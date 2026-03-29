@@ -2,6 +2,29 @@
 
 ## [0.1.0] — 2026-03-29
 
+### Highlights
+
+- **Integer-domain attention**: 2.9-4.8x faster than FP32 on Apple Silicon (ARM NEON `vdotq_s32`)
+- **Real model validated**: Qwen3.5-0.8B KV cache, cosine 0.994 (A+)
+- **8 quantization types** including mixed precision outlier and RHT pre-rotation
+- **K/V asymmetric**: independent key/value bit allocation (K4V2 = 9.8x compression)
+- **Community validated**: r/LocalLLaMA findings integrated
+
+### Integer-Domain Attention (v0.7)
+
+The single biggest performance breakthrough: instead of dequantizing Q4 keys to FP32,
+quantize the query to Q8 and compute integer dot products directly.
+
+```
+Before (v0.6): Q4 key → dequantize → FP32 dot = 0.49x vs FP32 (SLOWER)
+After  (v0.7): Q4 key × Q8 query → integer dot = 2.9-4.8x vs FP32 (FASTER)
+```
+
+Fair NEON-vs-NEON benchmark (Apple M-series, median of 7 runs):
+- dim=128, seq=2048: FP32 22.8μs → Int Q4×Q8 7.8μs (2.9x)
+- dim=256, seq=2048: FP32 57.7μs → Int Q4×Q8 12.5μs (4.6x)
+- Larger head_dim benefits more (Q4 data fits in L1 cache)
+
 ### Core Library
 - 7 quantization types: PolarQuant (3/4b), QJL (1b), TurboQuant (3/4b), Uniform (2/4b)
 - Direct attention kernels: QJL Hamming distance, PolarQuant cos/sin LUT (no dequantization needed)

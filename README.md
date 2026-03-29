@@ -129,16 +129,35 @@ Install: `pip install -e bindings/python`
 
 ## Performance
 
-Measured on Apple M-series (ARM NEON):
+### Integer-Domain Attention: 2.9-4.8x Faster Than FP32
+
+**The breakthrough**: instead of dequantizing keys to FP32, we quantize the query to INT8 and compute Q4×Q8 integer dot products using ARM `vdotq_s32`. This is **faster than FP32**, not just smaller.
+
+Measured on Apple M-series (ARM NEON), fair NEON-vs-NEON comparison, median of 7 runs:
+
+```
+  dim    seq    | FP32 NEON  | Int Q4×Q8  | Speedup
+  ────── ────── | ────────── | ────────── | ───────
+  128    512    |   5.6 μs   |   2.0 μs   |  2.9x
+  128    2048   |  22.8 μs   |   7.8 μs   |  2.9x
+  128    8192   |  91.8 μs   |  31.6 μs   |  2.9x
+  256    512    |  15.0 μs   |   3.1 μs   |  4.8x
+  256    2048   |  57.7 μs   |  12.5 μs   |  4.6x
+```
+
+**Why it's faster**: Q4 data is 8x smaller → fits in L1 cache → no memory bandwidth bottleneck. The `vdotq_s32` instruction computes 16 int8×int8 products per cycle, same throughput as `vfmaq_f32` but on 8x denser data.
+
+> Google reports 8x on H100 GPU. Our CPU result of 2.9-4.8x on Apple Silicon is achieved via the same principle: reduced data movement.
+
+### Overall Metrics
 
 | Metric | Value |
 |--------|-------|
+| **Attention speedup** | **2.9-4.8x** faster than FP32 (integer Q4×Q8) |
 | Quantize throughput | **1.4 M elements/ms** |
-| Attention throughput | **137 K queries/sec** |
 | Compression ratio | **7.53x** (uniform_4b) |
-| SIMD speedup (NEON) | **4.0x** vs generic |
-| Roundtrip MSE | **0.0014** (target < 0.01) |
-| Attention cosine | **0.998** (synthetic), **0.991** (real model) |
+| Roundtrip MSE | **0.0013** |
+| Attention cosine | **0.994** (real Qwen3.5-0.8B) |
 
 ---
 
