@@ -17,13 +17,14 @@
 
 | | PyTorch | TurboQuant.cpp |
 |---|---|---|
-| **CPU 속도** | 0.8 tok/s | **14 tok/s** (17배) |
-| **GPU 속도** | 10 tok/s (MPS) | **14 tok/s (CPU만으로!)** |
-| **가중치 메모리** | 1.7 GB (BF16) | **533 MB** (Q8, `-q` 플래그) |
+| **CPU 속도** | 0.8 tok/s | **18 tok/s** (23배) |
+| **GPU 속도** | 10 tok/s (MPS) | **18 tok/s (CPU만으로!)** |
+| **모델 로딩** | ~3초 | **< 0.3초** (TQM mmap) |
+| **가중치 메모리** | 1.7 GB (BF16) | **270 MB** (Q4) |
 | **KV 캐시** | FP16 (전체 크기) | **7.5배 압축** (4-bit) |
 | **의존성** | PyTorch + transformers | **0개** (순수 C) |
 
-> Qwen3.5-0.8B, Apple Silicon 기준. CPU 엔진이 PyTorch GPU보다 빠름.
+> Qwen3.5-0.8B, Apple Silicon 기준. CPU만으로 PyTorch GPU보다 빠름.
 
 ---
 
@@ -33,8 +34,11 @@
 git clone https://github.com/quantumaikr/TurboQuant.cpp && cd TurboQuant.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
 
-# 텍스트 생성 (14 tok/s, Q8 가중치, 4 스레드)
-./build/tq_run model.safetensors -t tokenizer.json -p "What is AI?" -j 4 -q
+# Step 1: 모델 변환 (1회, 자동 감지)
+./build/tq_convert
+
+# Step 2: 추론 (즉시 로딩, 토크나이저 내장)
+./build/tq_run model.tqm -p "What is AI?" -j 4
 ```
 
 ```
@@ -44,7 +48,7 @@ Artificial intelligence (AI) is a field of computer science that focuses
 on creating systems capable of performing tasks that typically require
 human intelligence...
 ---
-100 tokens in 7.2s (13.9 tok/s, 4 threads, kv=uniform_4b)
+50 tokens in 2.7s (18.3 tok/s, 4 threads, kv=uniform_4b)
 ```
 
 ### Python

@@ -17,13 +17,14 @@ Load a model, generate text, compress KV cache — all in one binary, no Python 
 
 | | PyTorch | TurboQuant.cpp |
 |---|---|---|
-| **CPU Speed** | 0.8 tok/s | **14 tok/s** (17x) |
-| **GPU Speed** | 10 tok/s (MPS) | **14 tok/s (CPU only!)** |
-| **Weight Memory** | 1.7 GB (BF16) | **533 MB** (Q8, `-q` flag) |
+| **CPU Speed** | 0.8 tok/s | **18 tok/s** (23x) |
+| **GPU Speed** | 10 tok/s (MPS) | **18 tok/s (CPU only!)** |
+| **Model Loading** | ~3 sec | **< 0.3 sec** (TQM mmap) |
+| **Weight Memory** | 1.7 GB (BF16) | **270 MB** (Q4) |
 | **KV Cache** | FP16 (full size) | **7.5x compressed** (4-bit) |
 | **Dependencies** | PyTorch + transformers | **0** (pure C) |
 
-> Qwen3.5-0.8B on Apple Silicon. Our CPU engine beats PyTorch on GPU.
+> Qwen3.5-0.8B on Apple Silicon. CPU-only, faster than PyTorch on GPU.
 
 ---
 
@@ -33,8 +34,11 @@ Load a model, generate text, compress KV cache — all in one binary, no Python 
 git clone https://github.com/quantumaikr/TurboQuant.cpp && cd TurboQuant.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
 
-# Generate text (14 tok/s, Q8 weights, 4 threads)
-./build/tq_run model.safetensors -t tokenizer.json -p "What is AI?" -j 4 -q
+# Step 1: Convert model (one-time, auto-detects from HuggingFace cache)
+./build/tq_convert
+
+# Step 2: Run (instant loading, tokenizer embedded)
+./build/tq_run model.tqm -p "What is AI?" -j 4
 ```
 
 ```
@@ -44,7 +48,7 @@ Artificial intelligence (AI) is a field of computer science that focuses
 on creating systems capable of performing tasks that typically require
 human intelligence...
 ---
-100 tokens in 7.2s (13.9 tok/s, 4 threads, kv=uniform_4b)
+50 tokens in 2.7s (18.3 tok/s, 4 threads, kv=uniform_4b)
 ```
 
 ### Python
@@ -65,13 +69,13 @@ scores = tq.attention(query, compressed, seq_len, dim, TurboQuant.UNIFORM_4B)
 Not a wrapper — a full inference engine in pure C:
 
 ```
-Model Loading    safetensors (mmap, BF16→FP32 streaming)
-Tokenizer        HuggingFace BPE (248K vocab)
+Model Loading    TQM format (mmap, instant, zero conversion)
+Tokenizer        HuggingFace BPE (248K vocab, embedded in TQM)
 Forward Pass     DeltaNet + Self-Attention (Qwen3.5 hybrid)
 KV Cache         TurboQuant quantized (4-bit, auto-compressed)
 Attention        Integer Q4×Q8 (2.9x faster than FP32)
-Weights          Q8 quantization (-q flag, 4x memory savings)
-Generation       Top-p sampling, streaming output
+Weights          Q4 pre-quantized (8x memory savings)
+Generation       Top-p sampling, streaming output, multi-threaded
 ```
 
 ### 2. Integer-Domain Attention
@@ -83,14 +87,20 @@ FP32 attention:  22.8 μs (baseline)
 Q4×Q8 integer:    7.8 μs (2.9x faster, ARM vdotq_s32)
 ```
 
-### 3. Q8 Weight Quantization
+### 3. TQM Format — Instant Loading
 
-Weights compressed 4x with negligible quality loss:
+Pre-quantize once, load instantly forever:
 
+```bash
+./build/tq_convert                         # one-time: 6s
+./build/tq_run model.tqm -p "Hello"        # every time: 0.3s load
 ```
-./build/tq_run model.safetensors -p "1+1=" -q
-→ "2" (correct, 533 MB instead of 2.1 GB)
-```
+
+| | safetensors | TQM |
+|---|---|---|
+| Load time | 3 sec | **0.3 sec** |
+| File size | 1.7 GB | **796 MB** |
+| Conversion | BF16→FP32→Q4 at runtime | **mmap, zero copy** |
 
 ---
 
@@ -119,16 +129,20 @@ Tested on [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) — real infe
 ## CLI Reference
 
 ```bash
-# Basic inference
-./build/tq_run MODEL -t TOKENIZER -p "prompt" -n 100
+# Convert (one-time, auto-detects model)
+./build/tq_convert                  # → model.tqm
+
+# Inference (instant loading)
+./build/tq_run model.tqm -p "prompt" -n 100
 
 # Options
--j 4          # threads (default: 4)
--q            # Q8 weight quantization (4x memory savings)
--k uniform_4b # KV cache type
--T 0.7        # temperature
--P 0.9        # top-p
---info         # show model info and exit
+-j 4            # threads (default: 4)
+-q q4           # weight quantization: q4 (default), q8, none
+-k uniform_4b   # KV cache type
+-T 0.7          # temperature
+-P 0.9          # top-p
+-t tok.json     # tokenizer (optional with TQM — embedded)
+--info           # show model info and exit
 ```
 
 ### Python CLI
