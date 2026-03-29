@@ -8,7 +8,7 @@
 **7.5배 메모리 절감**, **99.5% 어텐션 정확도** — 동일한 하드웨어에서 3배 더 긴 컨텍스트를 처리합니다.
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-35%20pass-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-38%2B%20pass-brightgreen)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![Score](https://img.shields.io/badge/harness%20score-99.7%25-brightgreen)]()
 
@@ -161,11 +161,50 @@ scores = tq.attention(query, quantized, 512, 128, TurboQuant.UNIFORM_4B)
 
 | 타입 | 비트 | 알고리즘 | 압축률 | 품질 | 추천 용도 |
 |------|------|----------|--------|------|----------|
-| `uniform_4b` | 4 | Min-Max | 7.5x | A+ (0.995) | **프로덕션** (최고 품질) |
-| `uniform_2b` | 2 | Min-Max | 14.2x | B (0.897) | 극한 압축 |
-| `polar_4b` | 4 | PolarQuant | 7.1x | B (0.827) | 연구용 |
+| `uniform_4b` | 4 | Min-Max | 7.5x | A+ (0.995) | **프로덕션 (커뮤니티 추천)** |
+| `mixed_4b8` | ~5 | 4bit + fp16 아웃라이어 | 6.4x | A+ | 아웃라이어 많은 데이터 |
+| `uniform_2b` | 2 | Min-Max | 14.2x | B+ (0.855) | 극한 압축 |
 | `turbo_3b` | 3 | Polar+QJL | 4.6x | B+ (0.917) | 균형 |
+| `polar_4b` | 4 | PolarQuant | 7.1x | B (0.827) | 연구용 |
 | `qjl_1b` | 1 | QJL 부호 해시 | 12.8x | C (0.702) | 초극한 압축 |
+
+> **커뮤니티 검증** (r/LocalLLaMA, llama.cpp #20969): `uniform_4b`가 QJL 기반 방법보다 실전에서 우수. QJL은 분산을 증가시켜 attention softmax에 불리.
+
+---
+
+## v0.6 핵심 기능
+
+### Random Hadamard Transform (RHT)
+
+양자화 전 벡터를 회전하여 **MSE 3.5배 감소**:
+
+```c
+// RHT 없이: MSE = 0.099
+// RHT 적용: MSE = 0.028 (3.54배 개선)
+tq_quantize_keys_rht(ctx, keys, n, head_dim, TQ_TYPE_UNIFORM_4B, seed, out, size);
+```
+
+RHT는 좌표 간 상관관계를 제거하여 스칼라 양자화를 최적화합니다. TurboQuant 논문의 핵심 기법.
+
+### K/V 비대칭 양자화
+
+키는 방향 보존, 값은 진폭 보존 — 서로 다른 비트 할당:
+
+```c
+// Key 4bit (고품질) + Value 2bit (고압축) = 평균 3.25 bit
+tq_quantize_kv(ctx, keys, values, n, head_dim,
+               TQ_TYPE_UNIFORM_4B, TQ_TYPE_UNIFORM_2B,
+               key_out, key_size, val_out, val_size);
+```
+
+### Mixed Precision 아웃라이어
+
+극단값 채널을 fp16으로 분리, 나머지 4bit → 범위 압축 극대화:
+
+```c
+// 아웃라이어 데이터: uniform_4b MSE = 0.15 → mixed_4b8 MSE = 0.01 (10배 개선)
+tq_quantize_keys(ctx, keys, n, head_dim, TQ_TYPE_MIXED_4B8, out, size);
+```
 
 ---
 
@@ -215,18 +254,23 @@ tq_free(ctx);
 ## 주요 특징
 
 ### 알고리즘
-- **7개 양자화 타입** — PolarQuant, QJL, TurboQuant, Uniform (2/4비트)
-- **직접 어텐션** — QJL은 해밍 거리, PolarQuant은 cos/sin 룩업 테이블로 역양자화 없이 직접 계산
-- **점진적 압축** — 최근 토큰은 전체 정밀도, 오래된 토큰은 자동으로 점진 압축
+- **8개 양자화 타입** — PolarQuant, QJL, TurboQuant, Uniform, Mixed Precision
+- **Random Hadamard Transform** — 양자화 전 회전으로 MSE 3.5배 감소 (논문 핵심 기법)
+- **K/V 비대칭** — 키/값에 독립 비트 할당 (커뮤니티 검증)
+- **Mixed Precision** — fp16 아웃라이어 + 4bit base (MSE 10배 개선)
+- **직접 어텐션** — QJL 해밍 거리, PolarQuant cos/sin LUT (역양자화 불필요)
+- **점진적 압축** — 3-tier 자동 열화, O(1) append, Copy-on-Write
 
 ### 시스템
 - **페이지 KV 캐시** — 블록 기반 할당 + 빔 서치용 Copy-on-Write
-- **SIMD 최적화** — ARM NEON (5.7배 가속), AVX2 스텁 준비
+- **SIMD 최적화** — ARM NEON (4x+ 가속), AVX2 스텁 준비
 - **GPU 커널** — CUDA + Metal 컴퓨트 셰이더
 - **스레드 안전** — mutex 보호 API, ThreadSanitizer 검증 완료
 
 ### 품질
-- **35개 테스트** (C++ 13 + Python 22) — ASan + UBSan + TSan 클린
+- **38+ 테스트** (C++ 16 + Python 22) — ASan + UBSan + TSan 클린
+- **실제 모델 검증** — Qwen2.5-0.5B KV 캐시 패턴, 코사인 0.991
+- **커뮤니티 검증** — r/LocalLLaMA 발견 사항 통합 (RHT, K/V 비대칭)
 - **실제 모델 검증** — Qwen2.5-0.5B KV 캐시 패턴, 코사인 0.991
 - **크로스 플랫폼 CI** — Linux x86_64 + macOS arm64
 - **포맷 사양서** — ONNX 표준 호환 비트 패킹, 버전 관리

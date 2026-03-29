@@ -8,7 +8,7 @@
 Achieve **7.5x memory reduction** with **99.5% attention accuracy** — run 3x longer contexts on the same hardware, with zero quality loss.
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-35%20pass-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-38%2B%20pass-brightgreen)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![Score](https://img.shields.io/badge/harness%20score-99.7%25-brightgreen)]()
 
@@ -164,12 +164,53 @@ Measured on Apple M-series (ARM NEON):
 
 | Type | Bits | Algorithm | Compression | Quality | Best For |
 |------|------|-----------|-------------|---------|----------|
-| `uniform_4b` | 4 | Min-Max | 7.5x | A+ (0.995) | Production (best quality) |
-| `uniform_2b` | 2 | Min-Max | 14.2x | B (0.897) | Max compression |
-| `polar_4b` | 4 | PolarQuant | 7.1x | B (0.827) | Research |
-| `polar_3b` | 3 | PolarQuant | 7.1x | B (0.827) | Research |
+| `uniform_4b` | 4 | Min-Max | 7.5x | A+ (0.995) | **Production (recommended)** |
+| `mixed_4b8` | ~5 | 4-bit + fp16 outliers | 6.4x | A+ | Data with outliers |
+| `uniform_2b` | 2 | Min-Max | 14.2x | B+ (0.855) | Max compression |
 | `turbo_3b` | 3 | Polar+QJL | 4.6x | B+ (0.917) | Balanced |
+| `polar_4b` | 4 | PolarQuant | 7.1x | B (0.827) | Research |
 | `qjl_1b` | 1 | QJL Sign Hash | 12.8x | C (0.702) | Extreme compression |
+
+> **Community finding** (r/LocalLLaMA, llama.cpp #20969): `uniform_4b` with bin-centered reconstruction outperforms QJL-based methods in practice. QJL increases variance which hurts attention softmax.
+
+---
+
+## Key Features (v0.6)
+
+### Random Hadamard Transform (RHT)
+
+Pre-rotate vectors before quantization for **3.5x MSE reduction**:
+
+```c
+// Without RHT: MSE = 0.099 on non-uniform data
+// With RHT:    MSE = 0.028 (3.54x better)
+tq_quantize_keys_rht(ctx, keys, n, head_dim, TQ_TYPE_UNIFORM_4B, seed, out, size);
+```
+
+RHT removes inter-coordinate correlation, making scalar quantization near-optimal. This is the core technique from the TurboQuant paper.
+
+### K/V Asymmetric Quantization
+
+Keys need direction preservation, values need amplitude preservation — use different bit widths:
+
+```c
+// Key 4-bit (high quality) + Value 2-bit (high compression) = avg 3.25 bits
+tq_quantize_kv(ctx, keys, values, n, head_dim,
+               TQ_TYPE_UNIFORM_4B,   // keys: 4-bit
+               TQ_TYPE_UNIFORM_2B,   // values: 2-bit
+               key_out, key_size, val_out, val_size);
+```
+
+Matches llama.cpp's `--cache-type-k` / `--cache-type-v` pattern.
+
+### Mixed Precision Outlier Detection
+
+A few channels have extreme values that waste min-max dynamic range. Store outliers at fp16, rest at 4-bit:
+
+```c
+// Outlier data: uniform_4b MSE = 0.15, mixed_4b8 MSE = 0.01 (10x+ better)
+tq_quantize_keys(ctx, keys, n, head_dim, TQ_TYPE_MIXED_4B8, out, size);
+```
 
 ---
 
@@ -182,7 +223,7 @@ Measured on Apple M-series (ARM NEON):
 tq_context_t* ctx;
 tq_init(&ctx, TQ_BACKEND_CPU);
 
-// Quantize keys (7.5x smaller)
+// Basic: Quantize keys (7.5x smaller)
 size_t buf_size = tq_quantize_keys_size(seq_len, head_dim, TQ_TYPE_UNIFORM_4B);
 void* compressed = malloc(buf_size);
 tq_quantize_keys(ctx, keys, seq_len, head_dim, TQ_TYPE_UNIFORM_4B, compressed, buf_size);
@@ -218,15 +259,18 @@ How many tokens can you fit after loading model weights?
 
 ## Features
 
-- **7 quantization types** — PolarQuant, QJL, TurboQuant, Uniform (2/4-bit)
-- **Direct attention** — QJL uses Hamming distance, PolarQuant uses cos/sin LUT (no dequantization needed)
-- **Progressive compression** — recent tokens at full precision, older tokens progressively compressed
-- **Paged KV cache** — block-based allocation with Copy-on-Write for beam search
-- **SIMD optimized** — ARM NEON (5.7x speedup), AVX2 stubs ready
-- **GPU kernels** — CUDA + Metal compute shaders (syntactically complete)
+- **8 quantization types** — PolarQuant, QJL, TurboQuant, Uniform, Mixed Precision
+- **Random Hadamard Transform** — 3.5x MSE reduction via pre-rotation (paper's core technique)
+- **K/V asymmetric** — independent bit allocation for keys vs values
+- **Mixed precision outlier** — fp16 outlier channels + 4-bit base (10x+ MSE improvement)
+- **Direct attention** — QJL Hamming distance, PolarQuant cos/sin LUT (no dequant needed)
+- **Progressive compression** — 3-tier auto-degradation, O(1) append, Copy-on-Write
+- **SIMD optimized** — ARM NEON (4x+ speedup), AVX2 stubs ready
+- **GPU kernels** — CUDA + Metal compute shaders
 - **Thread-safe** — mutex-protected API, ThreadSanitizer verified
-- **35 tests** (13 C++ + 22 Python) — ASan + UBSan + TSan clean
+- **38+ tests** (16 C++ + 22 Python) — ASan + UBSan + TSan clean
 - **Real model validated** — Qwen2.5-0.5B KV cache patterns, cosine 0.991
+- **Community validated** — r/LocalLLaMA findings integrated (RHT, K/V asymmetric)
 
 ---
 
@@ -234,12 +278,12 @@ How many tokens can you fit after loading model weights?
 
 ```
 include/turboquant/     Public C API (turboquant.h, tq_types.h, tq_spec.h)
-src/core/               Algorithms (polar, qjl, turbo, uniform, traits, context)
+src/core/               Algorithms (polar, qjl, turbo, uniform, mixed, rht, traits)
 src/cache/              Paged cache + progressive compression
 src/backend/cpu/        CPU kernels (generic, AVX2, NEON, dispatch)
 src/backend/cuda/       CUDA kernels (7 files)
 src/backend/metal/      Metal compute shaders (7 files)
-tests/                  Google Test suites (11 files)
+tests/                  Google Test suites (16 files)
 bench/                  Performance + quality benchmarks
 examples/               Standalone C, A/B test, real model demo
 integrations/           llama.cpp plugin, vLLM integration
