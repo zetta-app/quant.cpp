@@ -39,3 +39,4 @@ spec/test_vectors/*.bin
 refs/.venv/
 .cache/
 *.tqm
+.venv/
