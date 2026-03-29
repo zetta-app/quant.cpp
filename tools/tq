@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+tq — TurboQuant CLI
+
+Unified command-line interface for KV cache compression.
+Designed for both humans and AI agents (JSON output by default).
+
+Usage:
+    tq quantize <input> [--type TYPE] [--output FILE]
+    tq bench [--seq-len N] [--head-dim N] [--json]
+    tq info [--type TYPE]
+    tq demo [--question TEXT]
+    tq +compare                    # A/B test helper
+    tq +memory <model> <context>   # Memory savings calculator
+
+Google CLI design principles applied:
+    - JSON-first output (--json flag, default for scripts)
+    - Structured exit codes
+    - Help-driven discovery
+    - + prefix for high-level helpers
+"""
+
+import sys
+import os
+import json
+import argparse
+import time
+import struct
+import numpy as np
+
+# Add bindings to path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../bindings/python"))
+
+# ═══════════════════════════════════════════════════════════
+# Colors (disabled when piped)
+# ═══════════════════════════════════════════════════════════
+IS_TTY = sys.stdout.isatty()
+
+class C:
+    if IS_TTY:
+        BOLD = "\033[1m"; DIM = "\033[2m"; NC = "\033[0m"
+        CYAN = "\033[36m"; GREEN = "\033[32m"; YELLOW = "\033[33m"
+        RED = "\033[31m"; MAGENTA = "\033[35m"; BLUE = "\033[34m"
+        BAR = "█"; BAR_E = "░"
+    else:
+        BOLD = DIM = NC = CYAN = GREEN = YELLOW = RED = MAGENTA = BLUE = ""
+        BAR = "#"; BAR_E = "-"
+
+def bar(val, mx, w=25):
+    f = int(val / mx * w) if mx > 0 else 0
+    f = min(f, w)
+    return f"{C.GREEN}{C.BAR * f}{C.DIM}{C.BAR_E * (w - f)}{C.NC}"
+
+def sz(b):
+    if b >= 1e9: return f"{b/1e9:.2f} GB"
+    if b >= 1e6: return f"{b/1e6:.1f} MB"
+    if b >= 1e3: return f"{b/1e3:.1f} KB"
+    return f"{b} B"
+
+# ═══════════════════════════════════════════════════════════
+# EXIT CODES (structured, Google CLI pattern)
+# ═══════════════════════════════════════════════════════════
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_LIB_MISSING = 2
+EXIT_MODEL_ERROR = 3
+EXIT_IO_ERROR = 4
+
+# ═══════════════════════════════════════════════════════════
+# COMMANDS
+# ═══════════════════════════════════════════════════════════
+
+def cmd_info(args):
+    """Show quantization type information."""
+    try:
+        from turboquant import TurboQuant
+        tq = TurboQuant("cpu")
+    except Exception as e:
+        print(json.dumps({"error": "TurboQuant library not found", "detail": str(e)}))
+        return EXIT_LIB_MISSING
+
+    types = [
+        {"name": "uniform_4b", "id": 5, "bits": 4.2, "compression": 7.5, "grade": "A+", "recommended": True},
+        {"name": "mixed_4b8",  "id": 7, "bits": 5.0, "compression": 6.4, "grade": "A+", "recommended": True},
+        {"name": "uniform_2b", "id": 6, "bits": 2.2, "compression": 14.2, "grade": "A",  "recommended": False},
+        {"name": "turbo_3b",   "id": 3, "bits": 5.8, "compression": 4.6, "grade": "B+", "recommended": False},
+        {"name": "polar_4b",   "id": 1, "bits": 4.5, "compression": 7.1, "grade": "B",  "recommended": False},
+        {"name": "qjl_1b",     "id": 2, "bits": 1.2, "compression": 25.6,"grade": "C",  "recommended": False},
+    ]
+
+    if args.json_output:
+        print(json.dumps({"types": types}, indent=2))
+    else:
+        print(f"\n  {C.BOLD}TurboQuant Quantization Types{C.NC}")
+        print(f"  Ranked by real Qwen3.5-0.8B A/B test results\n")
+        print(f"  {C.BOLD}{'Type':<14} {'Bits':>5} {'Compress':>9} {'Grade':>6} {'Note':<20}{C.NC}")
+        print(f"  {'─'*14} {'─'*5} {'─'*9} {'─'*6} {'─'*20}")
+        for t in types:
+            star = f"{C.GREEN}★{C.NC}" if t["recommended"] else " "
+            note = "← recommended" if t["recommended"] else ""
+            print(f"  {star} {t['name']:<12} {t['bits']:>5.1f} {t['compression']:>8.1f}x {t['grade']:>5} {note}")
+        print()
+    return EXIT_OK
+
+
+def cmd_bench(args):
+    """Run performance benchmark."""
+    try:
+        from turboquant import TurboQuant
+        tq = TurboQuant("cpu")
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+        return EXIT_LIB_MISSING
+
+    seq_len = args.seq_len or 512
+    head_dim = args.head_dim or 128
+    reps = 500
+
+    np.random.seed(42)
+    keys = np.random.randn(seq_len, head_dim).astype(np.float32) * 0.15
+    query = np.random.randn(head_dim).astype(np.float32) * 0.15
+
+    results = []
+    for qtype, name in [(5, "uniform_4b"), (7, "mixed_4b8"), (6, "uniform_2b")]:
+        t0 = time.time()
+        for _ in range(reps):
+            q = tq.quantize_keys(keys, qtype)
+        quant_time = (time.time() - t0) / reps
+
+        deq = tq.dequantize_keys(q, seq_len, head_dim, qtype)
+        mse = float(np.mean((keys - deq) ** 2))
+
+        fp32_scores = keys @ query
+        scores = tq.attention(query, q, seq_len, head_dim, qtype)
+        cos = float(np.dot(scores, fp32_scores) / (np.linalg.norm(scores) * np.linalg.norm(fp32_scores) + 1e-10))
+
+        results.append({
+            "type": name, "seq_len": seq_len, "head_dim": head_dim,
+            "mse": round(mse, 6), "cosine": round(cos, 4),
+            "quant_ms": round(quant_time * 1000, 3),
+            "compression": round(keys.nbytes / len(q), 1),
+        })
+
+    if args.json_output:
+        print(json.dumps({"benchmark": results}, indent=2))
+    else:
+        print(f"\n  {C.BOLD}TurboQuant Benchmark{C.NC} (seq={seq_len}, dim={head_dim})\n")
+        print(f"  {C.BOLD}{'Type':<14} {'MSE':>10} {'Cosine':>8} {'Time':>8} {'Compress':>9}{C.NC}")
+        print(f"  {'─'*14} {'─'*10} {'─'*8} {'─'*8} {'─'*9}")
+        for r in results:
+            g = C.GREEN if r["cosine"] > 0.99 else C.YELLOW if r["cosine"] > 0.95 else C.RED
+            print(f"  {r['type']:<14} {r['mse']:>10.6f} {g}{r['cosine']:>8.4f}{C.NC} {r['quant_ms']:>6.1f}ms {r['compression']:>7.1f}x")
+        print()
+    return EXIT_OK
+
+
+def cmd_memory(args):
+    """Calculate memory savings for a model+context combination."""
+    models = {
+        "qwen3.5-0.8b":  {"layers": 6,  "kv_heads": 2,  "head_dim": 256, "params": 0.8},
+        "llama-3.2-1b":   {"layers": 16, "kv_heads": 8,  "head_dim": 64,  "params": 1.2},
+        "llama-3.2-3b":   {"layers": 28, "kv_heads": 8,  "head_dim": 128, "params": 3.2},
+        "phi-3-mini":     {"layers": 32, "kv_heads": 32, "head_dim": 96,  "params": 3.8},
+    }
+
+    model_key = args.model.lower().replace(" ", "-")
+    if model_key not in models:
+        avail = ", ".join(models.keys())
+        if args.json_output:
+            print(json.dumps({"error": f"Unknown model: {args.model}", "available": list(models.keys())}))
+        else:
+            print(f"  {C.RED}Unknown model: {args.model}{C.NC}")
+            print(f"  Available: {avail}")
+        return EXIT_USAGE
+
+    m = models[model_key]
+    ctx = args.context
+
+    fp16 = m["layers"] * m["kv_heads"] * m["head_dim"] * ctx * 2 * 2
+    tq4b = fp16 * 4.2 / 16
+    k4v2 = fp16 * (4.2 + 2.2) / 2 / 16
+    tq2b = fp16 * 2.2 / 16
+
+    result = {
+        "model": args.model, "context": ctx,
+        "fp16_bytes": int(fp16),
+        "uniform_4b_bytes": int(tq4b),
+        "k4v2_bytes": int(k4v2),
+        "uniform_2b_bytes": int(tq2b),
+        "saved_k4v2_bytes": int(fp16 - k4v2),
+        "saved_pct": round((1 - k4v2 / fp16) * 100, 1),
+    }
+
+    if args.json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        ctx_str = f"{ctx//1024}K" if ctx >= 1024 else str(ctx)
+        print(f"\n  {C.BOLD}Memory: {args.model} @ {ctx_str} context{C.NC}\n")
+        configs = [
+            ("FP16 (baseline)", fp16, C.RED),
+            ("TQ uniform_4b",  tq4b, C.GREEN),
+            ("TQ K4V2",        k4v2, C.GREEN),
+            ("TQ uniform_2b",  tq2b, C.YELLOW),
+        ]
+        for name, size, color in configs:
+            comp = fp16 / size if size > 0 else 1
+            print(f"  {name:<20} {sz(size):>10}  {comp:>5.1f}x  {bar(size, fp16)}")
+        print(f"\n  {C.GREEN}{C.BOLD}Best balance (K4V2): saves {sz(fp16 - k4v2)} ({(1-k4v2/fp16)*100:.0f}%){C.NC}\n")
+    return EXIT_OK
+
+
+def cmd_compare(args):
+    """A/B comparison helper."""
+    os.execvp(sys.executable, [sys.executable, "-c",
+        "import subprocess; subprocess.run(['./build/ab_test'])"])
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="tq",
+        description="TurboQuant CLI — KV cache compression for LLM inference",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+commands:
+  info                  Show quantization types and recommendations
+  bench                 Run performance benchmark
+  +memory MODEL CTX     Calculate memory savings
+  +compare              Run A/B comparison (requires build)
+  demo                  Interactive chat with Qwen3.5-0.8B
+
+examples:
+  tq info
+  tq info --json
+  tq bench --seq-len 2048 --head-dim 256
+  tq +memory llama-3.2-3b 65536
+  tq +memory qwen3.5-0.8b 131072 --json
+  tq demo "What is quantization?"
+""")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="JSON output (for AI agents)")
+    sub = parser.add_subparsers(dest="command")
+
+    # info
+    p_info = sub.add_parser("info", help="Quantization type information")
+    p_info.add_argument("--json", dest="json_output", action="store_true")
+
+    # bench
+    p_bench = sub.add_parser("bench", help="Performance benchmark")
+    p_bench.add_argument("--seq-len", type=int)
+    p_bench.add_argument("--head-dim", type=int)
+    p_bench.add_argument("--json", dest="json_output", action="store_true")
+
+    # +memory
+    p_mem = sub.add_parser("+memory", help="Memory savings calculator")
+    p_mem.add_argument("model", help="Model name (e.g., llama-3.2-3b)")
+    p_mem.add_argument("context", type=int, help="Context length in tokens")
+    p_mem.add_argument("--json", dest="json_output", action="store_true")
+
+    # +compare
+    sub.add_parser("+compare", help="Run A/B comparison")
+
+    # demo
+    p_demo = sub.add_parser("demo", help="Chat with Qwen3.5-0.8B")
+    p_demo.add_argument("question", nargs="?", help="Question (interactive if omitted)")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return EXIT_USAGE
+
+    if args.command == "info":
+        return cmd_info(args)
+    elif args.command == "bench":
+        return cmd_bench(args)
+    elif args.command == "+memory":
+        return cmd_memory(args)
+    elif args.command == "+compare":
+        return cmd_compare(args)
+    elif args.command == "demo":
+        os.execvp(sys.executable, [sys.executable,
+            os.path.join(os.path.dirname(__file__), "tq_chat.py"),
+            *([] if not args.question else [args.question])])
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
