@@ -25,7 +25,7 @@
 
 ### Validation
 - **A/B test**: uniform_4b achieves cosine 0.995 vs FP16 — A+ grade, virtually lossless
-- **Real model validation**: cosine 0.991 on Qwen2.5-0.5B KV cache patterns (4 layers, 14 heads)
+- **Real model validation**: cosine 0.991 on Qwen3.5-0.5B KV cache patterns (4 layers, 14 heads)
 - Per-layer analysis: quality consistent across depth (cosine >0.98 for uniform_4b)
 - Roundtrip MSE: 0.0014 (synthetic), 0.0025 (real model data)
 
@@ -70,7 +70,7 @@
 | Model | Context | FP16 Cache | TurboQuant | Saved |
 |-------|---------|------------|------------|-------|
 | Llama-3.2-3B | 64K | 7.00 GB | 0.93 GB | **87%** |
-| Qwen2.5-0.5B | 128K | 10.50 GB | 2.79 GB | **73%** |
+| Qwen3.5-0.5B | 128K | 10.50 GB | 2.79 GB | **73%** |
 | Phi-3-mini | 16K | 6.00 GB | 1.59 GB | **73%** |
 
 ### References

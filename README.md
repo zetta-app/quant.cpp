@@ -23,7 +23,7 @@ TurboQuant.cpp compresses KV caches from 16-bit to 2-4 bits, **directly in C** w
 | Scenario | FP16 | TurboQuant | Savings |
 |----------|------|------------|---------|
 | Llama-3.2-3B @ 64K ctx | 7.00 GB | 0.93 GB | **6.07 GB saved (87%)** |
-| Qwen2.5-0.5B @ 128K ctx | 10.50 GB | 2.79 GB | **7.71 GB saved (73%)** |
+| Qwen3.5-0.5B @ 128K ctx | 10.50 GB | 2.79 GB | **7.71 GB saved (73%)** |
 | Phi-3-mini @ 16K ctx | 6.00 GB | 1.59 GB | **4.41 GB saved (73%)** |
 
 **This means 3x longer contexts on the same GPU**, or serving 3x more users simultaneously.
@@ -84,7 +84,7 @@ python3 examples/python_quickstart.py   # Python API demo
 
 ## Real Model Validation
 
-Tested on realistic Qwen2.5-0.5B KV cache patterns (14 GQA heads, 4 layers, heavy-tail outliers):
+Tested on realistic Qwen3.5-0.5B KV cache patterns (14 GQA heads, 4 layers, heavy-tail outliers):
 
 | Type | Real MSE | Real Cosine | Grade |
 |------|----------|-------------|-------|
@@ -250,7 +250,7 @@ How many tokens can you fit after loading model weights?
 
 | Model | GPU | FP16 | TurboQuant | Gain |
 |-------|-----|------|------------|------|
-| Qwen2.5-0.5B | 8GB (M2 Air) | 87K | 286K | **3.3x** |
+| Qwen3.5-0.5B | 8GB (M2 Air) | 87K | 286K | **3.3x** |
 | Llama-3.2-1B | 16GB (RTX 4060) | 445K | 1,462K | **3.3x** |
 | Llama-3.2-3B | 24GB (RTX 4090) | 164K | 540K | **3.3x** |
 | Phi-3-mini | 24GB (RTX 4090) | 44K | 146K | **3.3x** |
@@ -269,7 +269,7 @@ How many tokens can you fit after loading model weights?
 - **GPU kernels** — CUDA + Metal compute shaders
 - **Thread-safe** — mutex-protected API, ThreadSanitizer verified
 - **38+ tests** (16 C++ + 22 Python) — ASan + UBSan + TSan clean
-- **Real model validated** — Qwen2.5-0.5B KV cache patterns, cosine 0.991
+- **Real model validated** — Qwen3.5-0.5B KV cache patterns, cosine 0.991
 - **Community validated** — r/LocalLLaMA findings integrated (RHT, K/V asymmetric)
 
 ---

@@ -5,7 +5,7 @@ Generated: 2026-03-29
 ## Overview
 
 This document reports quantization quality measured on realistic LLM KV cache data
-(synthetic data mimicking Qwen2.5-0.5B statistics: 14 GQA heads, head_dim=64,
+(synthetic data mimicking Qwen3.5-0.5B statistics: 14 GQA heads, head_dim=64,
 seq_len=64, 4 layers with increasing variance).
 
 The data exhibits real-world properties: per-channel variance, heavy tails from

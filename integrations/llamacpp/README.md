@@ -62,7 +62,7 @@ full materialization of FP32 keys.
 |-------|---------|------------|---------------------|-------|
 | Llama-3.2-3B | 64K | 7.00 GB | 1.25 GB | 82% |
 | Llama-3-8B | 32K | 2.00 GB | 0.36 GB | 82% |
-| Qwen2.5-0.5B | 128K | 10.50 GB | 1.88 GB | 82% |
+| Qwen3.5-0.5B | 128K | 10.50 GB | 1.88 GB | 82% |
 
 ## Build Instructions
 

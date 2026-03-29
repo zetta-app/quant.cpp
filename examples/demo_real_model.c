@@ -2,7 +2,7 @@
  * TurboQuant.cpp — Real Model KV Cache Compression Demo
  *
  * Simulates KV cache compression for actual LLM architectures:
- *   - Qwen2.5-0.5B  (24 layers, 14 KV heads, head_dim=64)
+ *   - Qwen3.5-0.5B  (24 layers, 14 KV heads, head_dim=64)
  *   - Llama-3.2-1B  (16 layers, 8 KV heads,  head_dim=64)
  *   - Llama-3.2-3B  (28 layers, 8 KV heads,  head_dim=128)
  *   - Phi-3-mini     (32 layers, 32 KV heads, head_dim=96)
@@ -32,7 +32,7 @@ typedef struct {
 } model_spec_t;
 
 static const model_spec_t MODELS[] = {
-    {"Qwen2.5-0.5B",   24, 14,  64, 151936, 0.5f},
+    {"Qwen3.5-0.5B",   24, 14,  64, 151936, 0.5f},
     {"Llama-3.2-1B",    16,  8,  64, 128256, 1.2f},
     {"Llama-3.2-3B",    28,  8, 128, 128256, 3.2f},
     {"Phi-3-mini-4k",   32, 32,  96,  32064, 3.8f},

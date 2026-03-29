@@ -5,7 +5,7 @@ Generates binary files with format:
   Header: magic(4B) + layer_idx(4B) + num_heads(4B) + seq_len(4B) + head_dim(4B) = 20 bytes
   Data:   num_heads * seq_len * head_dim * sizeof(float32)
 
-If transformers is available, uses Qwen/Qwen2.5-0.5B-Instruct.
+If transformers is available, uses Qwen/Qwen3.5-0.5B-Instruct.
 Otherwise, generates realistic synthetic data that mimics real LLM KV cache statistics.
 """
 
@@ -44,7 +44,7 @@ def write_kv_binary(fname, layer_idx, data):
 
 
 def dump_real_kv():
-    """Dump KV cache from Qwen2.5-0.5B or generate synthetic equivalent."""
+    """Dump KV cache from Qwen3.5-0.5B or generate synthetic equivalent."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     if HAS_TRANSFORMERS:
@@ -55,7 +55,7 @@ def dump_real_kv():
 
 def dump_from_model():
     """Load a real model and capture KV cache tensors."""
-    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_name = "Qwen/Qwen3.5-0.5B-Instruct"
     print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -113,9 +113,9 @@ def generate_realistic_synthetic():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     np.random.seed(42)
 
-    num_heads = 14   # Qwen2.5-0.5B has 14 KV heads (GQA)
+    num_heads = 14   # Qwen3.5-0.5B has 14 KV heads (GQA)
     seq_len = 64
-    head_dim = 64    # Qwen2.5-0.5B head_dim
+    head_dim = 64    # Qwen3.5-0.5B head_dim
 
     for layer_idx in range(4):
         # Per-channel standard deviation (log-normal mimics real variance patterns)
