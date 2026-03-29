@@ -60,7 +60,7 @@ def print_kv_analysis(cache, prompt_len, gen_tokens=0, elapsed=0):
     for i in range(len(cache.key_cache)):
         k = cache.key_cache[i]
         if k is not None and isinstance(k, torch.Tensor) and k.dim() >= 3:
-            total_fp16 += k.nelement() * 2 * 2  # K+V, fp16
+            total_fp16 += k.cpu().nelement() * 2 * 2  # K+V, fp16
             if head_dim == 0:
                 kv_heads = k.shape[1]
                 head_dim = k.shape[-1]
@@ -131,11 +131,16 @@ def run_chat(question, model, tokenizer):
                                           add_generation_prompt=True,
                                           enable_thinking=False)
     inputs = tokenizer(text, return_tensors="pt")
+    # Move to same device as model
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
     prompt_len = inputs["input_ids"].shape[1]
 
-    max_tokens = 80  # ~80 tokens ≈ 2 paragraphs, ~100s on CPU
+    is_gpu = str(model.device) != "cpu"
+    max_tokens = 150 if is_gpu else 80
+    est_time = max_tokens * 0.1 if is_gpu else max_tokens * 1.3
+    dev_name = "GPU" if is_gpu else "CPU"
 
-    print(f"  {C.BOLD}{C.GREEN}A:{C.NC} {C.DIM}(generating ~{max_tokens} tokens, ~{max_tokens*1.3:.0f}s on CPU){C.NC}")
+    print(f"  {C.BOLD}{C.GREEN}A:{C.NC} {C.DIM}(generating ~{max_tokens} tokens, ~{est_time:.0f}s on {dev_name}){C.NC}")
     print(f"     ", end="", flush=True)
 
     import contextlib, io, threading
@@ -196,6 +201,7 @@ def main():
 
     # Load model (suppress noisy warnings)
     print(f"  {C.DIM}Loading Qwen3.5-0.8B...{C.NC}", end="", flush=True)
+    # Note: device_label is set after torch import below
 
     import warnings
     import logging
@@ -210,11 +216,22 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_name = "Qwen/Qwen3.5-0.8B"
+
+    # Auto-detect best device: MPS (Apple GPU) > CPU
+    if torch.backends.mps.is_available():
+        device = "mps"
+        dtype = torch.float16
+        device_label = "MPS (Apple GPU)"
+    else:
+        device = "cpu"
+        dtype = torch.float32
+        device_label = "CPU"
+
     with contextlib.redirect_stderr(io.StringIO()):
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, trust_remote_code=True, dtype=torch.float32
-        )
+            model_name, trust_remote_code=True, dtype=dtype
+        ).to(device)
     model.eval()
 
     # Pre-set pad_token_id to suppress "Setting pad_token_id" message
@@ -222,7 +239,7 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
     model.generation_config.pad_token_id = tokenizer.eos_token_id
 
-    print(f" {C.GREEN}✓{C.NC}")
+    print(f" {C.GREEN}✓{C.NC} {C.DIM}({device_label}){C.NC}")
     print()
 
     if args.benchmark:
