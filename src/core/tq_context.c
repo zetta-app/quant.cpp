@@ -7,6 +7,7 @@
 #include "turboquant/turboquant.h"
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <pthread.h>
 
 struct tq_context {
@@ -44,11 +45,21 @@ tq_backend tq_get_backend(const tq_context_t* ctx) {
 
 size_t tq_quantize_keys_size(int n, int head_dim, tq_type type) {
     if (type < 0 || type >= TQ_TYPE_COUNT) return 0;
+    if (n <= 0 || head_dim <= 0) return 0;
+    if (n > TQ_MAX_SEQ_LEN) return 0;
+
     size_t block_size = TQ_TRAITS[type].block_size;
     size_t type_size  = TQ_TRAITS[type].type_size;
     /* Each key vector of head_dim elements uses ceil(head_dim/block_size) blocks */
     size_t blocks_per_key = ((size_t)head_dim + block_size - 1) / block_size;
-    return (size_t)n * blocks_per_key * type_size;
+
+    /* Check multiplication overflow: n * blocks_per_key * type_size */
+    size_t nb = (size_t)n * blocks_per_key;
+    if (blocks_per_key != 0 && nb / blocks_per_key != (size_t)n) return 0;
+    size_t result = nb * type_size;
+    if (type_size != 0 && result / type_size != nb) return 0;
+
+    return result;
 }
 
 tq_status tq_quantize_keys(tq_context_t* ctx,
@@ -57,10 +68,18 @@ tq_status tq_quantize_keys(tq_context_t* ctx,
                            void* out, size_t out_size) {
     if (!ctx || !keys || !out) return TQ_ERR_NULL_PTR;
     if (type < 0 || type >= TQ_TYPE_COUNT) return TQ_ERR_INVALID_TYPE;
-    if (head_dim <= 0) return TQ_ERR_INVALID_DIM;
+    if (n == 0) return TQ_OK;
+    if (head_dim < 2) return TQ_ERR_INVALID_DIM;
+
+    /* PolarQuant and TurboQuant require even head_dim (polar coordinate pairs) */
+    if (type == TQ_TYPE_POLAR_3B || type == TQ_TYPE_POLAR_4B ||
+        type == TQ_TYPE_TURBO_3B || type == TQ_TYPE_TURBO_4B) {
+        if (head_dim % 2 != 0) return TQ_ERR_INVALID_DIM;
+    }
 
     size_t needed = tq_quantize_keys_size(n, head_dim, type);
-    if (out_size < needed) return TQ_ERR_OUT_OF_MEM;
+    if (needed == 0) return TQ_ERR_INVALID_DIM;
+    if (out_size < needed) return TQ_ERR_BUFFER_TOO_SMALL;
 
     tq_quantize_fn qfn = TQ_TRAITS[type].quantize;
     if (!qfn) return TQ_ERR_NOT_IMPL;
@@ -132,6 +151,14 @@ tq_status tq_attention(tq_context_t* ctx,
                        float* scores) {
     if (!ctx || !query || !kv_cache || !scores) return TQ_ERR_NULL_PTR;
     if (type < 0 || type >= TQ_TYPE_COUNT) return TQ_ERR_INVALID_TYPE;
+    if (seq_len == 0) return TQ_OK;
+    if (head_dim < 2) return TQ_ERR_INVALID_DIM;
+
+    /* PolarQuant and TurboQuant require even head_dim */
+    if (type == TQ_TYPE_POLAR_3B || type == TQ_TYPE_POLAR_4B ||
+        type == TQ_TYPE_TURBO_3B || type == TQ_TYPE_TURBO_4B) {
+        if (head_dim % 2 != 0) return TQ_ERR_INVALID_DIM;
+    }
 
     tq_attention_fn afn = TQ_TRAITS[type].attention;
     if (!afn) return TQ_ERR_NOT_IMPL;

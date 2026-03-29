@@ -205,7 +205,7 @@ void tq_qjl_attention_ref(const float* query, const void* kv_cache,
     /* Scaling factor from QJL theory: sqrt(PI/2) / sketch_dim
      * This converts Hamming-based inner product estimate to dot product estimate.
      * See refs/QJL/qjl_kernel/csrc/qjl_score_kernel.cu line 153. */
-    const float scale = sqrtf((float)M_PI_2) / (float)sketch_dim;
+    const float scale = sqrtf(TQ_PI_2) / (float)sketch_dim;
 
     for (int s = 0; s < seq_len; s++) {
         const block_tq_qjl* block = &blocks[s];

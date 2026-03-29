@@ -33,6 +33,7 @@ typedef enum {
     TQ_ERR_OUT_OF_MEM  = -4,
     TQ_ERR_NOT_IMPL    = -5,
     TQ_ERR_BACKEND     = -6,
+    TQ_ERR_BUFFER_TOO_SMALL = -7,
 } tq_status;
 
 const char* tq_status_string(tq_status status);
@@ -184,6 +185,32 @@ tq_type tq_recommend_strategy(int head_dim, int target_bits,
 
 /** Get format spec for a quantization type */
 tq_format_spec_t tq_get_format_spec(tq_type type);
+
+/* ============================================================
+ * Convenience functions
+ * ============================================================ */
+
+int     tq_type_count(void);
+tq_type tq_type_from_name(const char* name);
+
+/* ============================================================
+ * Progressive compression
+ * ============================================================ */
+
+typedef struct tq_progressive tq_progressive_t;
+
+tq_status tq_progressive_create(tq_progressive_t** out,
+                                const tq_progressive_config_t* config,
+                                int head_dim, int max_tokens);
+tq_status tq_progressive_append(tq_progressive_t* p,
+                                const float* key, int head_dim);
+tq_status tq_progressive_attention(const tq_progressive_t* p,
+                                   const float* query,
+                                   float* scores, int head_dim);
+int       tq_progressive_count(const tq_progressive_t* p);
+void      tq_progressive_free(tq_progressive_t* p);
+
+tq_progressive_config_t tq_progressive_default_config(void);
 
 #ifdef __cplusplus
 }

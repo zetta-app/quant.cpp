@@ -161,7 +161,9 @@ eval_correctness() {
 
     local sa=0
     if [ -f "$PROJECT_DIR/include/turboquant/tq_types.h" ]; then
-        sa=$(grep -c 'static_assert\|_Static_assert' "$PROJECT_DIR/include/turboquant/tq_types.h" 2>/dev/null || echo "0")
+        sa=$(grep -c 'static_assert\|_Static_assert\|TQ_CHECK_SIZE\|TQ_STATIC_ASSERT' "$PROJECT_DIR/include/turboquant/tq_types.h" 2>/dev/null; true)
+        sa=$(echo "$sa" | head -1 | tr -d '[:space:]')
+        [ -z "$sa" ] && sa=0
     fi
     local sas=0
     [ "$sa" -ge 4 ] 2>/dev/null && sas=1

@@ -200,8 +200,8 @@ void tq_uniform_4b_dequantize_neon(const void* src, float* dst, int n) {
  * Returns atan2(y, x) in [-pi, pi] range. */
 static inline float32x4_t neon_atan2_approx(float32x4_t vy, float32x4_t vx) {
     /* Constants */
-    const float32x4_t v_pi      = vdupq_n_f32(3.14159265f);
-    const float32x4_t v_half_pi = vdupq_n_f32(1.57079632f);
+    const float32x4_t v_pi      = vdupq_n_f32(TQ_PI);
+    const float32x4_t v_half_pi = vdupq_n_f32(TQ_PI_2);
     const float32x4_t v_zero    = vdupq_n_f32(0.0f);
     (void)0; /* v_one removed — was unused */
     /* Polynomial coefficients for atan(z) where |z| <= 1
@@ -611,7 +611,7 @@ void tq_qjl_attention_neon(const float* query, const void* kv_cache,
         }
 
         float frac = (float)total_agree / TQ_SKETCH_DIM;
-        float cos_est = cosf((float)M_PI * (1.0f - frac));
+        float cos_est = cosf(TQ_PI * (1.0f - frac));
         scores[s] = cos_est * q_norm * key_norm;
     }
 }

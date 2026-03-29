@@ -11,6 +11,14 @@
 #define TQ_STATIC_ASSERT(cond, msg) TQ_STATIC_ASSERT(cond, msg)
 #endif
 
+/* Cross-platform math constants (some platforms lack M_PI) */
+#ifndef TQ_PI
+#define TQ_PI   3.14159265358979323846f
+#endif
+#ifndef TQ_PI_2
+#define TQ_PI_2 1.5707963267948966f
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -23,6 +31,7 @@ extern "C" {
 #define TQ_BK_QJL      256   /* QJL block size */
 #define TQ_SKETCH_DIM  256   /* QJL sketch dimension */
 #define TQ_OUTLIERS    4     /* QJL outlier count */
+#define TQ_MAX_SEQ_LEN (1 << 20)  /* Maximum sequence length (1M tokens) */
 #define TQ_VERSION_MAJOR 0
 #define TQ_VERSION_MINOR 1
 #define TQ_VERSION_PATCH 0

@@ -31,7 +31,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "polar_3b",
         .block_size = TQ_BK,
         .type_size  = sizeof(block_tq_polar),
-        .bpe        = 4.5f,
+        .bpe        = (float)sizeof(block_tq_polar) * 8.0f / TQ_BK,
         .quantize   = tq_polar_quantize_ref,
         .dequantize = tq_polar_dequantize_ref,
         .attention  = tq_polar_attention_ref,
@@ -41,7 +41,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "polar_4b",
         .block_size = TQ_BK,
         .type_size  = sizeof(block_tq_polar),
-        .bpe        = 4.5f,
+        .bpe        = (float)sizeof(block_tq_polar) * 8.0f / TQ_BK,
         .quantize   = tq_polar_quantize_ref,
         .dequantize = tq_polar_dequantize_ref,
         .attention  = tq_polar_attention_ref,
@@ -51,7 +51,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "qjl_1b",
         .block_size = TQ_BK_QJL,
         .type_size  = sizeof(block_tq_qjl),
-        .bpe        = 1.25f,
+        .bpe        = (float)sizeof(block_tq_qjl) * 8.0f / TQ_BK_QJL,
         .quantize   = tq_qjl_quantize_ref,
         .dequantize = tq_qjl_dequantize_ref,
         .attention  = tq_qjl_attention_ref,
@@ -61,7 +61,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "turbo_3b",
         .block_size = TQ_BK,
         .type_size  = sizeof(block_tq_turbo),
-        .bpe        = 5.75f,
+        .bpe        = (float)sizeof(block_tq_turbo) * 8.0f / TQ_BK,
         .quantize   = tq_turbo_quantize_ref,
         .dequantize = tq_turbo_dequantize_ref,
         .attention  = tq_turbo_attention_ref,
@@ -71,7 +71,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "turbo_4b",
         .block_size = TQ_BK,
         .type_size  = sizeof(block_tq_turbo),
-        .bpe        = 5.75f,
+        .bpe        = (float)sizeof(block_tq_turbo) * 8.0f / TQ_BK,
         .quantize   = tq_turbo_quantize_ref,
         .dequantize = tq_turbo_dequantize_ref,
         .attention  = tq_turbo_attention_ref,
@@ -81,7 +81,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "uniform_4b",
         .block_size = TQ_BK,
         .type_size  = sizeof(block_tq_uniform_4b),
-        .bpe        = 4.25f,
+        .bpe        = (float)sizeof(block_tq_uniform_4b) * 8.0f / TQ_BK,
         .quantize   = tq_uniform_4b_quantize_ref,
         .dequantize = tq_uniform_4b_dequantize_ref,
         .attention  = tq_uniform_4b_attention_ref,
@@ -91,7 +91,7 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .name       = "uniform_2b",
         .block_size = TQ_BK,
         .type_size  = sizeof(block_tq_uniform_2b),
-        .bpe        = 2.25f,
+        .bpe        = (float)sizeof(block_tq_uniform_2b) * 8.0f / TQ_BK,
         .quantize   = tq_uniform_2b_quantize_ref,
         .dequantize = tq_uniform_2b_dequantize_ref,
         .attention  = tq_uniform_2b_attention_ref,
@@ -128,6 +128,7 @@ const char* tq_status_string(tq_status status) {
         case TQ_ERR_OUT_OF_MEM:   return "out of memory";
         case TQ_ERR_NOT_IMPL:     return "not implemented";
         case TQ_ERR_BACKEND:      return "backend error";
+        case TQ_ERR_BUFFER_TOO_SMALL: return "buffer too small";
         default:                  return "unknown error";
     }
 }
@@ -160,4 +161,14 @@ tq_format_spec_t tq_get_format_spec(tq_type type) {
         default: break;
     }
     return spec;
+}
+
+int tq_type_count(void) { return TQ_TYPE_COUNT; }
+
+tq_type tq_type_from_name(const char* name) {
+    if (!name) return TQ_TYPE_COUNT;
+    for (int i = 0; i < TQ_TYPE_COUNT; i++) {
+        if (strcmp(TQ_TRAITS[i].name, name) == 0) return (tq_type)i;
+    }
+    return TQ_TYPE_COUNT;
 }

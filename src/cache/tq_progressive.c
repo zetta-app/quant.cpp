@@ -34,6 +34,8 @@ typedef struct tq_progressive {
     int                     capacity;   /* total slot capacity */
     int                     count;      /* number of tokens stored */
     int                     head_dim;   /* head dimension for all tokens */
+    int                     oldest_hot; /* index of oldest tier-0 (hot) slot */
+    int                     oldest_warm;/* index of oldest tier-1 (warm) slot */
 } tq_progressive_t;
 
 /* ================================================================
@@ -182,31 +184,57 @@ tq_status tq_progressive_append(tq_progressive_t* p,
     p->slots[idx].stored_type = TQ_TYPE_COUNT; /* No quant type for FP32 tier */
     p->count++;
 
-    /* Check if any tokens need tier transitions */
-    for (int i = 0; i < p->count; i++) {
-        int target_tier = tq_progressive_get_tier(p, i);
-        int current_tier = p->slots[i].tier;
+    /* O(1) tier transitions using two cursors:
+     * oldest_warm tracks the oldest tier-1 slot for warm->cold transitions
+     * oldest_hot  tracks the oldest tier-0 slot for hot->warm transitions */
 
-        if (target_tier > current_tier) {
-            /* Need to compress this slot */
+    /* First: check if oldest_warm needs cold transition */
+    while (p->oldest_warm < p->oldest_hot) {
+        int target_tier = tq_progressive_get_tier(p, p->oldest_warm);
+        if (target_tier < 2) break; /* not yet cold */
+
+        if (p->slots[p->oldest_warm].tier == 1) {
+            if (!p->config.enable_recompression) {
+                p->oldest_warm++;
+                continue;
+            }
+            tq_status st = compress_slot(&p->slots[p->oldest_warm],
+                                         p->config.cold_type, head_dim);
+            if (st == TQ_OK) {
+                p->slots[p->oldest_warm].tier = 2;
+                p->slots[p->oldest_warm].stored_type = p->config.cold_type;
+            }
+        }
+        p->oldest_warm++;
+    }
+
+    /* Second: check if oldest_hot needs warm transition */
+    while (p->oldest_hot < p->count) {
+        int target_tier = tq_progressive_get_tier(p, p->oldest_hot);
+        if (target_tier < 1) break; /* still hot */
+
+        if (p->slots[p->oldest_hot].tier == 0) {
             tq_type target_type;
-            if (target_tier == 1) {
-                target_type = p->config.warm_type;
-            } else {
+            if (target_tier >= 2 && p->config.enable_recompression) {
+                /* Skip warm, go directly to cold if already past warm window */
                 target_type = p->config.cold_type;
-                if (!p->config.enable_recompression && current_tier == 1) {
-                    /* Recompression disabled, skip tier 1 -> tier 2 */
-                    continue;
+                tq_status st = compress_slot(&p->slots[p->oldest_hot],
+                                             target_type, head_dim);
+                if (st == TQ_OK) {
+                    p->slots[p->oldest_hot].tier = target_tier;
+                    p->slots[p->oldest_hot].stored_type = target_type;
+                }
+            } else {
+                target_type = p->config.warm_type;
+                tq_status st = compress_slot(&p->slots[p->oldest_hot],
+                                             target_type, head_dim);
+                if (st == TQ_OK) {
+                    p->slots[p->oldest_hot].tier = 1;
+                    p->slots[p->oldest_hot].stored_type = target_type;
                 }
             }
-
-            tq_status st = compress_slot(&p->slots[i], target_type, head_dim);
-            if (st == TQ_OK) {
-                p->slots[i].tier = target_tier;
-                p->slots[i].stored_type = target_type;
-            }
-            /* If compression fails, keep current tier (graceful degradation) */
         }
+        p->oldest_hot++;
     }
 
     return TQ_OK;
@@ -281,4 +309,19 @@ tq_status tq_progressive_attention(const tq_progressive_t* p,
     }
 
     return TQ_OK;
+}
+
+/* ================================================================
+ * Default configuration
+ * ================================================================ */
+
+tq_progressive_config_t tq_progressive_default_config(void) {
+    tq_progressive_config_t c = {
+        .residual_window = 128,
+        .warm_window = 256,
+        .warm_type = TQ_TYPE_UNIFORM_4B,
+        .cold_type = TQ_TYPE_UNIFORM_2B,
+        .enable_recompression = 1
+    };
+    return c;
 }
