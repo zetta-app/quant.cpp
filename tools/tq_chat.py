@@ -49,16 +49,21 @@ def print_header():
     print(f"{C.CYAN}{C.BOLD}╚══════════════════════════════════════════════════════════╝{C.NC}")
     print()
 
-def print_kv_analysis(cache, prompt_len):
+def print_kv_analysis(cache, prompt_len, gen_tokens=0, elapsed=0):
     """Analyze and visualize KV cache compression."""
     import torch
 
     total_fp16 = 0
     layers = 0
+    head_dim = 0
+    kv_heads = 0
     for i in range(len(cache.key_cache)):
         k = cache.key_cache[i]
         if k is not None and isinstance(k, torch.Tensor) and k.dim() >= 3:
             total_fp16 += k.nelement() * 2 * 2  # K+V, fp16
+            if head_dim == 0:
+                kv_heads = k.shape[1]
+                head_dim = k.shape[-1]
             layers += 1
 
     tq_4b = int(total_fp16 * 4.2 / 16)
@@ -67,11 +72,26 @@ def print_kv_analysis(cache, prompt_len):
 
     print()
     print(f"  {C.BOLD}📊 KV Cache Analysis{C.NC}")
-    print(f"  {C.DIM}{'─' * 52}{C.NC}")
-    print(f"  Attention Layers: {C.BOLD}{layers}{C.NC}  |  Prompt Tokens: {C.BOLD}{prompt_len}{C.NC}")
+    print(f"  {C.DIM}{'─' * 56}{C.NC}")
+
+    # Model spec line
+    print(f"  {C.BOLD}Model:{C.NC} Qwen3.5-0.8B  {C.DIM}│{C.NC}  "
+          f"{C.BOLD}{layers}{C.NC} attn layers  {C.DIM}│{C.NC}  "
+          f"{C.BOLD}{kv_heads}{C.NC} KV heads  {C.DIM}│{C.NC}  "
+          f"dim {C.BOLD}{head_dim}{C.NC}")
+
+    # Performance line
+    if gen_tokens > 0 and elapsed > 0:
+        tps = gen_tokens / elapsed
+        print(f"  {C.BOLD}Speed:{C.NC} {gen_tokens} tokens in {elapsed:.1f}s "
+              f"({C.CYAN}{C.BOLD}{tps:.1f} tok/s{C.NC})  {C.DIM}│{C.NC}  "
+              f"prompt {C.BOLD}{prompt_len}{C.NC} tokens")
+    else:
+        print(f"  {C.BOLD}Tokens:{C.NC} {prompt_len} prompt")
+
     print()
-    print(f"  {C.BOLD}{'Method':<22} {'Size':>10}  {'Compression':>12}  Bar{C.NC}")
-    print(f"  {'─' * 22} {'─' * 10}  {'─' * 12}  {'─' * 30}")
+    print(f"  {C.BOLD}{'Method':<22} {'Size':>10}  {'Compress':>9}  Bar{C.NC}")
+    print(f"  {'─' * 22} {'─' * 10}  {'─' * 9}  {'─' * 30}")
 
     configs = [
         ("FP16 (baseline)", total_fp16, 1.0, C.RED),
@@ -81,7 +101,7 @@ def print_kv_analysis(cache, prompt_len):
     ]
 
     for name, size, comp, color in configs:
-        print(f"  {name:<22} {size_str(size):>10}  {comp:>10.1f}x  {bar(size, total_fp16, 30, color)}")
+        print(f"  {name:<22} {size_str(size):>10}  {comp:>7.1f}x  {bar(size, total_fp16, 30, color)}")
 
     saved = total_fp16 - k4v2
     print()
@@ -158,18 +178,12 @@ def run_chat(question, model, tokenizer):
                                 subsequent_indent="     ")
         print(wrapped)
 
-    # Stats
-    print()
-    print(f"  {C.DIM}{'─' * 52}{C.NC}")
-    tps = gen_tokens / elapsed if elapsed > 0 else 0
-    print(f"  {C.DIM}⏱  {gen_tokens} tokens in {elapsed:.1f}s ({tps:.1f} tok/s)  |  prompt: {prompt_len} tokens{C.NC}")
-
-    # KV cache analysis
+    # KV cache analysis (with timing info)
     with torch.no_grad():
         out2 = model(**inputs, use_cache=True)
         cache = out2.past_key_values
 
-    print_kv_analysis(cache, prompt_len)
+    print_kv_analysis(cache, prompt_len, gen_tokens, elapsed)
 
 
 def main():
