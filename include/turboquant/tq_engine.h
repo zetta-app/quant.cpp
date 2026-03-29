@@ -16,28 +16,57 @@ typedef struct {
     int n_layers;
     int hidden_dim;
     int intermediate_dim;
-    int n_heads;         /* query heads */
-    int n_kv_heads;      /* KV heads (GQA) */
-    int head_dim;
+    int n_heads;         /* query heads (for self_attn layers) */
+    int n_kv_heads;      /* KV heads (GQA, for self_attn layers) */
+    int head_dim;        /* head dimension for self_attn */
     int vocab_size;
     int max_seq_len;
     float rope_freq_base;
     float rms_norm_eps;
+
+    /* DeltaNet (linear_attention) config */
+    int delta_n_heads;       /* number of DeltaNet heads (e.g., 16) */
+    int delta_key_head_dim;  /* key head dim (e.g., 128) */
+    int delta_value_head_dim;/* value head dim (e.g., 128) */
+    int delta_conv_width;    /* conv1d kernel width (e.g., 4) */
+    float partial_rotary_factor; /* fraction of head_dim that uses RoPE (e.g., 0.25) */
+
+    /* QK-norm for self_attn (Qwen3.5 style) */
+    int use_qk_norm;         /* 1 if q_norm/k_norm weights present */
+    int attn_output_gate;    /* 1 if q_proj includes output gate (doubled q_proj output) */
 } tq_model_config_t;
 
 /* ============================================================
  * Model weights (in memory)
  * ============================================================ */
 typedef struct {
-    float* attn_norm;     /* [hidden_dim] */
-    float* ffn_norm;      /* [hidden_dim] */
+    /* RMSNorm weights */
+    float* attn_norm;     /* [hidden_dim] input_layernorm */
+    float* ffn_norm;      /* [hidden_dim] post_attention_layernorm */
+
+    /* Standard self_attn weights (NULL for DeltaNet layers) */
     float* wq;            /* [n_heads * head_dim, hidden_dim] */
     float* wk;            /* [n_kv_heads * head_dim, hidden_dim] */
     float* wv;            /* [n_kv_heads * head_dim, hidden_dim] */
     float* wo;            /* [hidden_dim, n_heads * head_dim] */
+    float* q_norm;        /* [head_dim] QK-norm for queries */
+    float* k_norm;        /* [head_dim] QK-norm for keys */
+
+    /* SwiGLU FFN weights (present on ALL layers) */
     float* w_gate;        /* [intermediate_dim, hidden_dim] */
     float* w_up;          /* [intermediate_dim, hidden_dim] */
     float* w_down;        /* [hidden_dim, intermediate_dim] */
+
+    /* DeltaNet (linear_attention) weights (NULL for self_attn layers) */
+    float* delta_a_log;       /* [delta_n_heads] decay parameter (log scale) */
+    float* delta_conv1d;      /* [qkv_dim, 1, conv_width] */
+    float* delta_dt_bias;     /* [delta_n_heads] delta bias */
+    float* delta_in_proj_a;   /* [delta_n_heads, hidden_dim] */
+    float* delta_in_proj_b;   /* [delta_n_heads, hidden_dim] */
+    float* delta_in_proj_qkv; /* [qkv_dim, hidden_dim] (qkv_dim = 3 * delta_n_heads * delta_key_head_dim) */
+    float* delta_in_proj_z;   /* [z_dim, hidden_dim] (z_dim = delta_n_heads * delta_value_head_dim) */
+    float* delta_norm;        /* [delta_value_head_dim] group norm weight */
+    float* delta_out_proj;    /* [hidden_dim, z_dim] */
 } tq_layer_weights_t;
 
 typedef struct {
@@ -80,11 +109,21 @@ typedef struct {
     float* hb2;         /* [intermediate_dim] FFN buffer 2 */
     float* logits;      /* [vocab_size] output logits */
 
-    /* KV cache — FP32 for values, quantized for keys via TurboQuant */
+    /* KV cache for self_attn layers */
     float* key_cache;    /* [n_layers, max_seq_len, n_kv_heads * head_dim] */
     float* value_cache;  /* [n_layers, max_seq_len, n_kv_heads * head_dim] */
     tq_type kv_quant_type; /* quantization type for KV attention */
     size_t kv_cache_size;
+
+    /* DeltaNet recurrent state */
+    float* delta_state;  /* [n_layers, delta_n_heads, key_head_dim, value_head_dim] */
+    float* conv_state;   /* [n_layers, qkv_dim, conv_width-1] */
+
+    /* DeltaNet workspace buffers */
+    float* delta_qkv;    /* [qkv_dim] workspace for QKV projection */
+    float* delta_z;      /* [z_dim] workspace for Z gate */
+    float* delta_ab;     /* [delta_n_heads * 2] workspace for a,b projections */
+    float* delta_out;    /* [z_dim] workspace for output */
 
     /* Quantization workspace */
     void* quant_key_buf;    /* workspace for quantized keys */
@@ -109,12 +148,15 @@ typedef struct {
  * Tokenizer
  * ============================================================ */
 typedef struct {
-    char** vocab;        /* token strings */
-    float* scores;       /* BPE merge scores */
-    int vocab_size;
+    char** vocab;        /* token strings, indexed by token_id */
+    float* scores;       /* BPE merge scores (merge priority) */
+    int vocab_size;      /* total vocab capacity (max_id + 1) */
     int max_token_len;
-    /* Sorted vocab for encoding */
+    int n_merges;        /* number of BPE merges loaded */
+    /* Sorted vocab for encoding (binary search by string) */
     int* sorted_indices;
+    /* Merge table: pairs of token IDs that merge into a result */
+    int* merge_pairs;    /* [n_merges * 3]: (token_a, token_b, result_id) */
 } tq_tokenizer_t;
 
 /* ============================================================

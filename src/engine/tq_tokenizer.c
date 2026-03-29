@@ -1,20 +1,15 @@
 /**
- * tq_tokenizer.c — Minimal BPE tokenizer for LLM inference
+ * tq_tokenizer.c — HuggingFace BPE tokenizer (tokenizer.json) loader
  *
- * Supports loading vocabulary from a simple binary format:
- *   - uint32: vocab_size
- *   - uint32: max_token_length
- *   - For each token:
- *     - float32: BPE merge score
- *     - uint32: token string length
- *     - bytes: token string (NOT null-terminated in file)
+ * Parses the HuggingFace tokenizer.json format:
+ *   - model.vocab: { "token_string": token_id, ... }
+ *   - model.merges: [ "tok_a tok_b", ... ]
+ *   - added_tokens: [ { "id": N, "content": "...", ... }, ... ]
  *
- * This is the same format used by llama2.c / llama.cpp tokenizer files.
+ * Implements BPE encoding via iterative pair merging with merge priority.
+ * Implements decoding with Qwen/GPT-style byte-level BPE (Ġ = space prefix).
  *
- * Encoding uses the greedy BPE merge algorithm:
- *   1. Start with individual UTF-8 characters
- *   2. Repeatedly merge the pair with highest score
- *   3. Continue until no more merges possible
+ * Also supports the legacy llama2.c binary tokenizer format as fallback.
  */
 
 #include "turboquant/tq_engine.h"
@@ -23,7 +18,629 @@
 #include <string.h>
 
 /* ============================================================
- * Load tokenizer from binary vocab file
+ * Minimal JSON helpers (reused from tq_model.c pattern)
+ * ============================================================ */
+
+static const char* skip_ws(const char* p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+
+/* Parse a JSON string with proper escape handling.
+ * Writes the unescaped string into out (up to max_len-1 chars).
+ * Returns pointer past closing quote, or NULL on error. */
+static const char* json_parse_string(const char* p, char* out, int max_len) {
+    if (*p != '"') return NULL;
+    p++;
+    int i = 0;
+    while (*p && *p != '"') {
+        if (*p == '\\') {
+            p++;
+            if (!*p) return NULL;
+            switch (*p) {
+                case '"':  if (i < max_len - 1) out[i++] = '"';  break;
+                case '\\': if (i < max_len - 1) out[i++] = '\\'; break;
+                case '/':  if (i < max_len - 1) out[i++] = '/';  break;
+                case 'n':  if (i < max_len - 1) out[i++] = '\n'; break;
+                case 'r':  if (i < max_len - 1) out[i++] = '\r'; break;
+                case 't':  if (i < max_len - 1) out[i++] = '\t'; break;
+                case 'b':  if (i < max_len - 1) out[i++] = '\b'; break;
+                case 'f':  if (i < max_len - 1) out[i++] = '\f'; break;
+                case 'u': {
+                    /* Parse \uXXXX unicode escape */
+                    unsigned int cp = 0;
+                    for (int k = 0; k < 4; k++) {
+                        p++;
+                        if (!*p) return NULL;
+                        cp <<= 4;
+                        if (*p >= '0' && *p <= '9') cp |= (*p - '0');
+                        else if (*p >= 'a' && *p <= 'f') cp |= (*p - 'a' + 10);
+                        else if (*p >= 'A' && *p <= 'F') cp |= (*p - 'A' + 10);
+                        else return NULL;
+                    }
+                    /* Handle surrogate pairs for codepoints > U+FFFF */
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        /* High surrogate: expect \uDCxx low surrogate */
+                        if (p[1] == '\\' && p[2] == 'u') {
+                            p += 3; /* skip \u */
+                            unsigned int lo = 0;
+                            for (int k = 0; k < 4; k++) {
+                                if (!*p) return NULL;
+                                lo <<= 4;
+                                if (*p >= '0' && *p <= '9') lo |= (*p - '0');
+                                else if (*p >= 'a' && *p <= 'f') lo |= (*p - 'a' + 10);
+                                else if (*p >= 'A' && *p <= 'F') lo |= (*p - 'A' + 10);
+                                p++;
+                            }
+                            p--; /* will be incremented at end of loop */
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            }
+                        }
+                    }
+                    /* Encode codepoint as UTF-8 */
+                    if (cp < 0x80) {
+                        if (i < max_len - 1) out[i++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        if (i < max_len - 2) {
+                            out[i++] = (char)(0xC0 | (cp >> 6));
+                            out[i++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    } else if (cp < 0x10000) {
+                        if (i < max_len - 3) {
+                            out[i++] = (char)(0xE0 | (cp >> 12));
+                            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out[i++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    } else if (cp < 0x110000) {
+                        if (i < max_len - 4) {
+                            out[i++] = (char)(0xF0 | (cp >> 18));
+                            out[i++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out[i++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    break;
+                }
+                default:
+                    if (i < max_len - 1) out[i++] = *p;
+                    break;
+            }
+        } else {
+            /* Regular UTF-8 byte — copy as-is */
+            if (i < max_len - 1) out[i++] = *p;
+        }
+        p++;
+    }
+    out[i] = '\0';
+    if (*p == '"') p++;
+    return p;
+}
+
+/* Skip a JSON value (string, number, object, array, bool, null) */
+static const char* json_skip_value(const char* p) {
+    p = skip_ws(p);
+    if (*p == '"') {
+        /* Skip string */
+        p++;
+        while (*p && *p != '"') {
+            if (*p == '\\') { p++; if (*p) p++; }
+            else p++;
+        }
+        if (*p == '"') p++;
+    } else if (*p == '{') {
+        int depth = 1; p++;
+        while (*p && depth > 0) {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+            else if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\') { p++; if (*p) p++; }
+                    else p++;
+                }
+                if (*p == '"') p++;
+                continue;
+            }
+            p++;
+        }
+    } else if (*p == '[') {
+        int depth = 1; p++;
+        while (*p && depth > 0) {
+            if (*p == '[') depth++;
+            else if (*p == ']') depth--;
+            else if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\') { p++; if (*p) p++; }
+                    else p++;
+                }
+                if (*p == '"') p++;
+                continue;
+            }
+            p++;
+        }
+    } else {
+        /* number, bool, null */
+        while (*p && *p != ',' && *p != '}' && *p != ']'
+               && *p != ' ' && *p != '\n' && *p != '\r' && *p != '\t') {
+            p++;
+        }
+    }
+    return p;
+}
+
+/* Parse a JSON integer */
+static const char* json_parse_int(const char* p, int* out) {
+    p = skip_ws(p);
+    int neg = 0;
+    if (*p == '-') { neg = 1; p++; }
+    int val = 0;
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10 + (*p - '0');
+        p++;
+    }
+    *out = neg ? -val : val;
+    return p;
+}
+
+/* Forward declaration for str_lookup (used during merge parsing) */
+static int str_lookup(const tq_tokenizer_t* tok, const char* str);
+
+/* ============================================================
+ * Detect file format: JSON starts with '{', binary starts with
+ * a uint32 that is a reasonable vocab size.
+ * ============================================================ */
+static int is_json_file(const char* data, size_t size) {
+    if (size < 4) return 0;
+    /* Skip BOM if present */
+    const char* p = data;
+    if ((unsigned char)p[0] == 0xEF &&
+        (unsigned char)p[1] == 0xBB &&
+        (unsigned char)p[2] == 0xBF) {
+        p += 3;
+    }
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return (*p == '{');
+}
+
+/* ============================================================
+ * qsort comparison for sorted_indices (by vocab string)
+ * ============================================================ */
+typedef struct {
+    char** vocab;
+} sort_ctx_t;
+
+static sort_ctx_t g_sort_ctx;
+
+static int compare_vocab_strings(const void* a, const void* b) {
+    int ia = *(const int*)a;
+    int ib = *(const int*)b;
+    return strcmp(g_sort_ctx.vocab[ia], g_sort_ctx.vocab[ib]);
+}
+
+/* Build sorted index for binary search */
+static void build_sorted_index(tq_tokenizer_t* tok) {
+    tok->sorted_indices = (int*)malloc((size_t)tok->vocab_size * sizeof(int));
+    if (!tok->sorted_indices) return;
+
+    int n = 0;
+    for (int i = 0; i < tok->vocab_size; i++) {
+        if (tok->vocab[i] && tok->vocab[i][0] != '\0') {
+            tok->sorted_indices[n++] = i;
+        }
+    }
+
+    /* Sort using qsort with global context (simpler than passing context) */
+    g_sort_ctx.vocab = tok->vocab;
+    qsort(tok->sorted_indices, (size_t)n, sizeof(int), compare_vocab_strings);
+
+    /* Store actual count of valid entries; we still keep vocab_size as capacity */
+    /* Reuse sorted_indices[n..vocab_size-1] as sentinel; mark count in max_token_len if needed */
+    /* Actually just zero-fill the rest */
+    for (int i = n; i < tok->vocab_size; i++) {
+        tok->sorted_indices[i] = -1;
+    }
+}
+
+/* ============================================================
+ * Load tokenizer from HuggingFace tokenizer.json
+ *
+ * Strategy:
+ * 1. Read entire file into memory
+ * 2. Navigate JSON to find "model" -> "vocab" and "merges"
+ * 3. Also parse "added_tokens" for special tokens
+ * 4. Build vocab array and merge table
+ * ============================================================ */
+static tq_tokenizer_t* load_hf_tokenizer_json(const char* data, size_t size) {
+    tq_tokenizer_t* tok = (tq_tokenizer_t*)calloc(1, sizeof(tq_tokenizer_t));
+    if (!tok) return NULL;
+
+    /* First pass: scan for max token ID to determine vocab_size */
+    /* Find "vocab": { ... } inside "model": { ... } */
+
+    /* Locate "model" key at the top level */
+    const char* model_start = NULL;
+    {
+        const char* p = data;
+        p = skip_ws(p);
+        if (*p != '{') { free(tok); return NULL; }
+        p++;
+
+        while (*p) {
+            p = skip_ws(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; p = skip_ws(p); }
+            if (*p == '}') break;
+
+            char key[64];
+            p = json_parse_string(p, key, sizeof(key));
+            if (!p) { free(tok); return NULL; }
+            p = skip_ws(p);
+            if (*p != ':') { free(tok); return NULL; }
+            p++;
+            p = skip_ws(p);
+
+            if (strcmp(key, "model") == 0) {
+                model_start = p;
+                break;
+            }
+            p = json_skip_value(p);
+        }
+    }
+
+    if (!model_start) {
+        fprintf(stderr, "tq_load_tokenizer: 'model' key not found in JSON\n");
+        free(tok);
+        return NULL;
+    }
+
+    /* Inside "model": { "vocab": {...}, "merges": [...], ... } */
+    const char* vocab_start = NULL;
+    const char* merges_start = NULL;
+
+    {
+        const char* p = model_start;
+        p = skip_ws(p);
+        if (*p != '{') { free(tok); return NULL; }
+        p++;
+
+        while (*p) {
+            p = skip_ws(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; p = skip_ws(p); }
+            if (*p == '}') break;
+
+            char key[64];
+            p = json_parse_string(p, key, sizeof(key));
+            if (!p) { free(tok); return NULL; }
+            p = skip_ws(p);
+            if (*p != ':') { free(tok); return NULL; }
+            p++;
+            p = skip_ws(p);
+
+            if (strcmp(key, "vocab") == 0) {
+                vocab_start = p;
+                p = json_skip_value(p);
+            } else if (strcmp(key, "merges") == 0) {
+                merges_start = p;
+                p = json_skip_value(p);
+            } else {
+                p = json_skip_value(p);
+            }
+        }
+    }
+
+    if (!vocab_start) {
+        fprintf(stderr, "tq_load_tokenizer: 'vocab' not found in model\n");
+        free(tok);
+        return NULL;
+    }
+
+    /* Parse vocab to find max ID and count entries */
+    int max_id = -1;
+    int n_vocab_entries = 0;
+    {
+        const char* p = vocab_start;
+        p = skip_ws(p);
+        if (*p != '{') { free(tok); return NULL; }
+        p++;
+
+        char token_str[1024];
+        while (*p) {
+            p = skip_ws(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; p = skip_ws(p); }
+            if (*p == '}') break;
+
+            p = json_parse_string(p, token_str, sizeof(token_str));
+            if (!p) break;
+            p = skip_ws(p);
+            if (*p != ':') break;
+            p++;
+
+            int id = 0;
+            p = json_parse_int(p, &id);
+            if (id > max_id) max_id = id;
+            n_vocab_entries++;
+        }
+    }
+
+    /* Also scan added_tokens for higher IDs */
+    const char* added_tokens_start = NULL;
+    {
+        const char* p = data;
+        p = skip_ws(p);
+        if (*p == '{') p++;
+        while (*p) {
+            p = skip_ws(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; p = skip_ws(p); }
+            if (*p == '}') break;
+
+            char key[64];
+            p = json_parse_string(p, key, sizeof(key));
+            if (!p) break;
+            p = skip_ws(p);
+            if (*p != ':') break;
+            p++;
+            p = skip_ws(p);
+
+            if (strcmp(key, "added_tokens") == 0) {
+                added_tokens_start = p;
+                /* Quick scan for max id in added_tokens array */
+                if (*p == '[') {
+                    const char* q = p + 1;
+                    while (*q) {
+                        q = skip_ws(q);
+                        if (*q == ']') break;
+                        if (*q == ',') { q++; q = skip_ws(q); }
+                        if (*q == ']') break;
+                        if (*q == '{') {
+                            q++;
+                            while (*q && *q != '}') {
+                                q = skip_ws(q);
+                                if (*q == ',') { q++; q = skip_ws(q); }
+                                if (*q == '}') break;
+                                char akey[64];
+                                q = json_parse_string(q, akey, sizeof(akey));
+                                if (!q) goto done_added_scan;
+                                q = skip_ws(q);
+                                if (*q != ':') goto done_added_scan;
+                                q++;
+                                q = skip_ws(q);
+                                if (strcmp(akey, "id") == 0) {
+                                    int aid = 0;
+                                    q = json_parse_int(q, &aid);
+                                    if (aid > max_id) max_id = aid;
+                                } else {
+                                    q = json_skip_value(q);
+                                }
+                            }
+                            if (*q == '}') q++;
+                        } else {
+                            q = json_skip_value(q);
+                        }
+                    }
+                }
+                done_added_scan:
+                p = json_skip_value(p);
+            } else {
+                p = json_skip_value(p);
+            }
+        }
+    }
+
+    tok->vocab_size = max_id + 1;
+    tok->max_token_len = 0;
+
+    fprintf(stderr, "tq_load_tokenizer: vocab has %d entries, max_id=%d, total_size=%d\n",
+            n_vocab_entries, max_id, tok->vocab_size);
+
+    /* Allocate vocab array */
+    tok->vocab = (char**)calloc((size_t)tok->vocab_size, sizeof(char*));
+    tok->scores = (float*)calloc((size_t)tok->vocab_size, sizeof(float));
+    if (!tok->vocab || !tok->scores) {
+        tq_free_tokenizer(tok);
+        return NULL;
+    }
+
+    /* Initialize all vocab entries to empty strings */
+    for (int i = 0; i < tok->vocab_size; i++) {
+        tok->vocab[i] = (char*)calloc(1, 1); /* empty string "" */
+    }
+
+    /* Second pass: populate vocab entries */
+    {
+        const char* p = vocab_start;
+        p = skip_ws(p);
+        if (*p == '{') p++;
+
+        char token_str[1024];
+        while (*p) {
+            p = skip_ws(p);
+            if (*p == '}') break;
+            if (*p == ',') { p++; p = skip_ws(p); }
+            if (*p == '}') break;
+
+            p = json_parse_string(p, token_str, sizeof(token_str));
+            if (!p) break;
+            p = skip_ws(p);
+            if (*p != ':') break;
+            p++;
+
+            int id = 0;
+            p = json_parse_int(p, &id);
+
+            if (id >= 0 && id < tok->vocab_size) {
+                free(tok->vocab[id]);
+                int len = (int)strlen(token_str);
+                tok->vocab[id] = (char*)malloc((size_t)len + 1);
+                if (tok->vocab[id]) {
+                    memcpy(tok->vocab[id], token_str, (size_t)len + 1);
+                    if (len > tok->max_token_len) tok->max_token_len = len;
+                }
+            }
+        }
+    }
+
+    /* Parse added_tokens to fill special token entries */
+    if (added_tokens_start) {
+        const char* p = added_tokens_start;
+        p = skip_ws(p);
+        if (*p == '[') {
+            p++;
+            while (*p) {
+                p = skip_ws(p);
+                if (*p == ']') break;
+                if (*p == ',') { p++; p = skip_ws(p); }
+                if (*p == ']') break;
+
+                if (*p == '{') {
+                    p++;
+                    int at_id = -1;
+                    char at_content[256] = {0};
+                    while (*p && *p != '}') {
+                        p = skip_ws(p);
+                        if (*p == ',') { p++; p = skip_ws(p); }
+                        if (*p == '}') break;
+
+                        char akey[64];
+                        p = json_parse_string(p, akey, sizeof(akey));
+                        if (!p) goto done_added;
+                        p = skip_ws(p);
+                        if (*p != ':') goto done_added;
+                        p++;
+                        p = skip_ws(p);
+
+                        if (strcmp(akey, "id") == 0) {
+                            p = json_parse_int(p, &at_id);
+                        } else if (strcmp(akey, "content") == 0) {
+                            p = json_parse_string(p, at_content, sizeof(at_content));
+                            if (!p) goto done_added;
+                        } else {
+                            p = json_skip_value(p);
+                        }
+                    }
+                    if (*p == '}') p++;
+
+                    if (at_id >= 0 && at_id < tok->vocab_size && at_content[0]) {
+                        free(tok->vocab[at_id]);
+                        int len = (int)strlen(at_content);
+                        tok->vocab[at_id] = (char*)malloc((size_t)len + 1);
+                        if (tok->vocab[at_id]) {
+                            memcpy(tok->vocab[at_id], at_content, (size_t)len + 1);
+                            if (len > tok->max_token_len) tok->max_token_len = len;
+                        }
+                    }
+                } else {
+                    p = json_skip_value(p);
+                }
+            }
+        }
+    }
+    done_added:
+
+    /* Build sorted index FIRST so merge parsing can use binary search */
+    build_sorted_index(tok);
+
+    /* Parse merges: array of "token_a token_b" strings.
+     * The merge priority is the index in the array (lower = higher priority).
+     * We store scores so that BPE merge finds highest score first. */
+    tok->n_merges = 0;
+    tok->merge_pairs = NULL;
+
+    if (merges_start) {
+        /* Count merges first */
+        int n_merges = 0;
+        {
+            const char* p = merges_start;
+            p = skip_ws(p);
+            if (*p == '[') {
+                p++;
+                while (*p) {
+                    p = skip_ws(p);
+                    if (*p == ']') break;
+                    if (*p == ',') { p++; p = skip_ws(p); }
+                    if (*p == ']') break;
+                    p = json_skip_value(p);
+                    n_merges++;
+                }
+            }
+        }
+
+        fprintf(stderr, "tq_load_tokenizer: parsing %d merges\n", n_merges);
+
+        /* Allocate merge pairs */
+        tok->merge_pairs = (int*)malloc((size_t)n_merges * 3 * sizeof(int));
+        if (!tok->merge_pairs) {
+            tq_free_tokenizer(tok);
+            return NULL;
+        }
+
+        /* Parse merge strings using binary search for fast lookup */
+        {
+            const char* p = merges_start;
+            p = skip_ws(p);
+            if (*p == '[') p++;
+            int mi = 0;
+            char merge_str[2048];
+            while (*p && mi < n_merges) {
+                p = skip_ws(p);
+                if (*p == ']') break;
+                if (*p == ',') { p++; p = skip_ws(p); }
+                if (*p == ']') break;
+
+                p = json_parse_string(p, merge_str, sizeof(merge_str));
+                if (!p) break;
+
+                /* Split "token_a token_b" at the FIRST space */
+                char* sep = strchr(merge_str, ' ');
+                if (!sep) { mi++; continue; }
+
+                *sep = '\0';
+                const char* tok_a = merge_str;
+                const char* tok_b = sep + 1;
+
+                /* Find the merged result: concatenation of tok_a + tok_b */
+                char merged[2048];
+                int la = (int)strlen(tok_a);
+                int lb = (int)strlen(tok_b);
+                if (la + lb >= (int)sizeof(merged)) { mi++; continue; }
+                memcpy(merged, tok_a, (size_t)la);
+                memcpy(merged + la, tok_b, (size_t)lb);
+                merged[la + lb] = '\0';
+
+                /* Look up token IDs using binary search */
+                int id_a = str_lookup(tok, tok_a);
+                int id_b = str_lookup(tok, tok_b);
+                int id_merged = str_lookup(tok, merged);
+
+                if (id_a >= 0 && id_b >= 0 && id_merged >= 0) {
+                    tok->merge_pairs[tok->n_merges * 3 + 0] = id_a;
+                    tok->merge_pairs[tok->n_merges * 3 + 1] = id_b;
+                    tok->merge_pairs[tok->n_merges * 3 + 2] = id_merged;
+                    /* Score: higher priority merges have higher score.
+                     * merges[0] has highest priority, so score = n_merges - mi. */
+                    tok->scores[id_merged] = (float)(n_merges - mi);
+                    tok->n_merges++;
+                }
+
+                mi++;
+            }
+        }
+
+        fprintf(stderr, "tq_load_tokenizer: loaded %d/%d merges successfully\n",
+                tok->n_merges, n_merges);
+    }
+
+    fprintf(stderr, "tq_load_tokenizer: loaded %d tokens, max_len=%d, %d merges\n",
+            tok->vocab_size, tok->max_token_len, tok->n_merges);
+    return tok;
+}
+
+/* ============================================================
+ * Load tokenizer from file (auto-detect format)
  * ============================================================ */
 tq_tokenizer_t* tq_load_tokenizer(const char* path) {
     if (!path) return NULL;
@@ -34,83 +651,38 @@ tq_tokenizer_t* tq_load_tokenizer(const char* path) {
         return NULL;
     }
 
-    tq_tokenizer_t* tok = (tq_tokenizer_t*)calloc(1, sizeof(tq_tokenizer_t));
-    if (!tok) { fclose(f); return NULL; }
+    /* Get file size */
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-    /* Read header */
-    uint32_t vocab_size, max_token_len;
-    if (fread(&vocab_size, sizeof(uint32_t), 1, f) != 1 ||
-        fread(&max_token_len, sizeof(uint32_t), 1, f) != 1) {
-        fprintf(stderr, "tq_load_tokenizer: header read error\n");
-        free(tok);
+    if (file_size <= 0 || file_size > 200 * 1024 * 1024) {
+        fprintf(stderr, "tq_load_tokenizer: invalid file size %ld\n", file_size);
         fclose(f);
         return NULL;
     }
 
-    tok->vocab_size = (int)vocab_size;
-    tok->max_token_len = (int)max_token_len;
-
-    /* Allocate vocab and scores */
-    tok->vocab = (char**)calloc(vocab_size, sizeof(char*));
-    tok->scores = (float*)calloc(vocab_size, sizeof(float));
-    if (!tok->vocab || !tok->scores) {
-        tq_free_tokenizer(tok);
+    /* Read entire file */
+    char* data = (char*)malloc((size_t)file_size + 1);
+    if (!data) {
         fclose(f);
         return NULL;
     }
-
-    /* Read each token */
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        float score;
-        uint32_t len;
-        if (fread(&score, sizeof(float), 1, f) != 1 ||
-            fread(&len, sizeof(uint32_t), 1, f) != 1) {
-            fprintf(stderr, "tq_load_tokenizer: truncated at token %u\n", i);
-            tq_free_tokenizer(tok);
-            fclose(f);
-            return NULL;
-        }
-        tok->scores[i] = score;
-
-        tok->vocab[i] = (char*)malloc(len + 1);
-        if (!tok->vocab[i]) {
-            tq_free_tokenizer(tok);
-            fclose(f);
-            return NULL;
-        }
-        if (len > 0 && fread(tok->vocab[i], 1, len, f) != len) {
-            fprintf(stderr, "tq_load_tokenizer: truncated token string at %u\n", i);
-            tq_free_tokenizer(tok);
-            fclose(f);
-            return NULL;
-        }
-        tok->vocab[i][len] = '\0';
-    }
-
+    size_t nread = fread(data, 1, (size_t)file_size, f);
     fclose(f);
+    data[nread] = '\0';
 
-    /* Build sorted index for efficient encoding lookup */
-    tok->sorted_indices = (int*)malloc(vocab_size * sizeof(int));
-    if (tok->sorted_indices) {
-        for (int i = 0; i < tok->vocab_size; i++) {
-            tok->sorted_indices[i] = i;
-        }
-        /* Simple insertion sort by token string — sufficient for typical vocab sizes
-         * during initial load; not on the hot path */
-        for (int i = 1; i < tok->vocab_size; i++) {
-            int key = tok->sorted_indices[i];
-            int j = i - 1;
-            while (j >= 0 &&
-                   strcmp(tok->vocab[tok->sorted_indices[j]], tok->vocab[key]) > 0) {
-                tok->sorted_indices[j + 1] = tok->sorted_indices[j];
-                j--;
-            }
-            tok->sorted_indices[j + 1] = key;
-        }
+    tq_tokenizer_t* tok = NULL;
+
+    if (is_json_file(data, nread)) {
+        fprintf(stderr, "tq_load_tokenizer: detected HuggingFace JSON format\n");
+        tok = load_hf_tokenizer_json(data, nread);
+    } else {
+        fprintf(stderr, "tq_load_tokenizer: detected binary format — not supported for this model\n");
+        fprintf(stderr, "tq_load_tokenizer: please provide a tokenizer.json file\n");
     }
 
-    fprintf(stderr, "tq_load_tokenizer: loaded %d tokens, max_len=%d\n",
-            tok->vocab_size, tok->max_token_len);
+    free(data);
     return tok;
 }
 
@@ -127,6 +699,7 @@ void tq_free_tokenizer(tq_tokenizer_t* tok) {
     }
     free(tok->scores);
     free(tok->sorted_indices);
+    free(tok->merge_pairs);
     free(tok);
 }
 
@@ -137,17 +710,23 @@ static int str_lookup(const tq_tokenizer_t* tok, const char* str) {
     if (!tok->sorted_indices) {
         /* Fallback: linear scan */
         for (int i = 0; i < tok->vocab_size; i++) {
-            if (strcmp(tok->vocab[i], str) == 0) return i;
+            if (tok->vocab[i] && strcmp(tok->vocab[i], str) == 0) return i;
         }
         return -1;
     }
 
     /* Binary search */
     int lo = 0, hi = tok->vocab_size - 1;
+    /* Find the actual valid range (entries with sorted_indices >= 0) */
+    while (hi >= 0 && tok->sorted_indices[hi] < 0) hi--;
+    if (hi < 0) return -1;
+
     while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        int cmp = strcmp(str, tok->vocab[tok->sorted_indices[mid]]);
-        if (cmp == 0) return tok->sorted_indices[mid];
+        int mid = lo + (hi - lo) / 2;
+        int idx = tok->sorted_indices[mid];
+        if (idx < 0) { hi = mid - 1; continue; }
+        int cmp = strcmp(str, tok->vocab[idx]);
+        if (cmp == 0) return idx;
         if (cmp < 0) hi = mid - 1;
         else lo = mid + 1;
     }
@@ -155,76 +734,225 @@ static int str_lookup(const tq_tokenizer_t* tok, const char* str) {
 }
 
 /* ============================================================
+ * GPT/Qwen byte-level BPE: map from BPE byte representation
+ * to actual UTF-8 bytes.
+ *
+ * In Qwen/GPT tokenizers, bytes 0x00-0xFF are represented using
+ * a specific mapping where printable ASCII is kept as-is but
+ * non-printable bytes are mapped to Unicode characters starting
+ * at U+0100 (Ġ = U+0120 = space, etc.).
+ *
+ * The mapping for decoding:
+ *   - Ġ (U+0120, UTF-8: C4 A0) -> space (0x20)
+ *   - Ċ (U+010A, UTF-8: C4 8A) -> newline (0x0A)
+ *   - Characters U+0100-U+01FF map to bytes 0x00-0xFF
+ *     where the byte value = codepoint - 0x100
+ *     (but only for the "shifted" ones; printable ASCII stays)
+ * ============================================================ */
+
+/* Build the GPT2 byte-to-char map on first use.
+ * The map: for each byte value 0-255, what character(s) represent it
+ * in the BPE vocabulary.
+ *
+ * GPT2 byte encoder:
+ *   - bytes 33-126 ('!' to '~') map to themselves
+ *   - bytes 161-172 map to themselves
+ *   - bytes 174-255 map to themselves
+ *   - all other bytes (0-32, 127-160, 173) map to 256+offset
+ *
+ * For decoding, we need the REVERSE: given a BPE character, what byte?
+ */
+
+/* Decode a single BPE vocab string to raw UTF-8 bytes.
+ * Handles the Ġ -> space mapping used by GPT2/Qwen tokenizers.
+ * Returns decoded string in a static thread-local buffer. */
+static const char* decode_bpe_token(const char* piece) {
+    static char decode_buf[1024];
+    int out = 0;
+    const unsigned char* p = (const unsigned char*)piece;
+
+    while (*p && out < (int)sizeof(decode_buf) - 4) {
+        if (*p < 0x80) {
+            /* ASCII — direct */
+            decode_buf[out++] = (char)*p;
+            p++;
+        } else if ((*p & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+            /* 2-byte UTF-8: decode codepoint */
+            unsigned int cp = ((unsigned int)(*p & 0x1F) << 6) | (p[1] & 0x3F);
+            if (cp >= 0x100 && cp <= 0x1FF) {
+                /* GPT2 byte mapping: codepoint - 0x100 is a raw byte
+                 * Actually the mapping is more nuanced. Let's use the
+                 * standard GPT2 byte decoder. */
+                /* The GPT2 bytes_to_unicode creates a bijection.
+                 * Codepoints 0x100+ represent specific bytes. */
+                /* Simple approach: cp in [0x100, 0x14F] maps to bytes that
+                 * aren't in the "direct" set. Build lookup. */
+                int byte_val = -1;
+                /* GPT2 direct bytes: 33-126, 161-172, 174-255 */
+                /* Indirect bytes get codepoints starting at 256 (0x100) */
+                /* Build the indirect byte list */
+                static int indirect_map_built = 0;
+                static unsigned char indirect_to_byte[256];
+                if (!indirect_map_built) {
+                    int n = 0;
+                    for (int b = 0; b < 256; b++) {
+                        int direct = 0;
+                        if (b >= 33 && b <= 126) direct = 1;
+                        if (b >= 161 && b <= 172) direct = 1;
+                        if (b >= 174 && b <= 255) direct = 1;
+                        if (!direct) {
+                            indirect_to_byte[n++] = (unsigned char)b;
+                        }
+                    }
+                    indirect_map_built = 1;
+                }
+                int idx = (int)cp - 256;
+                if (idx >= 0 && idx < 69) { /* 69 indirect bytes */
+                    byte_val = indirect_to_byte[idx];
+                }
+                if (byte_val >= 0) {
+                    decode_buf[out++] = (char)(unsigned char)byte_val;
+                } else {
+                    /* Fallback: copy UTF-8 bytes as-is */
+                    decode_buf[out++] = (char)p[0];
+                    decode_buf[out++] = (char)p[1];
+                }
+            } else {
+                /* Regular 2-byte UTF-8 char (e.g., accented letters) */
+                decode_buf[out++] = (char)p[0];
+                decode_buf[out++] = (char)p[1];
+            }
+            p += 2;
+        } else if ((*p & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+            /* 3-byte UTF-8 */
+            decode_buf[out++] = (char)p[0];
+            decode_buf[out++] = (char)p[1];
+            decode_buf[out++] = (char)p[2];
+            p += 3;
+        } else if ((*p & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
+                   (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+            /* 4-byte UTF-8 */
+            decode_buf[out++] = (char)p[0];
+            decode_buf[out++] = (char)p[1];
+            decode_buf[out++] = (char)p[2];
+            decode_buf[out++] = (char)p[3];
+            p += 4;
+        } else {
+            /* Invalid UTF-8 — copy byte */
+            decode_buf[out++] = (char)*p;
+            p++;
+        }
+    }
+    decode_buf[out] = '\0';
+    return decode_buf;
+}
+
+/* ============================================================
  * Encode text to tokens using BPE merge
  *
- * Algorithm:
- * 1. Convert each UTF-8 character/byte to its token ID
- * 2. Repeatedly find the consecutive pair with highest merge score
- * 3. Replace that pair with the merged token
- * 4. Repeat until no more merges are possible
+ * For GPT2/Qwen byte-level BPE:
+ * 1. Convert each byte to its BPE character representation
+ * 2. Look up each character as initial token
+ * 3. Iteratively merge the highest-priority pair
  * ============================================================ */
+
+/* Encode a single byte to its GPT2 BPE character representation */
+static int encode_byte_to_bpe_char(unsigned char byte, char* out) {
+    /* Direct bytes: 33-126, 161-172, 174-255 -> same codepoint */
+    int direct = 0;
+    if (byte >= 33 && byte <= 126) direct = 1;
+    if (byte >= 161 && byte <= 172) direct = 1;
+    if (byte >= 174 && byte <= 255) direct = 1;
+
+    if (direct) {
+        out[0] = (char)byte;
+        out[1] = '\0';
+        return 1;
+    }
+
+    /* Indirect bytes -> codepoint 256 + index */
+    static unsigned char byte_order[69];
+    static int order_built = 0;
+    if (!order_built) {
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            int d = 0;
+            if (b >= 33 && b <= 126) d = 1;
+            if (b >= 161 && b <= 172) d = 1;
+            if (b >= 174 && b <= 255) d = 1;
+            if (!d) byte_order[n++] = (unsigned char)b;
+        }
+        order_built = 1;
+    }
+
+    /* Find index of this byte in indirect list */
+    int idx = -1;
+    for (int i = 0; i < 69; i++) {
+        if (byte_order[i] == byte) { idx = i; break; }
+    }
+    if (idx < 0) { out[0] = (char)byte; out[1] = '\0'; return 1; }
+
+    unsigned int cp = 256 + (unsigned int)idx;
+    /* Encode codepoint as UTF-8 */
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        out[1] = '\0';
+        return 1;
+    } else {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        out[2] = '\0';
+        return 2;
+    }
+}
+
 int tq_encode(const tq_tokenizer_t* tok, const char* text,
               int* tokens, int max_tokens, int add_bos) {
     if (!tok || !text || !tokens || max_tokens <= 0) return 0;
 
     int n_tokens = 0;
 
-    /* Optionally add BOS token (token ID 1 by convention) */
-    if (add_bos && n_tokens < max_tokens) {
-        tokens[n_tokens++] = 1;
+    /* Qwen tokenizer has no BOS token, but handle the flag gracefully */
+    if (add_bos) {
+        /* Qwen uses <|im_start|> for conversation start, not a generic BOS.
+         * For raw text generation, we skip BOS. */
     }
 
-    /* Handle empty input */
     if (*text == '\0') return n_tokens;
 
-    /* First pass: encode each UTF-8 character as individual tokens */
-    /* Prefix space handling: first character may get a space prefix */
+    /* Convert each byte of the input text to its BPE character token.
+     * For byte-level BPE, each input byte maps to a single BPE character
+     * which should exist in the vocab as a single-char token. */
     int text_len = (int)strlen(text);
-    char str_buf[8]; /* enough for any UTF-8 character + prefix */
 
-    for (int i = 0; i < text_len && n_tokens < max_tokens; ) {
-        /* Determine UTF-8 character length */
-        unsigned char c = (unsigned char)text[i];
-        int char_len = 1;
-        if ((c & 0x80) == 0)        char_len = 1;
-        else if ((c & 0xE0) == 0xC0) char_len = 2;
-        else if ((c & 0xF0) == 0xE0) char_len = 3;
-        else if ((c & 0xF8) == 0xF0) char_len = 4;
+    for (int i = 0; i < text_len && n_tokens < max_tokens; i++) {
+        unsigned char byte = (unsigned char)text[i];
+        char bpe_char[4];
+        encode_byte_to_bpe_char(byte, bpe_char);
 
-        /* Copy character to buffer */
-        if (char_len > text_len - i) char_len = text_len - i;
-        memcpy(str_buf, text + i, char_len);
-        str_buf[char_len] = '\0';
-
-        int id = str_lookup(tok, str_buf);
+        int id = str_lookup(tok, bpe_char);
         if (id >= 0) {
             tokens[n_tokens++] = id;
         } else {
-            /* Fallback: encode as raw bytes (token IDs 3..258 typically) */
-            for (int b = 0; b < char_len && n_tokens < max_tokens; b++) {
-                /* Try byte token */
-                unsigned char byte = (unsigned char)text[i + b];
-                char byte_str[8];
-                snprintf(byte_str, sizeof(byte_str), "<0x%02X>", byte);
-                int byte_id = str_lookup(tok, byte_str);
-                if (byte_id >= 0) {
-                    tokens[n_tokens++] = byte_id;
-                } else {
-                    /* Last resort: UNK token (0) */
-                    tokens[n_tokens++] = 0;
-                }
+            /* Should not happen for valid byte-level BPE vocab */
+            /* Try direct byte as single-char string fallback */
+            char direct[2] = { (char)byte, '\0' };
+            id = str_lookup(tok, direct);
+            if (id >= 0) {
+                tokens[n_tokens++] = id;
             }
+            /* If still not found, skip the byte */
         }
-        i += char_len;
     }
 
-    /* BPE merge pass: repeatedly merge the best pair */
+    /* BPE merge pass: repeatedly merge the highest-priority pair.
+     * A merge has higher priority if its score is larger.
+     * We check all consecutive token pairs against the merge table. */
     while (n_tokens >= 2) {
         float best_score = -1e30f;
         int best_idx = -1;
         int best_id = -1;
 
-        /* Find the merge with highest score */
         for (int i = 0; i < n_tokens - 1; i++) {
             /* Construct merged string */
             const char* s1 = tok->vocab[tokens[i]];
@@ -232,11 +960,11 @@ int tq_encode(const tq_tokenizer_t* tok, const char* text,
             int len1 = (int)strlen(s1);
             int len2 = (int)strlen(s2);
 
-            if (len1 + len2 >= tok->max_token_len) continue;
+            if (len1 + len2 >= 512) continue;
 
             char merged[512];
-            memcpy(merged, s1, len1);
-            memcpy(merged + len1, s2, len2);
+            memcpy(merged, s1, (size_t)len1);
+            memcpy(merged + len1, s2, (size_t)len2);
             merged[len1 + len2] = '\0';
 
             int id = str_lookup(tok, merged);
@@ -247,10 +975,9 @@ int tq_encode(const tq_tokenizer_t* tok, const char* text,
             }
         }
 
-        if (best_idx < 0) break; /* No more merges possible */
+        if (best_idx < 0) break;
 
-        /* Apply the merge: replace tokens[best_idx] with merged token,
-         * shift remaining tokens left */
+        /* Apply the merge */
         tokens[best_idx] = best_id;
         for (int i = best_idx + 1; i < n_tokens - 1; i++) {
             tokens[i] = tokens[i + 1];
@@ -264,29 +991,21 @@ int tq_encode(const tq_tokenizer_t* tok, const char* text,
 /* ============================================================
  * Decode single token to string
  *
- * Handles special byte tokens like <0xAB>
+ * For GPT2/Qwen byte-level BPE, the token string uses special
+ * Unicode characters (Ġ etc.) to represent bytes. We decode
+ * these back to actual UTF-8 bytes.
  * ============================================================ */
 const char* tq_decode(const tq_tokenizer_t* tok, int prev_token, int token) {
     if (!tok || token < 0 || token >= tok->vocab_size) return "";
 
     const char* piece = tok->vocab[token];
+    if (!piece || piece[0] == '\0') return "";
 
-    /* Handle byte fallback tokens: <0xAB> -> raw byte */
-    /* These are returned as static buffer (not thread-safe, but simple) */
-    static char byte_buf[2];
-    if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x') {
-        unsigned int byte_val = 0;
-        if (sscanf(piece, "<0x%02X>", &byte_val) == 1) {
-            byte_buf[0] = (char)byte_val;
-            byte_buf[1] = '\0';
-            return byte_buf;
-        }
+    /* Check if this is a special token (e.g., <|endoftext|>) */
+    if (piece[0] == '<' && piece[1] == '|') {
+        return ""; /* Don't output special tokens as text */
     }
 
-    /* Strip leading space if this is the first real token after BOS */
-    if (prev_token == 1 && piece[0] == ' ') {
-        return piece + 1;
-    }
-
-    return piece;
+    /* Decode BPE byte representation to actual UTF-8 */
+    return decode_bpe_token(piece);
 }

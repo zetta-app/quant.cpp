@@ -699,19 +699,106 @@ tq_model_t* tq_load_model(const char* path) {
     if (wq0 && wk0) {
         int q_out = (int)wq0->shape[0];
         int k_out = (int)wk0->shape[0];
-        /* Common head_dim values: 64, 128 */
-        /* Try head_dim = 128, then 64, then 96 */
-        int head_dim = 128;
-        if (q_out % head_dim != 0) head_dim = 64;
-        if (q_out % head_dim != 0) head_dim = 96;
+
+        /* Try to detect head_dim from q_norm weight if available */
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.self_attn.q_norm.weight", probe_layer);
+        tensor_info_t* qn0 = find_tensor(tensors, n_tensors, name_buf);
+        int head_dim;
+        if (qn0 && qn0->n_dims >= 1) {
+            head_dim = (int)qn0->shape[0];
+            model->config.use_qk_norm = 1;
+        } else {
+            /* Common head_dim values: 128, 64, 96, 256 */
+            head_dim = 128;
+            if (q_out % head_dim != 0) head_dim = 64;
+            if (q_out % head_dim != 0) head_dim = 96;
+            if (q_out % head_dim != 0) head_dim = 256;
+            model->config.use_qk_norm = 0;
+        }
         model->config.head_dim = head_dim;
-        model->config.n_heads = q_out / head_dim;
         model->config.n_kv_heads = k_out / head_dim;
+
+        /* Detect attn_output_gate: if q_proj output is exactly 2x k_proj
+         * output * (n_heads/n_kv_heads ratio), then q_proj includes a gate.
+         * More precisely: q_out = n_heads * head_dim * (1 + gate).
+         * Compare against o_proj input dim to determine n_heads. */
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.self_attn.o_proj.weight", probe_layer);
+        tensor_info_t* wo0 = find_tensor(tensors, n_tensors, name_buf);
+        if (wo0 && wo0->n_dims >= 2) {
+            int o_in = (int)wo0->shape[1]; /* o_proj is [hidden_dim, n_heads*head_dim] */
+            int n_heads_from_o = o_in / head_dim;
+            if (q_out == n_heads_from_o * head_dim * 2) {
+                /* q_proj is doubled: [Q, gate_q] */
+                model->config.attn_output_gate = 1;
+                model->config.n_heads = n_heads_from_o;
+                fprintf(stderr, "tq_load_model: detected attn_output_gate=1 "
+                        "(q_proj=%d = 2 * %d * %d)\n",
+                        q_out, n_heads_from_o, head_dim);
+            } else {
+                model->config.attn_output_gate = 0;
+                model->config.n_heads = q_out / head_dim;
+            }
+        } else {
+            model->config.attn_output_gate = 0;
+            model->config.n_heads = q_out / head_dim;
+        }
     } else {
         /* Defaults for small models */
         model->config.head_dim = 64;
         model->config.n_heads = model->config.hidden_dim / 64;
         model->config.n_kv_heads = model->config.n_heads;
+        model->config.use_qk_norm = 0;
+        model->config.attn_output_gate = 0;
+    }
+
+    /* Detect DeltaNet config from first linear_attn layer */
+    model->config.delta_n_heads = 0;
+    model->config.delta_key_head_dim = 0;
+    model->config.delta_value_head_dim = 0;
+    model->config.delta_conv_width = 4;
+    model->config.partial_rotary_factor = 0.0f;
+    {
+        /* Find first DeltaNet layer */
+        int delta_layer = -1;
+        for (int l = 0; l < model->config.n_layers; l++) {
+            snprintf(name_buf, sizeof(name_buf),
+                     "model.layers.%d.linear_attn.A_log", l);
+            if (find_tensor(tensors, n_tensors, name_buf)) {
+                delta_layer = l;
+                break;
+            }
+        }
+        if (delta_layer >= 0) {
+            snprintf(name_buf, sizeof(name_buf),
+                     "model.layers.%d.linear_attn.A_log", delta_layer);
+            tensor_info_t* a_log = find_tensor(tensors, n_tensors, name_buf);
+            if (a_log) {
+                model->config.delta_n_heads = (int)a_log->shape[0];
+            }
+
+            snprintf(name_buf, sizeof(name_buf),
+                     "model.layers.%d.linear_attn.in_proj_qkv.weight", delta_layer);
+            tensor_info_t* qkv_proj = find_tensor(tensors, n_tensors, name_buf);
+            if (qkv_proj && model->config.delta_n_heads > 0) {
+                int qkv_dim = (int)qkv_proj->shape[0];
+                /* qkv_dim = 3 * n_heads * head_dim */
+                model->config.delta_key_head_dim = qkv_dim / (3 * model->config.delta_n_heads);
+                model->config.delta_value_head_dim = model->config.delta_key_head_dim;
+            }
+
+            snprintf(name_buf, sizeof(name_buf),
+                     "model.layers.%d.linear_attn.conv1d.weight", delta_layer);
+            tensor_info_t* conv = find_tensor(tensors, n_tensors, name_buf);
+            if (conv && conv->n_dims >= 3) {
+                model->config.delta_conv_width = (int)conv->shape[2];
+            }
+
+            fprintf(stderr, "tq_load_model: DeltaNet config — %d heads, key_dim=%d, val_dim=%d, conv_w=%d\n",
+                    model->config.delta_n_heads, model->config.delta_key_head_dim,
+                    model->config.delta_value_head_dim, model->config.delta_conv_width);
+        }
     }
 
     /* Detect intermediate_dim from gate projection (use probe_layer) */
@@ -730,10 +817,18 @@ tq_model_t* tq_load_model(const char* path) {
         model->config.intermediate_dim = model->config.hidden_dim * 4;
     }
 
-    /* Defaults */
+    /* Defaults — tuned for Qwen3.5 if DeltaNet detected */
     model->config.max_seq_len = 4096;
-    model->config.rope_freq_base = 10000.0f;
-    model->config.rms_norm_eps = 1e-5f;
+    if (model->config.delta_n_heads > 0) {
+        /* Qwen3.5 uses rope_theta=10M, rms_norm_eps=1e-6, partial_rotary=0.25 */
+        model->config.rope_freq_base = 10000000.0f;
+        model->config.rms_norm_eps = 1e-6f;
+        model->config.partial_rotary_factor = 0.25f;
+    } else {
+        model->config.rope_freq_base = 10000.0f;
+        model->config.rms_norm_eps = 1e-5f;
+        model->config.partial_rotary_factor = 0.0f;
+    }
 
     /* Allocate layer weight pointers */
     int n_layers = model->config.n_layers;
@@ -790,6 +885,74 @@ tq_model_t* tq_load_model(const char* path) {
         layer->wo = load_tensor(data_base,
                                  find_tensor(tensors, n_tensors, name_buf),
                                  &conv_buf, &conv_used, conv_capacity);
+
+        /* QK-norm weights (Qwen3.5 style) */
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.self_attn.q_norm.weight", l);
+        layer->q_norm = load_tensor(data_base,
+                                     find_tensor(tensors, n_tensors, name_buf),
+                                     &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.self_attn.k_norm.weight", l);
+        layer->k_norm = load_tensor(data_base,
+                                     find_tensor(tensors, n_tensors, name_buf),
+                                     &conv_buf, &conv_used, conv_capacity);
+
+        /* DeltaNet (linear_attention) weights */
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.A_log", l);
+        layer->delta_a_log = load_tensor(data_base,
+                                          find_tensor(tensors, n_tensors, name_buf),
+                                          &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.conv1d.weight", l);
+        layer->delta_conv1d = load_tensor(data_base,
+                                           find_tensor(tensors, n_tensors, name_buf),
+                                           &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.dt_bias", l);
+        layer->delta_dt_bias = load_tensor(data_base,
+                                            find_tensor(tensors, n_tensors, name_buf),
+                                            &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.in_proj_a.weight", l);
+        layer->delta_in_proj_a = load_tensor(data_base,
+                                              find_tensor(tensors, n_tensors, name_buf),
+                                              &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.in_proj_b.weight", l);
+        layer->delta_in_proj_b = load_tensor(data_base,
+                                              find_tensor(tensors, n_tensors, name_buf),
+                                              &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.in_proj_qkv.weight", l);
+        layer->delta_in_proj_qkv = load_tensor(data_base,
+                                                find_tensor(tensors, n_tensors, name_buf),
+                                                &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.in_proj_z.weight", l);
+        layer->delta_in_proj_z = load_tensor(data_base,
+                                              find_tensor(tensors, n_tensors, name_buf),
+                                              &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.norm.weight", l);
+        layer->delta_norm = load_tensor(data_base,
+                                         find_tensor(tensors, n_tensors, name_buf),
+                                         &conv_buf, &conv_used, conv_capacity);
+
+        snprintf(name_buf, sizeof(name_buf),
+                 "model.layers.%d.linear_attn.out_proj.weight", l);
+        layer->delta_out_proj = load_tensor(data_base,
+                                             find_tensor(tensors, n_tensors, name_buf),
+                                             &conv_buf, &conv_used, conv_capacity);
 
         /* FFN: gate, up, down projections (SwiGLU) */
         snprintf(name_buf, sizeof(name_buf),

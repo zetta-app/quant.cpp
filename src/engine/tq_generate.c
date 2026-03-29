@@ -178,12 +178,17 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     int output_pos = 0;
     int prev_token = prompt_tokens[n_prompt - 1];
 
-    /* EOS token IDs — common values */
-    int eos_token = 2;
+    /* EOS token IDs — check common values.
+     * Qwen3.5: eos = 248044 (<|endoftext|>), also 248046 (<|im_end|>)
+     * LLaMA: eos = 2 */
+    int eos_token1 = 2;       /* LLaMA convention */
+    int eos_token2 = 248044;  /* Qwen <|endoftext|> */
+    int eos_token3 = 248046;  /* Qwen <|im_end|> */
 
     /* Generate loop */
     while (generated < config->max_tokens) {
-        if (next_token == eos_token) break;
+        if (next_token == eos_token1 || next_token == eos_token2 ||
+            next_token == eos_token3) break;
         if (pos >= model->config.max_seq_len) break;
 
         /* Decode token to text */
