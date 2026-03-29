@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Streaming token callback */
 static void print_token(const char* text, void* user_data) {
@@ -157,11 +158,27 @@ int main(int argc, char** argv) {
     fprintf(stderr, "---\n");
 
     char output[65536];
+
+    /* Measure generation time for tok/s reporting */
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
     int n_generated = tq_generate(model, tokenizer, prompt, &config,
                                    output, sizeof(output));
 
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    double elapsed = (double)(ts_end.tv_sec - ts_start.tv_sec)
+                   + (double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+
     fprintf(stderr, "\n---\n");
-    fprintf(stderr, "Generated %d tokens\n", n_generated);
+    if (n_generated > 0 && elapsed > 0.0) {
+        double tok_per_sec = (double)n_generated / elapsed;
+        fprintf(stderr, "%d tokens in %.1fs (%.1f tok/s, %d threads, kv=%s)\n",
+                n_generated, elapsed, tok_per_sec, tq_get_threads(),
+                kv_type < TQ_TYPE_COUNT ? tq_type_name(kv_type) : "fp32");
+    } else {
+        fprintf(stderr, "Generated %d tokens\n", n_generated);
+    }
 
     /* Cleanup */
     if (tokenizer) tq_free_tokenizer(tokenizer);

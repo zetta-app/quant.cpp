@@ -100,8 +100,27 @@ tq_state_t* tq_create_state(const tq_model_config_t* config, tq_type kv_type) {
     if (block_size == 0) block_size = TQ_BK;
     if (type_size == 0) type_size = sizeof(block_tq_uniform_4b);
     size_t n_blocks_per_head = ((size_t)config->head_dim + block_size - 1) / block_size;
-    s->quant_key_buf = calloc(n_blocks_per_head * type_size * (size_t)config->n_kv_heads, 1);
+    /* quant_key_buf is used as a gather buffer for integer attention:
+     * we collect quantized key blocks for one KV head across all seq positions.
+     * Size needed: max_seq_len * blocks_per_head * type_size */
+    size_t gather_buf_size = (size_t)max_seq * n_blocks_per_head * type_size;
+    /* Ensure at least the old size for other uses */
+    size_t old_buf_size = n_blocks_per_head * type_size * (size_t)config->n_kv_heads;
+    if (gather_buf_size < old_buf_size) gather_buf_size = old_buf_size;
+    s->quant_key_buf = calloc(gather_buf_size, 1);
     s->quant_score_buf = (float*)calloc((size_t)max_seq, sizeof(float));
+
+    /* Quantized key cache for integer attention acceleration.
+     * Layout: [n_layers][max_seq_len][n_kv_heads][blocks_per_head * type_size]
+     * Each key vector is quantized when stored, then reused for fast Q4xQ8 attention. */
+    s->quant_head_stride = n_blocks_per_head * type_size;
+    size_t quant_pos_stride = s->quant_head_stride * (size_t)config->n_kv_heads;
+    s->quant_kv_stride = quant_pos_stride * (size_t)max_seq;
+    if (kv_type < TQ_TYPE_COUNT) {
+        s->quant_key_cache = calloc((size_t)n_layers * s->quant_kv_stride, 1);
+    } else {
+        s->quant_key_cache = NULL;
+    }
 
     /* Verify critical allocations */
     if (!s->x || !s->xb || !s->xb2 || !s->q || !s->k || !s->v ||
@@ -136,6 +155,7 @@ void tq_free_state(tq_state_t* state) {
     free(state->delta_out);
     free(state->quant_key_buf);
     free(state->quant_score_buf);
+    free(state->quant_key_cache);
     free(state);
 }
 
@@ -474,22 +494,77 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     memcpy(key_cache_layer + (size_t)pos * kv_dim, s->k, kv_dim * sizeof(float));
     memcpy(val_cache_layer + (size_t)pos * kv_dim, s->v, kv_dim * sizeof(float));
 
+    /* Quantize the new key into the quantized cache for integer attention.
+     * Each KV head's key vector is quantized independently into blocks. */
+    int use_int_attn = (s->kv_quant_type < TQ_TYPE_COUNT && s->quant_key_cache != NULL);
+    if (use_int_attn) {
+        const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
+        for (int kh = 0; kh < n_kv_heads; kh++) {
+            const float* key_src = s->k + kh * head_dim;
+            /* Destination in quantized cache:
+             * offset = layer * quant_kv_stride + pos * (n_kv_heads * quant_head_stride) + kh * quant_head_stride */
+            uint8_t* quant_dst = (uint8_t*)s->quant_key_cache
+                + (size_t)l * s->quant_kv_stride
+                + (size_t)pos * n_kv_heads * s->quant_head_stride
+                + (size_t)kh * s->quant_head_stride;
+            traits->quantize(key_src, quant_dst, head_dim);
+        }
+    }
+
     /* Multi-head attention */
     int seq_len = pos + 1;
+    /* Use integer attention when enough cached keys to amortize overhead */
+    int int_attn_threshold = 32;
 
     for (int h = 0; h < n_heads; h++) {
         float* qh = s->q + h * head_dim;
         float* atth = s->att + (size_t)h * c->max_seq_len;
         int kv_h = h / kv_mul;
 
-        /* Attention scores */
-        for (int t = 0; t < seq_len; t++) {
-            const float* kt = key_cache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-            float score = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                score += qh[d] * kt[d];
+        if (use_int_attn && seq_len > int_attn_threshold) {
+            /* Integer Q4xQ8 attention path.
+             * Gather quantized key blocks for this KV head across all positions
+             * into a contiguous buffer, then call the traits attention function.
+             *
+             * The quantized cache stores keys as:
+             *   [layer][pos][kv_head][blocks_per_head * type_size]
+             * The attention function expects:
+             *   [seq_len][blocks_per_head] contiguous blocks
+             * So we need to gather from strided positions. */
+            const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
+            size_t head_block_bytes = s->quant_head_stride;
+            size_t pos_stride_bytes = (size_t)n_kv_heads * head_block_bytes;
+            uint8_t* layer_base = (uint8_t*)s->quant_key_cache
+                + (size_t)l * s->quant_kv_stride;
+
+            /* Gather quantized blocks for this KV head into quant_key_buf */
+            uint8_t* gather_dst = (uint8_t*)s->quant_key_buf;
+            for (int t = 0; t < seq_len; t++) {
+                const uint8_t* src = layer_base
+                    + (size_t)t * pos_stride_bytes
+                    + (size_t)kv_h * head_block_bytes;
+                memcpy(gather_dst + (size_t)t * head_block_bytes, src, head_block_bytes);
             }
-            atth[t] = score / sqrtf((float)head_dim);
+
+            /* Compute attention scores using integer kernel */
+            traits->attention(qh, s->quant_key_buf, atth, seq_len, head_dim);
+
+            /* The integer attention computes raw dot products;
+             * apply 1/sqrt(head_dim) scaling */
+            float scale = 1.0f / sqrtf((float)head_dim);
+            for (int t = 0; t < seq_len; t++) {
+                atth[t] *= scale;
+            }
+        } else {
+            /* FP32 attention scores (short sequences or no quantization) */
+            for (int t = 0; t < seq_len; t++) {
+                const float* kt = key_cache_layer + (size_t)t * kv_dim + kv_h * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    score += qh[d] * kt[d];
+                }
+                atth[t] = score / sqrtf((float)head_dim);
+            }
         }
 
         /* Softmax */

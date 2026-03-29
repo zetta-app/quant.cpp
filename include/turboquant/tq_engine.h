@@ -128,6 +128,11 @@ typedef struct {
     /* Quantization workspace */
     void* quant_key_buf;    /* workspace for quantized keys */
     float* quant_score_buf; /* workspace for quantized attention scores */
+
+    /* Quantized KV cache for integer attention */
+    void* quant_key_cache;   /* [n_layers, max_seq_len, n_kv_heads, blocks_per_head * type_size] */
+    size_t quant_kv_stride;  /* bytes per layer in quant_key_cache */
+    size_t quant_head_stride;/* bytes per head per position */
 } tq_state_t;
 
 /* ============================================================
