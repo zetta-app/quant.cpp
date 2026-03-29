@@ -84,22 +84,28 @@ python3 examples/python_quickstart.py   # Python API demo
 
 ## Real Model Validation
 
-Tested on [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) architecture (2 KV heads, 256 head_dim, hybrid DeltaNet+Attention):
+Validated on **real** [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) KV cache (actual model inference, not synthetic data):
 
 | Type | MSE | Attention Cosine | Grade | Compression |
 |------|-----|-----------------|-------|-------------|
-| **mixed_4b8** | **0.004** | **0.997** | **A+** | 6.4x |
-| **RHT+uniform_4b** | **0.005** | — | — | 7.5x |
-| **uniform_4b** | 0.021 | **0.980** | **A** | 7.5x |
-| turbo_3b | 0.174 | 0.875 | B | 4.6x |
-| uniform_2b | 0.303 | 0.835 | B | 14.2x |
+| **mixed_4b8** | **0.016** | **0.994** | **A+** | 6.4x |
+| **uniform_4b** | 0.038 | **0.994** | **A+** | 7.5x |
+| **uniform_2b** | 0.601 | **0.953** | **A** | 14.2x |
+| RHT+uniform_4b | 0.021 | — | — | 7.5x |
+| turbo_3b | 0.345 | 0.934 | B+ | 4.6x |
 
-**Key findings:**
-- `mixed_4b8` achieves **A+ (cosine 0.997)** — outlier separation is crucial for 256-dim heads
-- **RHT reduces MSE by 3.9x** (0.021 → 0.005) on Qwen3.5 architecture
-- K4V2 asymmetric gives **9.8x compression** with key quality preserved
+**Key findings on real model data:**
+- Both `uniform_4b` and `mixed_4b8` achieve **A+ (cosine 0.994)** on actual Qwen3.5 KV cache
+- `uniform_2b` achieves **A grade (0.953)** — 14x compression with high quality
+- **RHT reduces MSE by 1.8x** on real data (0.038 → 0.021)
+- K4V2 asymmetric gives **9.8x compression**
 
-Run it yourself: `python3 tests/reference/dump_qwen35_kv.py && ./build/qwen35_validation`
+Run it yourself:
+```bash
+python3 -m venv /tmp/tq && source /tmp/tq/bin/activate
+pip install torch transformers numpy accelerate
+python3 tests/reference/dump_qwen35_kv.py && ./build/qwen35_validation
+```
 
 ---
 
