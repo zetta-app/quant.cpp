@@ -26,6 +26,11 @@ extern void tq_uniform_2b_dequantize_ref(const void* src, float* dst, int n);
 extern void tq_uniform_2b_attention_ref(const float* query, const void* kv,
                                          float* scores, int seq_len, int head_dim);
 
+extern void tq_mixed_4b8_quantize_ref(const float* src, void* dst, int n);
+extern void tq_mixed_4b8_dequantize_ref(const void* src, float* dst, int n);
+extern void tq_mixed_4b8_attention_ref(const float* query, const void* kv,
+                                        float* scores, int seq_len, int head_dim);
+
 const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
     [TQ_TYPE_POLAR_3B] = {
         .name       = "polar_3b",
@@ -97,6 +102,16 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .attention  = tq_uniform_2b_attention_ref,
         .residual_type = TQ_TYPE_COUNT,
     },
+    [TQ_TYPE_MIXED_4B8] = {
+        .name       = "mixed_4b8",
+        .block_size = TQ_BK,
+        .type_size  = sizeof(block_tq_mixed_4b8),
+        .bpe        = (float)sizeof(block_tq_mixed_4b8) * 8.0f / TQ_BK,
+        .quantize   = tq_mixed_4b8_quantize_ref,
+        .dequantize = tq_mixed_4b8_dequantize_ref,
+        .attention  = tq_mixed_4b8_attention_ref,
+        .residual_type = TQ_TYPE_COUNT,
+    },
 };
 
 const char* tq_type_name(tq_type type) {
@@ -158,6 +173,9 @@ tq_format_spec_t tq_get_format_spec(tq_type type) {
             spec.algorithm = TQ_ALG_UNIFORM; spec.key_bits = 4; break;
         case TQ_TYPE_UNIFORM_2B:
             spec.algorithm = TQ_ALG_UNIFORM; spec.key_bits = 2; break;
+        case TQ_TYPE_MIXED_4B8:
+            spec.algorithm = TQ_ALG_MIXED; spec.key_bits = 4;
+            spec.outlier_count = TQ_MIXED_OUTLIERS; break;
         default: break;
     }
     return spec;

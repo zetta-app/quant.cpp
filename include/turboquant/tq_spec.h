@@ -15,6 +15,7 @@ extern "C" {
 #define TQ_ALG_QJL      1
 #define TQ_ALG_TURBO    2
 #define TQ_ALG_UNIFORM  3
+#define TQ_ALG_MIXED    4
 
 #define TQ_FLAG_HAS_ZERO_POINT  (1 << 0)
 #define TQ_FLAG_SYMMETRIC       (1 << 1)

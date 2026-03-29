@@ -39,7 +39,8 @@ enum {
     GGML_TYPE_TQ_TURBO_4B   = GGML_TYPE_TQ_BASE + 4,
     GGML_TYPE_TQ_UNIFORM_4B = GGML_TYPE_TQ_BASE + 5,
     GGML_TYPE_TQ_UNIFORM_2B = GGML_TYPE_TQ_BASE + 6,
-    GGML_TYPE_TQ_COUNT      = 7,
+    GGML_TYPE_TQ_MIXED_4B8  = GGML_TYPE_TQ_BASE + 7,
+    GGML_TYPE_TQ_COUNT      = 8,
 };
 
 /* ============================================================
@@ -55,6 +56,7 @@ static int tq_to_ggml_type(tq_type type) {
         case TQ_TYPE_TURBO_4B:   return GGML_TYPE_TQ_TURBO_4B;
         case TQ_TYPE_UNIFORM_4B: return GGML_TYPE_TQ_UNIFORM_4B;
         case TQ_TYPE_UNIFORM_2B: return GGML_TYPE_TQ_UNIFORM_2B;
+        case TQ_TYPE_MIXED_4B8:  return GGML_TYPE_TQ_MIXED_4B8;
         default: return -1;
     }
 }
@@ -68,6 +70,7 @@ static tq_type ggml_to_tq_type(int ggml_id) {
         case GGML_TYPE_TQ_TURBO_4B:   return TQ_TYPE_TURBO_4B;
         case GGML_TYPE_TQ_UNIFORM_4B: return TQ_TYPE_UNIFORM_4B;
         case GGML_TYPE_TQ_UNIFORM_2B: return TQ_TYPE_UNIFORM_2B;
+        case GGML_TYPE_TQ_MIXED_4B8:  return TQ_TYPE_MIXED_4B8;
         default: return TQ_TYPE_COUNT;
     }
 }
@@ -127,6 +130,7 @@ TQ_GGML_WRAPPERS(turbo_3b,   TQ_TYPE_TURBO_3B)
 TQ_GGML_WRAPPERS(turbo_4b,   TQ_TYPE_TURBO_4B)
 TQ_GGML_WRAPPERS(uniform_4b, TQ_TYPE_UNIFORM_4B)
 TQ_GGML_WRAPPERS(uniform_2b, TQ_TYPE_UNIFORM_2B)
+TQ_GGML_WRAPPERS(mixed_4b8,  TQ_TYPE_MIXED_4B8)
 
 /* ============================================================
  * vec_dot wrappers (quantized key . FP32 query -> scalar)
@@ -174,6 +178,7 @@ TQ_GGML_VEC_DOT(turbo_3b,   TQ_TYPE_TURBO_3B)
 TQ_GGML_VEC_DOT(turbo_4b,   TQ_TYPE_TURBO_4B)
 TQ_GGML_VEC_DOT(uniform_4b, TQ_TYPE_UNIFORM_4B)
 TQ_GGML_VEC_DOT(uniform_2b, TQ_TYPE_UNIFORM_2B)
+TQ_GGML_VEC_DOT(mixed_4b8,  TQ_TYPE_MIXED_4B8)
 
 /* ============================================================
  * GGML type trait table
@@ -249,6 +254,13 @@ static const tq_ggml_type_trait TQ_GGML_TRAITS[GGML_TYPE_TQ_COUNT] = {
         tq_ggml_from_float_uniform_2b,
         tq_ggml_to_float_uniform_2b,
         tq_ggml_vec_dot_uniform_2b,
+    },
+    {
+        "tq_mixed_4b8", GGML_TYPE_TQ_MIXED_4B8, TQ_TYPE_MIXED_4B8,
+        sizeof(block_tq_mixed_4b8), TQ_BK, 5.0f,
+        tq_ggml_from_float_mixed_4b8,
+        tq_ggml_to_float_mixed_4b8,
+        tq_ggml_vec_dot_mixed_4b8,
     },
 };
 

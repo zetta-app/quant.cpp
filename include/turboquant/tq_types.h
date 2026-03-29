@@ -48,7 +48,8 @@ typedef enum {
     TQ_TYPE_TURBO_4B  = 4,   /* PolarQuant 3b + QJL 1b            */
     TQ_TYPE_UNIFORM_4B= 5,   /* Min-Max uniform 4-bit             */
     TQ_TYPE_UNIFORM_2B= 6,   /* Min-Max uniform 2-bit             */
-    TQ_TYPE_COUNT     = 7
+    TQ_TYPE_MIXED_4B8 = 7,   /* Mixed: 4-bit base + fp16 outliers */
+    TQ_TYPE_COUNT     = 8
 } tq_type;
 
 /* ============================================================
@@ -104,6 +105,23 @@ typedef struct {
     uint16_t zero_point;
     uint8_t  qs[TQ_BK / 4];         /* 2-bit: 4 values/byte, LSB-first */
 } block_tq_uniform_2b;
+
+/* size verified after extern "C" block */
+
+/* Mixed precision: 4-bit base with fp16 outlier channels
+ * Top-k channels by absolute value are stored at fp16 precision.
+ * Remaining channels use 4-bit uniform quantization with a tighter
+ * min-max range (excluding outliers), reducing quantization error.
+ */
+#define TQ_MIXED_OUTLIERS 4   /* number of fp16 outlier channels */
+
+typedef struct {
+    uint16_t scale;                            /* 4-bit scale (fp16)            */
+    uint16_t zero_point;                       /* 4-bit zero/minimum (fp16)     */
+    uint8_t  outlier_idx[TQ_MIXED_OUTLIERS];   /* outlier channel indices       */
+    int16_t  outlier_vals[TQ_MIXED_OUTLIERS];  /* outlier values (fp16)         */
+    uint8_t  qs[TQ_BK / 2];                   /* 4-bit packed, LSB-first       */
+} block_tq_mixed_4b8;
 
 /* size verified after extern "C" block */
 
@@ -168,5 +186,6 @@ TQ_CHECK_SIZE(block_tq_polar,      8 + TQ_BK / 2);
 TQ_CHECK_SIZE(block_tq_qjl,        4 + TQ_SKETCH_DIM / 8 + TQ_OUTLIERS);
 TQ_CHECK_SIZE(block_tq_uniform_4b, 4 + TQ_BK / 2);
 TQ_CHECK_SIZE(block_tq_uniform_2b, 4 + TQ_BK / 4);
+TQ_CHECK_SIZE(block_tq_mixed_4b8, 4 + TQ_MIXED_OUTLIERS + TQ_MIXED_OUTLIERS * 2 + TQ_BK / 2);
 
 #endif /* TQ_TYPES_H */
