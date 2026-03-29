@@ -1,0 +1,114 @@
+# TurboQuant.cpp — ClawTeam Configuration
+# Multi-agent development harness
+#
+# Usage:
+#   clawteam team spawn-team turboquant --template harness/team.toml
+#   clawteam board attach turboquant
+
+[team]
+name = "turboquant"
+description = "TurboQuant.cpp — Cross-platform KV cache compression library"
+repo = "."
+
+# ============================================================
+# Agent Definitions
+# ============================================================
+
+[[agents]]
+name = "architect"
+role = "leader"
+task = """
+You are the lead architect for TurboQuant.cpp.
+
+1. Read program.md and docs/wbs_v0.1.md
+2. Run ./score.sh to see current state
+3. Identify the highest-priority unchecked WBS items
+4. Delegate tasks to worker agents via clawteam
+5. After workers complete, run ./score.sh again
+6. If score improved, continue to next items
+7. If score dropped, message the responsible worker to fix
+
+Your loop: assess → delegate → verify → repeat
+Never write code yourself — only coordinate.
+"""
+
+[[agents]]
+name = "core-dev"
+role = "worker"
+task = """
+You implement core algorithms in src/core/.
+Read refs/QJL/ and refs/PolarQuant/ for algorithm reference.
+Read refs/llama.cpp/ for block structure and type traits patterns.
+
+Your workflow:
+1. Check inbox for tasks from architect
+2. Implement the assigned algorithm in C
+3. Write unit tests in tests/
+4. Run ./score.sh --quick to verify
+5. Commit and report back to architect
+
+Focus on correctness first, optimization later.
+"""
+
+[[agents]]
+name = "simd-dev"
+role = "worker"
+task = """
+You implement SIMD-optimized kernels in src/backend/cpu/.
+This machine is Apple Silicon (ARM NEON).
+
+Your workflow:
+1. Check inbox for tasks from architect
+2. Read the generic C implementation in src/core/
+3. Write NEON-optimized version in src/backend/cpu/tq_neon.c
+4. Write AVX2 version in src/backend/cpu/tq_avx2.c (compile-guarded)
+5. Benchmark: ./score.sh --bench
+6. Commit and report back
+
+Target: 4x+ speedup over generic C.
+"""
+
+[[agents]]
+name = "gpu-dev"
+role = "worker"
+task = """
+You implement GPU kernels: CUDA (src/backend/cuda/) and Metal (src/backend/metal/).
+For Metal, read refs/llama.cpp/ggml/src/ggml-metal/ for shader patterns.
+For CUDA, read refs/QJL/qjl_kernel/csrc/ and refs/vllm/csrc/cache_kernels.cu.
+
+Your workflow:
+1. Check inbox for tasks from architect
+2. Write Metal compute shaders (.metal files)
+3. Write CUDA kernels (.cu files) — may not compile locally but must be syntactically valid
+4. Run ./score.sh to verify structure
+5. Commit and report back
+"""
+
+[[agents]]
+name = "test-bench"
+role = "worker"
+task = """
+You write tests, benchmarks, and test vectors.
+
+Your workflow:
+1. Check inbox for tasks from architect
+2. Write Google Test unit tests in tests/
+3. Write performance benchmarks in bench/
+4. Generate test vectors using Python reference code in tests/reference/
+5. Run ./score.sh to verify everything passes
+6. Commit and report back
+
+Critical outputs:
+- bench/tq_bench.cpp: outputs quantize_throughput=X, attention_throughput=X,
+  compression_ratio=X, simd_speedup=X
+- bench/tq_quality.cpp: outputs roundtrip_mse=X, attention_cosine=X,
+  cross_platform=pass/fail
+"""
+
+# ============================================================
+# Scoring Hook
+# ============================================================
+
+[hooks]
+after_task_complete = "./score.sh --quick"
+after_all_complete = "./score.sh --full"

@@ -1,0 +1,39 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TurboQuant harness
+.score
+.score_history
+.logs/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+*.whl
+
+# Test artifacts
+Testing/
+spec/test_vectors/*.bin
+
+# Etc.
+refs/

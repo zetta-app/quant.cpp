@@ -1,0 +1,171 @@
+# TurboQuant.cpp — Agent Development Guide
+
+## Project Overview
+
+TurboQuant.cpp is a cross-platform C/C++ library for extreme KV cache compression in LLM inference.
+It implements PolarQuant + QJL (TurboQuant) algorithms to achieve 5x KV cache memory reduction at 3-bit with zero quality loss.
+
+## Architecture
+
+```
+include/turboquant/   — Public C API (turboquant.h, tq_types.h, tq_spec.h)
+src/core/             — Algorithms (tq_polar.c, tq_qjl.c, tq_turbo.c, tq_uniform.c, tq_traits.c)
+src/cache/            — Paged cache + progressive compression
+src/backend/cpu/      — CPU kernels (generic, AVX2, NEON)
+src/backend/cuda/     — CUDA kernels
+src/backend/metal/    — Metal compute shaders
+tests/                — Google Test unit tests
+bench/                — Performance benchmarks
+spec/                 — Format specification + test vectors
+integrations/         — llama.cpp, vLLM, Python bindings
+harness/              — Autonomous development harness (run.sh, team.toml)
+```
+
+## Key Documents
+
+- `docs/prd_v0.1.md` — Full product requirements
+- `docs/wbs_v0.1.md` — Work breakdown structure with checklists
+- `program.md` — Current agent task specification (READ THIS FIRST)
+- `score.sh` — Automated 5-dimension scoring (0.0 ~ 1.0)
+
+## Reference Implementations (DO NOT MODIFY)
+
+- `refs/QJL/` — QJL Python/CUDA implementation (Amir Zandieh)
+- `refs/PolarQuant/` — PolarQuant Python/Triton implementation
+- `refs/llama.cpp/` — llama.cpp fork with TQ1/TQ2 weight quantization
+- `refs/vllm/` — vLLM KV cache infrastructure
+- `refs/onnx/` — ONNX quantization operator specification
+
+## Build & Test
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DTQ_BUILD_TESTS=ON -DTQ_BUILD_BENCH=ON
+cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+ctest --test-dir build --output-on-failure
+```
+
+## Scoring (5-Dimension Harness)
+
+```bash
+bash score.sh              # Full 5-dimension evaluation
+bash score.sh --quick      # Build + correctness only (fast iteration)
+bash score.sh --bench      # Performance only
+bash score.sh --quality    # Quantization quality only
+```
+
+The score measures 5 dimensions:
+1. **Structure** (10w) — Headers, sources, tests, specs exist
+2. **Correctness** (11w) — Builds, tests pass, zero warnings
+3. **Quality** (11w) — Roundtrip MSE < 0.01, attention cosine > 0.99
+4. **Performance** (14w) — Throughput, compression ratio 5x, SIMD speedup 4x
+5. **Integration** (6w) — llama.cpp/vLLM/Python plugins, docs, examples
+
+## Coding Standards
+
+- C11 for core library, C++17 for tests/CUDA/Metal wrappers
+- No external dependencies in core (libc/libm only)
+- Every block struct must have static_assert size verification
+- Every public function must have a unit test
+- ONNX LSB-first bit-packing convention for all quantized formats
+- Use refs/ code as algorithm reference — port to C, don't wrap Python
+
+## Quantization Types
+
+| Type | Key Bits | Algorithm | Block Size |
+|------|----------|-----------|------------|
+| TQ_POLAR_3B | 3 | PolarQuant | 128 |
+| TQ_POLAR_4B | 4 | PolarQuant | 128 |
+| TQ_QJL_1B | 1 | QJL sign hash | 256 |
+| TQ_TURBO_3B | 3 | Polar 2b + QJL 1b | 128 |
+| TQ_TURBO_4B | 4 | Polar 3b + QJL 1b | 128 |
+| TQ_UNIFORM_4B | 4 | Min-Max | 128 |
+| TQ_UNIFORM_2B | 2 | Min-Max | 128 |
+
+## Module Ownership (Conflict-Free Zones)
+
+Each module has exclusive file ownership. When working in parallel, agents must only modify their assigned files:
+
+| Module | Owned Files | Dependencies |
+|--------|-------------|-------------|
+| `foundation` | `CMakeLists.txt`, `include/**`, `src/core/tq_traits.c` | None |
+| `polar` | `src/core/tq_polar.*`, `tests/test_polar.*` | foundation |
+| `qjl` | `src/core/tq_qjl.*`, `tests/test_qjl.*` | foundation |
+| `turbo` | `src/core/tq_turbo.*`, `tests/test_turbo.*` | polar, qjl |
+| `uniform` | `src/core/tq_uniform.*`, `src/core/tq_value_quant.*`, `tests/test_uniform.*`, `tests/test_value.*` | foundation |
+| `cache` | `src/cache/**`, `tests/test_paged_cache.*`, `tests/test_progressive.*` | foundation |
+| `simd-neon` | `src/backend/cpu/**` | polar, qjl |
+| `gpu-cuda` | `src/backend/cuda/**` | polar, qjl |
+| `gpu-metal` | `src/backend/metal/**` | polar, qjl |
+| `bench` | `bench/**`, `spec/**`, `tests/reference/**` | all core |
+| `integration` | `integrations/**`, `bindings/**`, `examples/**` | all |
+
+## Development Methodology: Hierarchical Harness
+
+This project uses a **Hierarchical Harness** that combines two methodologies:
+
+### Methodology A: Karpathy AutoResearch Loop
+Single agent, sequential, safe. Score → modify → score → revert-if-worse → repeat.
+
+### Methodology B: ClawTeam Multi-Agent
+Multiple agents in isolated git worktrees, parallel, fast. Leader delegates, workers execute.
+
+### Combined: Hierarchical Harness
+
+```
+Outer Loop (Leader — Karpathy pattern):
+  1. bash score.sh → measure full project score
+  2. Identify lowest-scoring dimension
+  3. Delegate independent modules to Workers (ClawTeam)
+  4. Wait for workers to complete
+  5. Merge Gate: merge each worker's results one-by-one
+     - If score improves or stays: keep merge
+     - If score drops: revert that merge
+  6. Repeat from 1
+
+Inner Loop (Workers — each runs own Karpathy loop):
+  - Work in isolated git worktree
+  - Only modify files in their module ownership
+  - score → modify → score → revert-if-worse
+  - Report completion via clawteam task update
+```
+
+### Phase Transitions (Score-Based)
+
+| Score Range | Phase | Strategy |
+|-------------|-------|----------|
+| 0.00 ~ 0.05 | Foundation | Single agent, sequential (CMake, headers, types) |
+| 0.05 ~ 0.30 | Core Algorithms | 3 parallel workers (polar, qjl, uniform) |
+| 0.30 ~ 0.60 | Advanced | 4 parallel workers (turbo, cache, simd, bench) |
+| 0.60 ~ 1.00 | Fine-tuning | Single agent, precision optimization |
+
+### Merge Gate Protocol
+
+When merging worker results back to main:
+1. Save current HEAD
+2. Merge worker branch
+3. Run `bash score.sh --quick`
+4. If score dropped → `git reset --hard` to saved HEAD
+5. If score OK → proceed to next worker
+
+### Slash Commands
+
+- `/score` — Run the scoring harness and show results
+- `/develop` — Start autonomous development (one WBS item per round)
+- `/harness` — Launch the full hierarchical harness
+- `/spawn-team` — Spawn ClawTeam parallel workers for current phase
+
+### Running the Harness
+
+```bash
+# Recommended: Hierarchical hybrid mode
+./harness/run.sh --target 0.9
+
+# Single agent Karpathy loop only
+./harness/run.sh --single --rounds 50
+
+# ClawTeam parallel workers only
+./harness/run.sh --parallel-only
+
+# Manual team spawn
+clawteam launch harness/team.toml --goal "Build TurboQuant.cpp" --workspace
+```

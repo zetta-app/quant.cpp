@@ -1,0 +1,68 @@
+cmake_minimum_required(VERSION 3.20)
+project(turboquant VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+option(TQ_BUILD_TESTS "Build tests" OFF)
+option(TQ_BUILD_BENCH "Build benchmarks" OFF)
+option(TQ_BUILD_CUDA "Build CUDA backend" OFF)
+option(TQ_BUILD_METAL "Build Metal backend" OFF)
+
+# Core library
+file(GLOB TQ_CORE_SOURCES src/core/*.c)
+file(GLOB TQ_CACHE_SOURCES src/cache/*.c)
+file(GLOB TQ_CPU_SOURCES src/backend/cpu/*.c)
+
+add_library(turboquant STATIC
+    ${TQ_CORE_SOURCES}
+    ${TQ_CACHE_SOURCES}
+    ${TQ_CPU_SOURCES}
+)
+target_include_directories(turboquant PUBLIC include)
+target_link_libraries(turboquant PRIVATE m)
+
+# Compiler warnings
+target_compile_options(turboquant PRIVATE
+    -Wall -Wextra -Wpedantic -Wno-unused-parameter
+)
+
+# Tests
+if(TQ_BUILD_TESTS)
+    enable_testing()
+    include(FetchContent)
+    FetchContent_Declare(googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    file(GLOB TEST_SOURCES tests/*.cpp)
+    foreach(test_src ${TEST_SOURCES})
+        get_filename_component(test_name ${test_src} NAME_WE)
+        add_executable(${test_name} ${test_src})
+        target_link_libraries(${test_name} turboquant GTest::gtest_main)
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endforeach()
+endif()
+
+# Benchmarks
+if(TQ_BUILD_BENCH)
+    file(GLOB BENCH_SOURCES bench/*.cpp)
+    file(GLOB BENCH_PERF_SOURCES bench/performance/*.cpp)
+    list(APPEND BENCH_SOURCES ${BENCH_PERF_SOURCES})
+    foreach(bench_src ${BENCH_SOURCES})
+        get_filename_component(bench_name ${bench_src} NAME_WE)
+        add_executable(${bench_name} ${bench_src})
+        target_link_libraries(${bench_name} turboquant)
+    endforeach()
+endif()
+
+# Examples (always built)
+file(GLOB EXAMPLE_C_SOURCES examples/*.c)
+file(GLOB EXAMPLE_CXX_SOURCES examples/*.cpp)
+foreach(ex_src ${EXAMPLE_C_SOURCES} ${EXAMPLE_CXX_SOURCES})
+    get_filename_component(ex_name ${ex_src} NAME_WE)
+    add_executable(${ex_name} ${ex_src})
+    target_link_libraries(${ex_name} turboquant)
+endforeach()
