@@ -307,9 +307,7 @@ static tensor_info_t* find_tensor(tensor_info_t* tensors, int n,
     for (int p = 1; NAME_PREFIXES[p] != NULL; p++) {
         const char* prefix = NAME_PREFIXES[p];
         if (strncmp(name, "model.", 6) == 0) {
-            char alt[MAX_NAME_LEN];
-            /* Replace "model." with "model." + prefix
-             * e.g., "model.layers.0.foo" -> "model.language_model.layers.0.foo" */
+            char alt[MAX_NAME_LEN * 2];
             snprintf(alt, sizeof(alt), "model.%s%s", prefix, name + 6);
             for (int i = 0; i < n; i++) {
                 if (strcmp(tensors[i].name, alt) == 0) {
