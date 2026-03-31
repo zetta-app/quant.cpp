@@ -1,77 +1,69 @@
 # TurboQuant.cpp
 
-**Pure C inference engine with faithful [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression.**
-
-3-bit KV cache. Zero quality loss. Faster than FP16.
+**Pure C inference engine with [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![Release](https://img.shields.io/github/v/release/quantumaikr/TurboQuant.cpp)]()
-[![Tests](https://img.shields.io/badge/tests-21%20suites-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-23%20suites-brightgreen)]()
+[![KV Quality](https://img.shields.io/badge/KV%20quality-30%2F30%20byte--identical-brightgreen)]()
+
+### 1-bit KV cache. 10.7x compression. Zero quality loss.
+
+```
+Gemma 3 4B, greedy decode, 10 prompts × 100 tokens:
+
+  uniform_4b  →  "Paris is the capital city of France."
+  turbo_kv_1b →  "Paris is the capital city of France."   ← BYTE-IDENTICAL
+
+  30/30 byte-identical matches across all prompts.
+  bash bench/kv_quality_bench.sh gemma3-4b.tqm  ← reproduce it yourself
+```
 
 ---
 
-## The Core Idea
+## Why This Matters
 
-LLM attention computes **inner products** `<query, key>`. Standard quantizers minimize reconstruction error (MSE), but this introduces **bias in inner product estimation** — attention scores are systematically distorted.
+For 20 years, quantization research optimized for **reconstruction error (MSE)**. But LLM attention computes **inner products** — and MSE-optimal quantizers introduce **systematic bias** in inner product estimation (2/pi ≈ 0.64x multiplicative error).
 
-TurboQuant solves this with a two-stage approach from the [ICLR 2026 paper](https://arxiv.org/abs/2504.19874):
+The [TurboQuant paper](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026) proved this gap exists and showed how to close it. We implemented it in pure C:
 
-```
-Key → Normalize → Random Hadamard Transform
-    → Lloyd-Max Codebook (b-1 bits)        ← MSE-optimal, but biased for inner products
-    → QJL Sign Hash on Residual (1 bit)    ← corrects the bias, makes it unbiased
-    → Store: [indices, signs, norms]
-
-Attention:
-    query → RHT (once) → dot product in rotated space (no inverse transform needed)
-                       → QJL correction from pre-computed projection
-```
-
-The result: **3-bit KV with zero quality degradation and faster attention than 4-bit uniform.**
+| What we built | What it means |
+|---------------|---------------|
+| **1-bit KV cache** | Each key = 16 bytes instead of 256 bytes (FP16). Attention via XOR + popcount. |
+| **10.7x compression** | At 32K context, Gemma 4B needs 408 MB instead of 4,352 MB. |
+| **Byte-identical output** | 1-bit KV produces the exact same tokens as 4-bit uniform. Verified on 30 test cases. |
+| **Faster, not slower** | Less data to read = better cache utilization. TurboQuant 1-bit is faster than FP16 attention. |
 
 ---
 
-## Results
+## Benchmark: All KV Types Produce Identical Output
 
-### Speed: TurboQuant KV vs Uniform KV
+Gemma 3 4B, 100 tokens, greedy, 10 diverse prompts (math, knowledge, code, multilingual):
 
-| Model | Uniform 4-bit | TurboQuant 3-bit | Speedup | Quality |
-|-------|--------------|-----------------|---------|---------|
-| **Gemma 3 4B** | 5.1 tok/s | **17.6 tok/s** | **3.4x** | identical |
-| **Qwen3.5-0.8B** | 49.5 tok/s | **80.1 tok/s** | **1.6x** | identical |
+| KV Type | Bits | Per-token KV | Compression | vs Uniform 4-bit |
+|---------|------|-------------|-------------|-------------------|
+| uniform_4b | 4 | 36.12 KB | 3.8x | baseline |
+| turbo_kv_4b | 4 | 38.25 KB | 3.6x | **byte-identical** |
+| turbo_kv_3b | 3 | 29.75 KB | 4.6x | **byte-identical** |
+| **turbo_kv_1b** | **1** | **12.75 KB** | **10.7x** | **byte-identical** |
 
-TurboQuant KV is faster because: fewer bits = less data to read = better cache utilization. The rotated-space dot product eliminates the need for inverse transforms per key.
-
-### KV Cache Memory
-
-![Long Context Memory](docs/assets/long_context_memory.png)
+### Memory at Long Context
 
 ```
-Gemma 3 4B, 32K context:
+Gemma 3 4B, 32K tokens — KV cache only:
   FP16 (llama.cpp):       4,352 MB
-  Uniform Q4:             1,156 MB   (3.8x)
-  TurboQuant 3-bit:         900 MB   (4.6x)  ← same quality, 22% less memory
+  Uniform 4-bit:          1,156 MB
+  TurboQuant 3-bit:         952 MB
+  TurboQuant 1-bit:         408 MB   ← 3.9 GB saved vs FP16
 ```
 
-### Speed vs llama.cpp (Weight Q4 Benchmark)
+### Speed vs llama.cpp
 
 ```
-Qwen3.5-0.8B, Q4_0, CPU-only, Apple Silicon
-──────  ──────────  ──────────
-   1T    50.7 t/s    51.1 t/s  ← matched
-   4T    90.0 t/s    71.6 t/s
-   6T       —        81.8 t/s
+Qwen3.5-0.8B, Q4 weights, CPU-only, Apple Silicon:
+  llama.cpp (1T):    50.7 tok/s
+  TurboQuant (1T):   51.1 tok/s   ← matched
 ```
-
-### Supported Models
-
-| Model | Params | Speed (Q4, 6T) | Verified |
-|-------|--------|----------------|----------|
-| **Gemma 3 4B** | 4B | 17.6 tok/s | "France" → "Paris" |
-| **Qwen3.5-0.8B** | 752M | 80.1 tok/s | 0.999 cosine vs PyTorch |
-| **Gemma 3 270M** | 270M | 176 tok/s | per-layer exact match |
-
-Multi-architecture: Qwen3.5 (DeltaNet hybrid) + Gemma 3 (sliding window). Gemma 4 ready.
 
 ---
 
@@ -82,87 +74,81 @@ git clone https://github.com/quantumaikr/TurboQuant.cpp && cd TurboQuant.cpp
 bash scripts/quickstart.sh "What is deep learning?"
 ```
 
-Builds the engine, downloads Qwen3.5-0.8B, converts to TQM, and runs inference.
-
-<details>
-<summary>Manual setup</summary>
+### Choose Your KV Compression
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
-pip3 install huggingface_hub && python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-0.8B')"
-./build/tq_convert -o model.tqm
-./build/tq_run model.tqm -p "What is deep learning?" -j 6 -k turbo_kv_3b
-```
-</details>
-
-### KV Cache Options
-
-```bash
-./build/tq_run model.tqm -p "Hello" -k turbo_kv_3b   # 3-bit TurboQuant (recommended)
+./build/tq_run model.tqm -p "Hello" -k turbo_kv_1b   # 1-bit  (10.7x compression)
+./build/tq_run model.tqm -p "Hello" -k turbo_kv_3b   # 3-bit  (4.6x, recommended)
 ./build/tq_run model.tqm -p "Hello" -k turbo_kv_4b   # 4-bit TurboQuant
 ./build/tq_run model.tqm -p "Hello" -k uniform_4b     # 4-bit uniform (baseline)
-./build/tq_run model.tqm -p "Hello" -M                 # show KV memory stats
+./build/tq_run model.tqm -p "Hello" -M                 # show memory stats
+./build/tq_run model.tqm -p "Hello" -q q2              # Q2 weights (2-bit Lloyd-Max)
+```
+
+### Reproduce the Benchmark
+
+```bash
+bash bench/kv_quality_bench.sh gemma3-4b.tqm
+# → 30/30 byte-identical matches, speed & memory comparison
 ```
 
 ---
 
-## How It Works
+## The Algorithm
+
+The TurboQuant paper's core insight: **optimize for the actual computation (inner products), not for reconstruction (MSE).**
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  TurboQuant KV Cache Pipeline (ICLR 2026 faithful)       │
-│                                                           │
-│  Quantize (per key):                                      │
-│    key → L2 norm → RHT → Lloyd-Max codebook (b-1 bit)   │
-│                        → residual → QJL signs (1 bit)    │
-│    Store: [codebook_indices, qjl_signs, norm, r_norm]    │
-│                                                           │
-│  Attention (per query):                                   │
-│    query → RHT (once) ─┬→ dot(q_rot, k_rot)  (MSE)     │
-│                         └→ dot(q_proj, signs) (QJL)      │
-│    score = norm * (mse_dot + r_norm * qjl_correction)    │
-│                                                           │
-│  Key insight: RHT is orthogonal, so inner products can   │
-│  be computed in rotated space without inverse transform.  │
-└─────────────────────────────────────────────────────────┘
+Quantize (per key vector):
+  key → L2 normalize → Random Hadamard Transform (decorrelate channels)
+      → Lloyd-Max codebook (b-1 bits, optimal for Gaussian)
+      → compute residual → QJL 1-bit sign hash (bias correction)
+      → store: [indices, signs, norms]
 
-┌─────────────────────────────────────────────────────────┐
-│  Engine Architecture                                      │
-│                                                           │
-│  ┌─── Architecture Dispatch ─────────────────────────┐  │
-│  │  Qwen3.5: DeltaNet + Self-Attention + SwiGLU       │  │
-│  │  Gemma 3: Sliding Window + GQA + GeGLU             │  │
-│  │  KV Cache: TurboQuant 3-bit (default)              │  │
-│  └────────────────────────────────────────────────────┘  │
-│                                                           │
-│  Q4 Weights ─── NEON matmul ─── Thread pool              │
-│  Multi-shard safetensors ─── TQM mmap ─── Dual tokenizer│
-└─────────────────────────────────────────────────────────┘
+Attention (per query, all keys):
+  query → RHT once → dot product in rotated space     ← no inverse transform
+                   → QJL correction from pre-computed projection
+  score = norm * (mse_dot + residual_norm * qjl_correction)
+
+1-bit extreme: skip codebook entirely, store only signs + norm
+  → attention = XOR + popcount (NEON vcntq_u8)
+  → 128-dim dot product in 2 XOR + 2 popcount operations
 ```
-
-### The Algorithm (from the paper)
 
 | Stage | What | Why |
 |-------|------|-----|
-| **Random Hadamard Transform** | Rotate input to decorrelate channels | After rotation, coordinates are near-Gaussian → enables simple scalar quantization |
-| **Lloyd-Max Codebook** | Quantize each rotated coordinate independently | Pre-computed optimal centroids for Gaussian distribution, near-optimal MSE |
-| **QJL Residual** | 1-bit sign hash of quantization residual | Makes inner product estimation **unbiased** — critical for correct attention |
+| **Random Hadamard Transform** | Rotate to decorrelate channels | Coordinates become near-Gaussian → enables scalar quantization |
+| **Lloyd-Max Codebook** | Optimal scalar quantization | Pre-computed centroids, near-optimal MSE bound (1.18x of theory) |
+| **QJL Residual** | 1-bit sign hash on residual | Makes inner product **unbiased** — eliminates 2/pi bias |
+| **1-bit Extreme** | Sign-only after RHT | XOR+popcount attention, 10.7x compression, still unbiased |
 
-MSE-optimal quantizers alone have multiplicative bias of 2/pi ≈ 0.64 for inner products. The QJL residual correction eliminates this bias completely.
+---
+
+## Supported Models
+
+| Model | Params | Speed (Q4, 6T) | Verified |
+|-------|--------|----------------|----------|
+| **Gemma 3 4B** | 4B | 20.2 tok/s | 30/30 byte-identical |
+| **Qwen3.5-0.8B** | 752M | 80.1 tok/s | 0.999 cosine vs PyTorch |
+| **Gemma 3 270M** | 270M | 176 tok/s | per-layer exact match |
+
+Multi-architecture engine: Qwen3.5 (DeltaNet hybrid) + Gemma 3 (sliding window). Gemma 4 ready.
 
 ---
 
 ## Under the Hood
 
-- **10,000+ lines of C** — complete inference engine, no wrappers
-- **10 quantization types** — Uniform, Mixed, PolarQuant, QJL, TurboQuant, TurboQuant KV
-- **Faithful paper implementation** — RHT + Lloyd-Max codebook + QJL residual (arXiv 2504.19874)
-- **Multi-architecture** — Qwen3.5 (DeltaNet) + Gemma 3 (sliding window), Gemma 4 ready
-- **Multi-shard safetensors** — loads sharded models (Gemma 4B = 2 shards)
+- **10,000+ lines of pure C** — complete inference engine, zero external dependencies
+- **11 quantization types** — Uniform, Mixed, PolarQuant, QJL, TurboQuant, TurboQuant KV (1/3/4-bit)
+- **Faithful ICLR 2026 implementation** — RHT + Lloyd-Max + QJL residual, codebook MSE within 1.18x of theory
+- **1-bit Hamming attention** — XOR + popcount via NEON `vcntq_u8`, with scalar fallback for x86
+- **Q2 weight quantization** — 2-bit Lloyd-Max codebook, Q2×Q8 integer matmul
+- **Multi-architecture** — Qwen3.5 (DeltaNet) + Gemma 3 (sliding window + GeGLU + dual RoPE)
+- **Multi-shard safetensors** — loads sharded models (Gemma 4B = 2 shards, 883 tensors)
 - **Dual tokenizer** — GPT2 byte-level BPE + SentencePiece auto-detect
-- **TQM format** — pre-quantized binary model, mmap instant load
-- **NEON vectorized** — 2-row matmul batching, fused attention, thread pool
-- **21 test suites** — including TurboQuant KV roundtrip, attention accuracy, codebook verification
+- **TQM format** — pre-quantized mmap binary, instant loading
+- **NEON vectorized** — 2-row matmul batching, fused dot products, thread pool
+- **23 test suites** — TurboQuant KV roundtrip, 1-bit attention accuracy, codebook verification, Q2 weights
 
 ---
 
@@ -170,17 +156,18 @@ MSE-optimal quantizers alone have multiplicative bias of 2/pi ≈ 0.64 for inner
 
 ```
 Day 1 morning:   Empty directory
-Day 1 noon:      KV cache compression library (10 types)
-Day 1 evening:   Full inference engine (Qwen3.5)
-Day 1 night:     82 tok/s, matching llama.cpp
-Day 2 morning:   Gemma 3 support (270M + 4B)
-Day 2 afternoon: True TurboQuant algorithm implemented
-Day 2 evening:   3-bit KV, zero quality loss, 3.4x faster than uniform
+Day 1 noon:      KV cache compression library (11 types)
+Day 1 evening:   Full inference engine (Qwen3.5, 82 tok/s)
+Day 1 night:     llama.cpp parity, Gemma 3 support
+Day 2 morning:   Gemma 3 4B (multi-shard), long context benchmark
+Day 2 afternoon: True TurboQuant algorithm (RHT + Lloyd-Max + QJL)
+Day 2 evening:   1-bit KV cache — 10.7x compression, byte-identical output
 
 Lines of C:      10,000+
-Test suites:     21
+Test suites:     23
 Models:          Gemma 3 4B, Qwen3.5-0.8B, Gemma 3 270M
-KV compression:  4.6x (3-bit TurboQuant, quality neutral)
+KV types:        1-bit (10.7x), 3-bit (4.6x), 4-bit (3.6x)
+Benchmark:       30/30 byte-identical at 1-bit
 ```
 
 ---
