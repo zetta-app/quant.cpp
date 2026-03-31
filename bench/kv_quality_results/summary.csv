@@ -1,0 +1,11 @@
+prompt_idx,prompt,uniform_4b_vs_turbo_4b,uniform_4b_vs_turbo_3b,uniform_4b_vs_turbo_1b
+0,"1+1=",MATCH,MATCH,MATCH
+1,"The capital of France is",MATCH,MATCH,MATCH
+2,"The capital of Japan is",MATCH,MATCH,MATCH
+3,"Water boils at",MATCH,MATCH,MATCH
+4,"The sun rises in the",MATCH,MATCH,MATCH
+5,"Write a Python function to reverse a string:",MATCH,MATCH,MATCH
+6,"If a train travels 60 miles in 1 hour, how far does it travel in 3 hours?",MATCH,MATCH,MATCH
+7,"Explain how a computer works to a 5-year-old child.",MATCH,MATCH,MATCH
+8,"List the planets in our solar system:",MATCH,MATCH,MATCH
+9,"Once upon a time, in a faraway land,",MATCH,MATCH,MATCH
