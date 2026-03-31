@@ -21,6 +21,18 @@ Qwen3.5 + Gemma 3 지원. Gemma 4 대응 준비 완료.
 | **Qwen3.5-0.8B** | 752M | 82 tok/s | PyTorch 대비 코사인 0.999 |
 | **Gemma 3 270M** | 270M | 176 tok/s | PyTorch 대비 레이어별 일치 |
 
+### KV 캐시 메모리: 진짜 차별점
+
+![Long Context Memory](docs/assets/long_context_memory.png)
+
+```
+Gemma 3 4B, 32K 컨텍스트:
+  llama.cpp (FP16 KV):    4,352 MB
+  TurboQuant (Q4 KV):     1,156 MB  ← 3.8배 작음, 3.2 GB 절약
+```
+
+128K 토큰에서 llama.cpp는 KV 캐시만 17 GB 필요. TurboQuant는 4.6 GB.
+
 ### llama.cpp vs TurboQuant — Q4 공정 벤치마크
 
 ```

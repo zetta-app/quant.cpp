@@ -15,6 +15,7 @@
  *   -j <threads>     Number of threads for matmul (default: 4)
  *   -s <seed>        Random seed (default: 42)
  *   --info           Print model info and exit
+ *   -M, --memory     Print KV cache memory stats after generation
  */
 
 #include "turboquant/tq_engine.h"
@@ -62,6 +63,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -q <type>        Quantize weights: q4 (4-bit, ~6x reduction, default),\n");
     fprintf(stderr, "                   q8 (int8, ~3.5x reduction), or none (FP32)\n");
     fprintf(stderr, "  --info           Print model info and exit\n");
+    fprintf(stderr, "  -M, --memory     Print KV cache memory stats after generation\n");
 }
 
 int main(int argc, char** argv) {
@@ -81,6 +83,7 @@ int main(int argc, char** argv) {
     int n_threads = 4;
     int quant_mode = 0;   /* 0 = none (default), 4 = Q4, 8 = Q8 */
     int info_only = 0;
+    int show_memory = 0;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -117,6 +120,8 @@ int main(int argc, char** argv) {
             }
         } else if (strcmp(argv[i], "--info") == 0) {
             info_only = 1;
+        } else if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--memory") == 0) {
+            show_memory = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -139,9 +144,9 @@ int main(int argc, char** argv) {
 
     /* Print model info */
     tq_model_config_t* c = &model->config;
-    fprintf(stderr, "Model: %d layers, dim=%d, heads=%d/%d, vocab=%d, inter=%d\n",
+    fprintf(stderr, "Model: %d layers, dim=%d, heads=%d/%d, head_dim=%d, vocab=%d, inter=%d\n",
             c->n_layers, c->hidden_dim, c->n_heads, c->n_kv_heads,
-            c->vocab_size, c->intermediate_dim);
+            c->head_dim, c->vocab_size, c->intermediate_dim);
     fprintf(stderr, "KV cache type: %s\n",
             kv_type < TQ_TYPE_COUNT ? tq_type_name(kv_type) : "fp32");
 
@@ -212,6 +217,62 @@ int main(int argc, char** argv) {
                 kv_type < TQ_TYPE_COUNT ? tq_type_name(kv_type) : "fp32");
     } else {
         fprintf(stderr, "Generated %d tokens\n", n_generated);
+    }
+
+    /* Print KV cache memory stats if requested */
+    if (show_memory && n_generated > 0) {
+        int total_tokens = n_generated;
+
+        /* FP16 KV baseline (llama.cpp default):
+         * 2 (K+V) * n_layers * n_kv_heads * head_dim * 2 bytes per token */
+        size_t fp16_per_token = (size_t)2 * c->n_layers * c->n_kv_heads * c->head_dim * 2;
+
+        /* Compressed KV: both keys and values quantized to same type.
+         * blocks_per_head * type_size bytes per head per layer, times 2 for K+V */
+        size_t block_size = tq_type_block_size(kv_type);
+        size_t type_size_bytes = tq_type_type_size(kv_type);
+        if (block_size == 0) block_size = TQ_BK;
+        if (type_size_bytes == 0) type_size_bytes = sizeof(block_tq_uniform_4b);
+        size_t blocks_per_head = ((size_t)c->head_dim + block_size - 1) / block_size;
+
+        /* Q4 K+V per token: 2 * n_layers * n_kv_heads * blocks_per_head * type_size */
+        size_t compressed_per_token = (size_t)2 * c->n_layers * c->n_kv_heads
+                                    * blocks_per_head * type_size_bytes;
+
+        /* If kv_type is fp32 (sentinel), both key and value are FP32 */
+        if (kv_type >= TQ_TYPE_COUNT) {
+            compressed_per_token = (size_t)2 * c->n_layers * c->n_kv_heads
+                                 * c->head_dim * sizeof(float);
+        }
+
+        /* Total bytes for all generated tokens */
+        size_t total_compressed = compressed_per_token * (size_t)total_tokens;
+        size_t total_fp16 = fp16_per_token * (size_t)total_tokens;
+
+        float ratio = (total_compressed > 0) ? (float)total_fp16 / (float)total_compressed : 0.0f;
+
+        fprintf(stderr, "\n=== KV Cache Memory Stats ===\n");
+        fprintf(stderr, "Tokens in cache:      %d\n", total_tokens);
+        fprintf(stderr, "Model config:         %d layers, %d kv_heads, head_dim=%d\n",
+                c->n_layers, c->n_kv_heads, c->head_dim);
+        fprintf(stderr, "KV type:              %s\n",
+                kv_type < TQ_TYPE_COUNT ? tq_type_name(kv_type) : "fp32");
+        fprintf(stderr, "Per-token KV (Q4):    %.2f KB\n",
+                (double)compressed_per_token / 1024.0);
+        fprintf(stderr, "Per-token KV (FP16):  %.2f KB\n",
+                (double)fp16_per_token / 1024.0);
+        fprintf(stderr, "Total KV (Q4):        %.2f MB\n",
+                (double)total_compressed / (1024.0 * 1024.0));
+        fprintf(stderr, "Total KV (FP16):      %.2f MB\n",
+                (double)total_fp16 / (1024.0 * 1024.0));
+        fprintf(stderr, "Compression ratio:    %.2fx\n", ratio);
+        fprintf(stderr, "Memory saved:         %.2f MB\n",
+                (double)(total_fp16 - total_compressed) / (1024.0 * 1024.0));
+        fprintf(stderr, "=============================\n");
+
+        /* Machine-parseable line for scripts */
+        fprintf(stderr, "MEMORY_CSV:%d,%zu,%zu,%.4f\n",
+                total_tokens, total_compressed, total_fp16, ratio);
     }
 
     /* Cleanup */
