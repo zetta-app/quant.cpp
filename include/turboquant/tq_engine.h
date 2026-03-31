@@ -157,9 +157,13 @@ typedef struct {
     void* _q4_data;           /* heap buffer for all Q4 quantized weights */
     size_t _q4_size;
 
-    /* Memory management */
-    void* _mmap_data;
+    /* Memory management — supports multi-shard safetensors */
+#define TQ_MAX_SHARDS 16
+    void* _mmap_data;         /* primary mmap (shard 0 or TQM file) */
     size_t _mmap_size;
+    void* _mmap_shards[TQ_MAX_SHARDS];  /* additional shard mmaps (index 0 unused) */
+    size_t _mmap_shard_sizes[TQ_MAX_SHARDS];
+    int _n_shards;            /* total number of shards (0 or 1 = single file) */
     void* _converted_data;    /* heap buffer for dtype-converted tensors (e.g., BF16->FP32) */
     size_t _converted_size;
 } tq_model_t;

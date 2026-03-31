@@ -158,12 +158,70 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* Try Gemma3 4B model paths (multi-shard) if still not found */
+    if (!model_path) {
+        const char* home = getenv("HOME");
+        if (home) {
+            static char auto_model_g4[2048];
+            static char auto_tok_g4[2048];
+            const char* gemma4b_bases[] = {
+                "/.cache/huggingface/hub/models--google--gemma-3-4b-it/snapshots",
+                "/.cache/huggingface/hub/models--unsloth--gemma-3-4b-it/snapshots",
+                NULL
+            };
+            for (int gi = 0; gemma4b_bases[gi] && !model_path; gi++) {
+                char snap_dir[2048];
+                snprintf(snap_dir, sizeof(snap_dir), "%s%s", home, gemma4b_bases[gi]);
+                DIR* dir = opendir(snap_dir);
+                if (dir) {
+                    struct dirent* ent;
+                    while ((ent = readdir(dir)) != NULL) {
+                        if (ent->d_name[0] == '.') continue;
+                        char try_path[2048];
+                        /* Multi-shard: look for model.safetensors.index.json */
+                        snprintf(try_path, sizeof(try_path), "%s/%s/model.safetensors.index.json",
+                                 snap_dir, ent->d_name);
+                        if (access(try_path, R_OK) == 0) {
+                            /* Point to model.safetensors (the loader detects index.json) */
+                            snprintf(auto_model_g4, sizeof(auto_model_g4),
+                                     "%s/%s/model.safetensors", snap_dir, ent->d_name);
+                            model_path = auto_model_g4;
+                        }
+                        /* Fallback: single file */
+                        if (!model_path) {
+                            snprintf(try_path, sizeof(try_path), "%s/%s/model.safetensors",
+                                     snap_dir, ent->d_name);
+                            if (access(try_path, R_OK) == 0) {
+                                snprintf(auto_model_g4, sizeof(auto_model_g4), "%s", try_path);
+                                model_path = auto_model_g4;
+                            }
+                        }
+                        if (model_path && !tokenizer_path) {
+                            char* last_slash = strrchr(auto_model_g4, '/');
+                            if (last_slash) {
+                                size_t dir_len = (size_t)(last_slash - auto_model_g4);
+                                snprintf(auto_tok_g4, sizeof(auto_tok_g4), "%.*s/tokenizer.json",
+                                         (int)dir_len, auto_model_g4);
+                                if (access(auto_tok_g4, R_OK) == 0) {
+                                    tokenizer_path = auto_tok_g4;
+                                }
+                            }
+                        }
+                        if (model_path) break;
+                    }
+                    closedir(dir);
+                }
+            }
+        }
+    }
+
     if (!model_path) {
         fprintf(stderr, "Error: model not found.\n");
         fprintf(stderr, "  Auto-detect searched:\n");
         fprintf(stderr, "    ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/\n");
         fprintf(stderr, "    ~/.cache/huggingface/hub/models--unsloth--gemma-3-270m-it/\n");
         fprintf(stderr, "    ~/.cache/huggingface/hub/models--google--gemma-3-270m-it/\n");
+        fprintf(stderr, "    ~/.cache/huggingface/hub/models--google--gemma-3-4b-it/\n");
         fprintf(stderr, "  Specify manually: %s <model.safetensors> [tokenizer.json] -o output.tqm\n", argv[0]);
         return 1;
     }

@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #endif
 
 /* ============================================================
@@ -58,6 +59,7 @@ typedef struct {
     int n_dims;
     int64_t data_start;
     int64_t data_end;
+    void* data_base;  /* base pointer for this tensor's shard data region */
 } tensor_info_t;
 
 /* ============================================================
@@ -316,6 +318,18 @@ static tensor_info_t* find_tensor(tensor_info_t* tensors, int n,
             }
         }
     }
+    /* Try "language_model." prefix: Gemma 4B uses
+     * "language_model.model.layers.N.foo" instead of "model.layers.N.foo".
+     * Also try "language_model.lm_head.weight" for "lm_head.weight". */
+    {
+        char alt[MAX_NAME_LEN * 2];
+        snprintf(alt, sizeof(alt), "language_model.%s", name);
+        for (int i = 0; i < n; i++) {
+            if (strcmp(tensors[i].name, alt) == 0) {
+                return &tensors[i];
+            }
+        }
+    }
     return NULL;
 }
 
@@ -324,12 +338,12 @@ static tensor_info_t* find_tensor(tensor_info_t* tensors, int n,
  * Returns a newly allocated float buffer on conversion,
  * or NULL if the tensor is already F32 (caller uses mmap).
  * ============================================================ */
-static float* convert_tensor_to_fp32(void* data_base, tensor_info_t* t,
+static float* convert_tensor_to_fp32(tensor_info_t* t,
                                       float** conv_buf, size_t* conv_used,
                                       size_t conv_capacity) {
     if (!t) return NULL;
 
-    const void* src = (const char*)data_base + t->data_start;
+    const void* src = (const char*)t->data_base + t->data_start;
     int64_t data_bytes = t->data_end - t->data_start;
     int elem_size = dtype_element_size(t->dtype);
     if (elem_size == 0) return NULL;
@@ -337,7 +351,7 @@ static float* convert_tensor_to_fp32(void* data_base, tensor_info_t* t,
 
     if (strcmp(t->dtype, "F32") == 0) {
         /* Zero-copy: return direct pointer into mmap */
-        return (float*)((char*)data_base + t->data_start);
+        return (float*)((char*)t->data_base + t->data_start);
     }
 
     /* Need conversion — write into the pre-allocated conversion buffer */
@@ -375,21 +389,21 @@ static float* convert_tensor_to_fp32(void* data_base, tensor_info_t* t,
  * Map or convert tensor data pointer from mmap'd file.
  * Wrapper that handles F32 (zero-copy) and BF16/F16 (convert).
  * ============================================================ */
-static float* load_tensor(void* data_base, tensor_info_t* t,
+static float* load_tensor(tensor_info_t* t,
                            float** conv_buf, size_t* conv_used,
                            size_t conv_capacity) {
     if (!t) return NULL;
-    return convert_tensor_to_fp32(data_base, t, conv_buf, conv_used, conv_capacity);
+    return convert_tensor_to_fp32(t, conv_buf, conv_used, conv_capacity);
 }
 
 /* ============================================================
  * Get raw BF16 pointer for a tensor (zero-copy from mmap).
  * Returns NULL if tensor is not BF16.
  * ============================================================ */
-static const uint16_t* get_bf16_ptr(void* data_base, tensor_info_t* t) {
+static const uint16_t* get_bf16_ptr(tensor_info_t* t) {
     if (!t) return NULL;
     if (strcmp(t->dtype, "BF16") != 0) return NULL;
-    return (const uint16_t*)((const char*)data_base + t->data_start);
+    return (const uint16_t*)((const char*)t->data_base + t->data_start);
 }
 
 /* ============================================================
@@ -401,10 +415,12 @@ static int should_keep_bf16(const char* name) {
     /* Embedding table — largest single tensor, only need one row at a time */
     if (strcmp(name, "model.embed_tokens.weight") == 0) return 1;
     if (strcmp(name, "model.language_model.embed_tokens.weight") == 0) return 1;
+    if (strcmp(name, "language_model.model.embed_tokens.weight") == 0) return 1;
     if (strcmp(name, "tok_embeddings.weight") == 0) return 1;
     if (strcmp(name, "transformer.wte.weight") == 0) return 1;
     /* lm_head — output projection, can use BF16 matmul */
     if (strcmp(name, "lm_head.weight") == 0) return 1;
+    if (strcmp(name, "language_model.lm_head.weight") == 0) return 1;
     return 0;
 }
 
@@ -449,6 +465,10 @@ static int detect_n_layers(tensor_info_t* tensors, int n_tensors) {
         else if (sscanf(name, "model.language_model.layers.%d.", &layer_idx) == 1) {
             if (layer_idx > max_layer) max_layer = layer_idx;
         }
+        /* Try Gemma 4B prefix: language_model.model.layers.N. */
+        else if (sscanf(name, "language_model.model.layers.%d.", &layer_idx) == 1) {
+            if (layer_idx > max_layer) max_layer = layer_idx;
+        }
     }
     return max_layer + 1;
 }
@@ -473,11 +493,14 @@ static int* detect_attn_layers(tensor_info_t* tensors, int n_tensors,
         const char* name = tensors[i].name;
 
         /* Only match model.layers.N. or model.language_model.layers.N.
+         * or language_model.model.layers.N. (Gemma 4B).
          * Skip other prefixes like mtp.layers.N. */
         const char* layers_pos = NULL;
         if (strncmp(name, "model.layers.", 13) == 0) {
             layers_pos = name + 13;
         } else if (strncmp(name, "model.language_model.layers.", 28) == 0) {
+            layers_pos = name + 28;
+        } else if (strncmp(name, "language_model.model.layers.", 28) == 0) {
             layers_pos = name + 28;
         }
         if (!layers_pos) continue;
@@ -562,13 +585,11 @@ tq_model_t* tq_load_model(const char* path) {
 }
 
 /* ============================================================
- * Load model from safetensors file
+ * Helper: mmap a file, returning pointer and size.
+ * Returns NULL on failure.
  * ============================================================ */
-static tq_model_t* tq_load_safetensors(const char* path) {
-    if (!path) return NULL;
-
+static void* mmap_file(const char* path, size_t* out_size) {
 #ifdef _WIN32
-    /* Windows file mapping */
     HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -577,73 +598,278 @@ static tq_model_t* tq_load_safetensors(const char* path) {
     }
     LARGE_INTEGER fileSize;
     GetFileSizeEx(hFile, &fileSize);
-    size_t file_size = (size_t)fileSize.QuadPart;
-
+    *out_size = (size_t)fileSize.QuadPart;
     HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!hMap) {
-        CloseHandle(hFile);
-        return NULL;
-    }
-    void* mmap_data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!hMap) { CloseHandle(hFile); return NULL; }
+    void* data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
     CloseHandle(hMap);
     CloseHandle(hFile);
-    if (!mmap_data) return NULL;
+    return data;
 #else
-    /* POSIX mmap */
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "tq_load_model: cannot open '%s'\n", path);
         return NULL;
     }
     struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        return NULL;
-    }
-    size_t file_size = (size_t)st.st_size;
-
-    void* mmap_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (fstat(fd, &st) < 0) { close(fd); return NULL; }
+    *out_size = (size_t)st.st_size;
+    void* data = mmap(NULL, *out_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (mmap_data == MAP_FAILED) {
+    if (data == MAP_FAILED) {
         fprintf(stderr, "tq_load_model: mmap failed for '%s'\n", path);
         return NULL;
     }
+    return data;
 #endif
+}
 
-    /* Parse safetensors header */
+/* ============================================================
+ * Helper: parse a single safetensors shard.
+ * Mmaps the file, parses the header, and appends tensors to the
+ * provided tensor array. Sets data_base on each tensor.
+ * Returns number of tensors added, or -1 on error.
+ * mmap_out/mmap_size_out receive the mmap pointer for the caller to manage.
+ * ============================================================ */
+static int parse_shard(const char* shard_path,
+                       tensor_info_t* tensors, int existing_count, int max_tensors,
+                       void** mmap_out, size_t* mmap_size_out) {
+    size_t file_size = 0;
+    void* mmap_data = mmap_file(shard_path, &file_size);
+    if (!mmap_data) return -1;
+
     if (file_size < 8) {
-        fprintf(stderr, "tq_load_model: file too small\n");
-        goto fail;
+        fprintf(stderr, "tq_load_model: shard too small: '%s'\n", shard_path);
+#ifdef _WIN32
+        UnmapViewOfFile(mmap_data);
+#else
+        munmap(mmap_data, file_size);
+#endif
+        return -1;
     }
 
     uint64_t header_size = 0;
-    memcpy(&header_size, mmap_data, 8); /* little-endian */
-
+    memcpy(&header_size, mmap_data, 8);
     if (8 + header_size > file_size) {
-        fprintf(stderr, "tq_load_model: invalid header size (%llu, file=%zu)\n",
-                (unsigned long long)header_size, file_size);
-        goto fail;
+        fprintf(stderr, "tq_load_model: invalid header in shard '%s'\n", shard_path);
+#ifdef _WIN32
+        UnmapViewOfFile(mmap_data);
+#else
+        munmap(mmap_data, file_size);
+#endif
+        return -1;
     }
-
-    fprintf(stderr, "tq_load_model: header size = %llu bytes\n",
-            (unsigned long long)header_size);
 
     const char* json = (const char*)mmap_data + 8;
     void* data_base = (char*)mmap_data + 8 + header_size;
 
-    /* Parse tensors */
-    tensor_info_t* tensors = (tensor_info_t*)calloc(MAX_TENSORS, sizeof(tensor_info_t));
-    if (!tensors) goto fail;
-
-    int n_tensors = parse_safetensors_header(json, (int64_t)header_size,
-                                              tensors, MAX_TENSORS);
-    if (n_tensors < 0) {
-        fprintf(stderr, "tq_load_model: JSON parse error\n");
-        free(tensors);
-        goto fail;
+    int space = max_tensors - existing_count;
+    if (space <= 0) {
+#ifdef _WIN32
+        UnmapViewOfFile(mmap_data);
+#else
+        munmap(mmap_data, file_size);
+#endif
+        return -1;
     }
 
-    fprintf(stderr, "tq_load_model: parsed %d tensors\n", n_tensors);
+    int n = parse_safetensors_header(json, (int64_t)header_size,
+                                     tensors + existing_count, space);
+    if (n < 0) {
+        fprintf(stderr, "tq_load_model: JSON parse error in shard '%s'\n", shard_path);
+#ifdef _WIN32
+        UnmapViewOfFile(mmap_data);
+#else
+        munmap(mmap_data, file_size);
+#endif
+        return -1;
+    }
+
+    /* Set data_base for each newly parsed tensor */
+    for (int i = existing_count; i < existing_count + n; i++) {
+        tensors[i].data_base = data_base;
+    }
+
+    *mmap_out = mmap_data;
+    *mmap_size_out = file_size;
+
+    fprintf(stderr, "tq_load_model: shard '%s' — %d tensors, header=%llu bytes\n",
+            shard_path, n, (unsigned long long)header_size);
+    return n;
+}
+
+/* ============================================================
+ * Helper: compare strings for qsort (used to sort shard filenames)
+ * ============================================================ */
+static int cmp_strings(const void* a, const void* b) {
+    return strcmp(*(const char**)a, *(const char**)b);
+}
+
+/* ============================================================
+ * Helper: find all shard files in the same directory as `path`.
+ * If path points to a single model.safetensors, check for
+ * model.safetensors.index.json to detect multi-shard.
+ * If path is a shard like model-00001-of-00002.safetensors,
+ * find all matching shards.
+ * Returns number of shard paths, or 0 for single-file mode.
+ * shard_paths[] is filled with allocated strings (caller must free).
+ * ============================================================ */
+static int find_shard_files(const char* path, char** shard_paths, int max_shards) {
+    /* Extract directory and basename */
+    char dir_path[2048];
+    strncpy(dir_path, path, sizeof(dir_path) - 1);
+    dir_path[sizeof(dir_path) - 1] = '\0';
+    char* last_slash = strrchr(dir_path, '/');
+    const char* basename = path;
+    if (last_slash) {
+        *last_slash = '\0';
+        basename = last_slash + 1;
+    } else {
+        strcpy(dir_path, ".");
+    }
+
+    /* Check 1: path is "model.safetensors" and index file exists */
+    if (strcmp(basename, "model.safetensors") == 0) {
+        char index_path[2048];
+        snprintf(index_path, sizeof(index_path), "%s/model.safetensors.index.json",
+                 dir_path);
+        if (access(index_path, R_OK) == 0) {
+            /* Multi-shard: find all model-NNNNN-of-NNNNN.safetensors */
+            DIR* dir = opendir(dir_path);
+            if (!dir) return 0;
+
+            int count = 0;
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != NULL && count < max_shards) {
+                /* Match pattern: model-XXXXX-of-XXXXX.safetensors */
+                if (strncmp(ent->d_name, "model-", 6) == 0 &&
+                    strstr(ent->d_name, "-of-") != NULL &&
+                    strstr(ent->d_name, ".safetensors") != NULL &&
+                    strstr(ent->d_name, ".index.") == NULL) {
+                    char full[2048];
+                    snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+                    shard_paths[count] = strdup(full);
+                    count++;
+                }
+            }
+            closedir(dir);
+
+            /* Sort shard paths alphabetically so they load in order */
+            if (count > 1) {
+                qsort(shard_paths, (size_t)count, sizeof(char*), cmp_strings);
+            }
+
+            if (count > 0) {
+                fprintf(stderr, "tq_load_model: detected %d shard files\n", count);
+            }
+            return count;
+        }
+    }
+
+    /* Check 2: path itself is a shard file (contains "-of-") */
+    if (strstr(basename, "-of-") != NULL &&
+        strstr(basename, ".safetensors") != NULL) {
+        /* Extract prefix before the shard number: e.g., "model-" */
+        const char* dash_of = strstr(basename, "-of-");
+        /* Walk back to find the dash before the shard number */
+        const char* num_start = dash_of;
+        while (num_start > basename && *(num_start - 1) != '-') num_start--;
+        size_t prefix_len = (size_t)(num_start - basename);
+
+        DIR* dir = opendir(dir_path);
+        if (!dir) return 0;
+
+        int count = 0;
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != NULL && count < max_shards) {
+            if (strncmp(ent->d_name, basename, prefix_len) == 0 &&
+                strstr(ent->d_name, "-of-") != NULL &&
+                strstr(ent->d_name, ".safetensors") != NULL &&
+                strstr(ent->d_name, ".index.") == NULL) {
+                char full[2048];
+                snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+                shard_paths[count] = strdup(full);
+                count++;
+            }
+        }
+        closedir(dir);
+
+        if (count > 1) {
+            qsort(shard_paths, (size_t)count, sizeof(char*), cmp_strings);
+            fprintf(stderr, "tq_load_model: detected %d shard files\n", count);
+            return count;
+        }
+
+        /* Only 1 shard found = effectively single file, clean up */
+        for (int i = 0; i < count; i++) free(shard_paths[i]);
+        return 0;
+    }
+
+    return 0; /* single file mode */
+}
+
+/* ============================================================
+ * Load model from safetensors file (single or multi-shard)
+ * ============================================================ */
+static tq_model_t* tq_load_safetensors(const char* path) {
+    if (!path) return NULL;
+
+    /* Detect multi-shard */
+    char* shard_paths[TQ_MAX_SHARDS];
+    memset(shard_paths, 0, sizeof(shard_paths));
+    int n_shards = find_shard_files(path, shard_paths, TQ_MAX_SHARDS);
+
+    /* Parse tensors from all shards (or single file) */
+    tensor_info_t* tensors = (tensor_info_t*)calloc(MAX_TENSORS, sizeof(tensor_info_t));
+    if (!tensors) {
+        for (int i = 0; i < n_shards; i++) free(shard_paths[i]);
+        return NULL;
+    }
+
+    void* mmap_ptrs[TQ_MAX_SHARDS];
+    size_t mmap_sizes[TQ_MAX_SHARDS];
+    memset(mmap_ptrs, 0, sizeof(mmap_ptrs));
+    memset(mmap_sizes, 0, sizeof(mmap_sizes));
+    int total_shards_loaded = 0;
+    int n_tensors = 0;
+
+    if (n_shards > 0) {
+        /* Multi-shard loading */
+        for (int s = 0; s < n_shards; s++) {
+            int added = parse_shard(shard_paths[s], tensors, n_tensors, MAX_TENSORS,
+                                    &mmap_ptrs[s], &mmap_sizes[s]);
+            if (added < 0) {
+                fprintf(stderr, "tq_load_model: failed to parse shard '%s'\n", shard_paths[s]);
+                /* Clean up already-loaded shards */
+                for (int j = 0; j < s; j++) {
+#ifdef _WIN32
+                    if (mmap_ptrs[j]) UnmapViewOfFile(mmap_ptrs[j]);
+#else
+                    if (mmap_ptrs[j]) munmap(mmap_ptrs[j], mmap_sizes[j]);
+#endif
+                }
+                for (int j = 0; j < n_shards; j++) free(shard_paths[j]);
+                free(tensors);
+                return NULL;
+            }
+            n_tensors += added;
+            total_shards_loaded++;
+        }
+        for (int i = 0; i < n_shards; i++) free(shard_paths[i]);
+    } else {
+        /* Single file loading */
+        int added = parse_shard(path, tensors, 0, MAX_TENSORS,
+                                &mmap_ptrs[0], &mmap_sizes[0]);
+        if (added < 0) {
+            free(tensors);
+            return NULL;
+        }
+        n_tensors = added;
+        total_shards_loaded = 1;
+    }
+
+    fprintf(stderr, "tq_load_model: parsed %d tensors from %d file(s)\n",
+            n_tensors, total_shards_loaded);
 
     /* Log the dtype of the first non-metadata tensor */
     for (int i = 0; i < n_tensors; i++) {
@@ -660,8 +886,13 @@ static tq_model_t* tq_load_safetensors(const char* path) {
         free(tensors);
         goto fail;
     }
-    model->_mmap_data = mmap_data;
-    model->_mmap_size = file_size;
+    model->_mmap_data = mmap_ptrs[0];
+    model->_mmap_size = mmap_sizes[0];
+    model->_n_shards = total_shards_loaded;
+    for (int i = 1; i < total_shards_loaded; i++) {
+        model->_mmap_shards[i] = mmap_ptrs[i];
+        model->_mmap_shard_sizes[i] = mmap_sizes[i];
+    }
 
     /* Calculate and allocate conversion buffer for non-F32 tensors */
     size_t conv_capacity = calc_conversion_buffer_size(tensors, n_tensors);
@@ -709,7 +940,7 @@ static tq_model_t* tq_load_safetensors(const char* path) {
     model->config.hidden_dim = (int)embed->shape[1];
 
     /* Try to keep embedding as BF16 (streaming conversion saves ~1GB) */
-    model->embed_bf16 = get_bf16_ptr(data_base, embed);
+    model->embed_bf16 = get_bf16_ptr(embed);
     if (model->embed_bf16) {
         /* BF16 embedding: don't convert, will convert on demand in forward pass */
         model->token_embedding = NULL;
@@ -718,7 +949,7 @@ static tq_model_t* tq_load_safetensors(const char* path) {
                 embed_bytes / (1024 * 1024));
     } else {
         /* F32 or other dtype: convert as before */
-        model->token_embedding = load_tensor(data_base, embed,
+        model->token_embedding = load_tensor( embed,
                                               &conv_buf, &conv_used, conv_capacity);
     }
 
@@ -938,14 +1169,14 @@ static tq_model_t* tq_load_safetensors(const char* path) {
         /* Attention norm */
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.input_layernorm.weight", l);
-        layer->attn_norm = load_tensor(data_base,
+        layer->attn_norm = load_tensor(
                                         find_tensor(tensors, n_tensors, name_buf),
                                         &conv_buf, &conv_used, conv_capacity);
 
         /* FFN norm (Qwen3.5: post_attention_layernorm used as pre-FFN norm) */
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.post_attention_layernorm.weight", l);
-        layer->ffn_norm = load_tensor(data_base,
+        layer->ffn_norm = load_tensor(
                                        find_tensor(tensors, n_tensors, name_buf),
                                        &conv_buf, &conv_used, conv_capacity);
 
@@ -957,13 +1188,13 @@ static tq_model_t* tq_load_safetensors(const char* path) {
 
             snprintf(name_buf, sizeof(name_buf),
                      "model.layers.%d.pre_feedforward_layernorm.weight", l);
-            layer->pre_ffn_norm = load_tensor(data_base,
+            layer->pre_ffn_norm = load_tensor(
                                                find_tensor(tensors, n_tensors, name_buf),
                                                &conv_buf, &conv_used, conv_capacity);
 
             snprintf(name_buf, sizeof(name_buf),
                      "model.layers.%d.post_feedforward_layernorm.weight", l);
-            layer->post_ffn_norm = load_tensor(data_base,
+            layer->post_ffn_norm = load_tensor(
                                                 find_tensor(tensors, n_tensors, name_buf),
                                                 &conv_buf, &conv_used, conv_capacity);
         }
@@ -971,118 +1202,118 @@ static tq_model_t* tq_load_safetensors(const char* path) {
         /* Q, K, V, O projections — only exist for self_attn layers */
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.self_attn.q_proj.weight", l);
-        layer->wq = load_tensor(data_base,
+        layer->wq = load_tensor(
                                  find_tensor(tensors, n_tensors, name_buf),
                                  &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.self_attn.k_proj.weight", l);
-        layer->wk = load_tensor(data_base,
+        layer->wk = load_tensor(
                                  find_tensor(tensors, n_tensors, name_buf),
                                  &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.self_attn.v_proj.weight", l);
-        layer->wv = load_tensor(data_base,
+        layer->wv = load_tensor(
                                  find_tensor(tensors, n_tensors, name_buf),
                                  &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.self_attn.o_proj.weight", l);
-        layer->wo = load_tensor(data_base,
+        layer->wo = load_tensor(
                                  find_tensor(tensors, n_tensors, name_buf),
                                  &conv_buf, &conv_used, conv_capacity);
 
         /* QK-norm weights (Qwen3.5 style) */
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.self_attn.q_norm.weight", l);
-        layer->q_norm = load_tensor(data_base,
+        layer->q_norm = load_tensor(
                                      find_tensor(tensors, n_tensors, name_buf),
                                      &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.self_attn.k_norm.weight", l);
-        layer->k_norm = load_tensor(data_base,
+        layer->k_norm = load_tensor(
                                      find_tensor(tensors, n_tensors, name_buf),
                                      &conv_buf, &conv_used, conv_capacity);
 
         /* DeltaNet (linear_attention) weights */
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.A_log", l);
-        layer->delta_a_log = load_tensor(data_base,
+        layer->delta_a_log = load_tensor(
                                           find_tensor(tensors, n_tensors, name_buf),
                                           &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.conv1d.weight", l);
-        layer->delta_conv1d = load_tensor(data_base,
+        layer->delta_conv1d = load_tensor(
                                            find_tensor(tensors, n_tensors, name_buf),
                                            &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.dt_bias", l);
-        layer->delta_dt_bias = load_tensor(data_base,
+        layer->delta_dt_bias = load_tensor(
                                             find_tensor(tensors, n_tensors, name_buf),
                                             &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.in_proj_a.weight", l);
-        layer->delta_in_proj_a = load_tensor(data_base,
+        layer->delta_in_proj_a = load_tensor(
                                               find_tensor(tensors, n_tensors, name_buf),
                                               &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.in_proj_b.weight", l);
-        layer->delta_in_proj_b = load_tensor(data_base,
+        layer->delta_in_proj_b = load_tensor(
                                               find_tensor(tensors, n_tensors, name_buf),
                                               &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.in_proj_qkv.weight", l);
-        layer->delta_in_proj_qkv = load_tensor(data_base,
+        layer->delta_in_proj_qkv = load_tensor(
                                                 find_tensor(tensors, n_tensors, name_buf),
                                                 &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.in_proj_z.weight", l);
-        layer->delta_in_proj_z = load_tensor(data_base,
+        layer->delta_in_proj_z = load_tensor(
                                               find_tensor(tensors, n_tensors, name_buf),
                                               &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.norm.weight", l);
-        layer->delta_norm = load_tensor(data_base,
+        layer->delta_norm = load_tensor(
                                          find_tensor(tensors, n_tensors, name_buf),
                                          &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.linear_attn.out_proj.weight", l);
-        layer->delta_out_proj = load_tensor(data_base,
+        layer->delta_out_proj = load_tensor(
                                              find_tensor(tensors, n_tensors, name_buf),
                                              &conv_buf, &conv_used, conv_capacity);
 
         /* FFN: gate, up, down projections (SwiGLU) */
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.mlp.gate_proj.weight", l);
-        layer->w_gate = load_tensor(data_base,
+        layer->w_gate = load_tensor(
                                      find_tensor(tensors, n_tensors, name_buf),
                                      &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.mlp.up_proj.weight", l);
-        layer->w_up = load_tensor(data_base,
+        layer->w_up = load_tensor(
                                    find_tensor(tensors, n_tensors, name_buf),
                                    &conv_buf, &conv_used, conv_capacity);
 
         snprintf(name_buf, sizeof(name_buf),
                  "model.layers.%d.mlp.down_proj.weight", l);
-        layer->w_down = load_tensor(data_base,
+        layer->w_down = load_tensor(
                                      find_tensor(tensors, n_tensors, name_buf),
                                      &conv_buf, &conv_used, conv_capacity);
     }
 
     /* Output norm */
-    model->output_norm = load_tensor(data_base,
+    model->output_norm = load_tensor(
         find_tensor(tensors, n_tensors, "model.norm.weight"),
         &conv_buf, &conv_used, conv_capacity);
 
@@ -1090,14 +1321,14 @@ static tq_model_t* tq_load_safetensors(const char* path) {
     tensor_info_t* lm_head = find_tensor(tensors, n_tensors, "lm_head.weight");
     if (lm_head) {
         /* Try to keep lm_head as BF16 */
-        model->output_weight_bf16 = get_bf16_ptr(data_base, lm_head);
+        model->output_weight_bf16 = get_bf16_ptr(lm_head);
         if (model->output_weight_bf16) {
             model->output_weight = NULL;
             size_t lm_bytes = (size_t)lm_head->shape[0] * lm_head->shape[1] * 2;
             fprintf(stderr, "tq_load_model: keeping lm_head as BF16 (%zu MB saved)\n",
                     lm_bytes / (1024 * 1024));
         } else {
-            model->output_weight = load_tensor(data_base, lm_head,
+            model->output_weight = load_tensor( lm_head,
                                                 &conv_buf, &conv_used, conv_capacity);
         }
     } else {
@@ -1237,11 +1468,16 @@ static tq_model_t* tq_load_safetensors(const char* path) {
     return model;
 
 fail:
+    /* Clean up all mmaps on failure */
+    for (int i = 0; i < total_shards_loaded; i++) {
+        if (mmap_ptrs[i]) {
 #ifdef _WIN32
-    if (mmap_data) UnmapViewOfFile(mmap_data);
+            UnmapViewOfFile(mmap_ptrs[i]);
 #else
-    if (mmap_data && mmap_data != MAP_FAILED) munmap(mmap_data, file_size);
+            munmap(mmap_ptrs[i], mmap_sizes[i]);
 #endif
+        }
+    }
     return NULL;
 }
 
@@ -2291,8 +2527,15 @@ void tq_free_model(tq_model_t* model) {
 
 #ifdef _WIN32
     if (model->_mmap_data) UnmapViewOfFile(model->_mmap_data);
+    for (int i = 1; i < model->_n_shards; i++) {
+        if (model->_mmap_shards[i]) UnmapViewOfFile(model->_mmap_shards[i]);
+    }
 #else
     if (model->_mmap_data) munmap(model->_mmap_data, model->_mmap_size);
+    for (int i = 1; i < model->_n_shards; i++) {
+        if (model->_mmap_shards[i])
+            munmap(model->_mmap_shards[i], model->_mmap_shard_sizes[i]);
+    }
 #endif
 
     free(model->_converted_data);
