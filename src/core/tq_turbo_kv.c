@@ -20,6 +20,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 /* Forward declarations from other modules */
 extern void tq_codebook_quantize(const float* src, uint8_t* dst_indices,
                                   int n, int bits, float inv_std);
@@ -262,15 +266,17 @@ void tq_turbo_kv_3b_dequantize_ref(const void* src, float* dst, int n) {
 /* ============================================================
  * TurboQuant KV 3-bit: attention (two-stage inner product estimation)
  *
+ * Optimized pipeline:
+ *   1. RHT(query) computed ONCE before the per-key loop
+ *   2. MSE dot product computed in rotated space (no RHT inverse)
+ *   3. QJL query projection pre-computed ONCE, reused per key
+ *   4. NEON vectorization for inner loops (with scalar fallback)
+ *
  * The paper's formula for inner product estimation:
- *   <q, k_approx> = norm * (<q_rot, k_mse_rot> + r_norm * correction)
+ *   <q, k_approx> = norm * (<q_rot, k_mse_rot> + r_norm * qjl_scale * correction)
  *
- * Where the QJL correction for <q_residual, r> is computed as:
- *   correction = sqrt(pi/2) / sketch_dim * sum_s(q_proj_s * key_sign_s)
- * with q_proj_s = sum_d(q_rot[d] * S[d,s]) being the query projection.
- *
- * This is more efficient: project query once, then inner product
- * with each key's sign vector is just Hamming distance arithmetic.
+ * Key insight: RHT is orthogonal, so <q, Pi^T * k_rot> = <Pi*q, k_rot>.
+ * By pre-rotating the query, we eliminate RHT inverse per key entirely.
  * ============================================================ */
 
 void tq_turbo_kv_3b_attention_ref(const float* query, const void* kv_cache,
@@ -282,12 +288,23 @@ void tq_turbo_kv_3b_attention_ref(const float* query, const void* kv_cache,
     int sketch_dim = dim;  /* sketch dimension = block dim */
     float qjl_scale = sqrtf(TQ_PI_2) / (float)sketch_dim;
 
-    /* Project query into QJL sketch space (once, reuse across all keys) */
+    /* Optimization #1: RHT(query) computed ONCE before the loop.
+     * All keys use TKV_DEFAULT_SEED, so a single rotation suffices.
+     * Since RHT is orthogonal: <q, Pi^T * k_rot> = <Pi*q, k_rot> = <q_rot, k_rot>
+     * This eliminates O(d log d) RHT inverse per key. */
+    float q_rot[TQ_BK];
+    memcpy(q_rot, query, (size_t)dim * sizeof(float));
+    for (int i = dim; i < TQ_BK; i++) q_rot[i] = 0.0f;
+    tq_rht_transform(q_rot, dim, TKV_DEFAULT_SEED);
+
+    /* Optimization #2: Pre-compute QJL query projection ONCE.
+     * q_proj[s] = sum_d(q_rot[d] * S[d,s]) for each sketch dimension.
+     * This is O(dim * sketch_dim) once, instead of per key. */
     float q_proj[TQ_BK];
     for (int s = 0; s < sketch_dim; s++) {
         float proj = 0.0f;
         for (int d = 0; d < dim; d++) {
-            proj += query[d] * tkv_qjl_random_entry(d, s);
+            proj += q_rot[d] * tkv_qjl_random_entry(d, s);
         }
         q_proj[s] = proj;
     }
@@ -296,55 +313,93 @@ void tq_turbo_kv_3b_attention_ref(const float* query, const void* kv_cache,
         const block_tq_turbo_kv_3b* block = &blocks[seq];
         float norm = tkv_fp16_to_fp32(block->norm);
         float r_norm = tkv_fp16_to_fp32(block->residual_norm);
-        uint32_t seed = block->rht_seed;
 
-        /* MSE stage: dequantize -> inverse RHT -> dot with query */
+        /* MSE stage: dequantize in rotated space, dot with q_rot directly.
+         * No RHT inverse needed -- both vectors are in rotated space. */
         float rotated[TQ_BK];
         dequant_mse_rotated_2bit(block, rotated, dim);
-        tq_rht_inverse(rotated, dim, seed);
 
         float mse_dot = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            mse_dot += query[d] * rotated[d];
-        }
-
-        /* QJL residual correction:
-         * The residual was computed in rotated space, so the QJL signs
-         * encode sign(S . residual_rotated). The inner product correction is:
-         *   <q, residual_original> = <q_rot, residual_rotated>  (RHT is orthogonal)
-         * And QJL estimates <q_rot, residual_rotated> via:
-         *   r_norm * sqrt(pi/2) / m * sum_s(q_rot_proj_s * sign_s)
-         *
-         * But our query is in original space, not rotated. We need to
-         * rotate the query first to get q_rot, then project into sketch space.
-         * However, we can also compute <q, r_original> directly since
-         * the QJL random matrix S operates on the rotated residual.
-         *
-         * Since q_original and r_original are related by RHT:
-         *   <q, r_original> = <q_rot, r_rotated>  (orthogonal transform preserves dot)
-         *
-         * So we need q_rot = RHT(query) to compute the QJL correction.
-         * But RHT(query) changes per query -- not per key -- so we could
-         * precompute it. For simplicity in this reference implementation,
-         * we compute it inside the loop (can be hoisted later).
-         */
-
-        /* Rotate query to match the RHT space of this key */
-        float q_rot[TQ_BK];
-        memcpy(q_rot, query, (size_t)dim * sizeof(float));
-        tq_rht_transform(q_rot, dim, seed);
-
-        /* Project rotated query into QJL sketch space */
-        float qjl_correction = 0.0f;
-        for (int s = 0; s < sketch_dim; s++) {
-            float proj = 0.0f;
-            for (int d = 0; d < dim; d++) {
-                proj += q_rot[d] * tkv_qjl_random_entry(d, s);
+#ifdef __ARM_NEON
+        {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+            int d = 0;
+            for (; d + 15 < dim; d += 16) {
+                acc0 = vfmaq_f32(acc0, vld1q_f32(&q_rot[d]),      vld1q_f32(&rotated[d]));
+                acc1 = vfmaq_f32(acc1, vld1q_f32(&q_rot[d + 4]),  vld1q_f32(&rotated[d + 4]));
+                acc2 = vfmaq_f32(acc2, vld1q_f32(&q_rot[d + 8]),  vld1q_f32(&rotated[d + 8]));
+                acc3 = vfmaq_f32(acc3, vld1q_f32(&q_rot[d + 12]), vld1q_f32(&rotated[d + 12]));
             }
+            acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            for (; d + 3 < dim; d += 4) {
+                acc0 = vfmaq_f32(acc0, vld1q_f32(&q_rot[d]), vld1q_f32(&rotated[d]));
+            }
+            mse_dot = vaddvq_f32(acc0);
+            for (; d < dim; d++) {
+                mse_dot += q_rot[d] * rotated[d];
+            }
+        }
+#else
+        for (int d = 0; d < dim; d++) {
+            mse_dot += q_rot[d] * rotated[d];
+        }
+#endif
+
+        /* QJL residual correction using pre-computed q_proj.
+         * Per key: just sum q_proj[s] * sign_s, which is O(sketch_dim). */
+        float qjl_correction = 0.0f;
+#ifdef __ARM_NEON
+        {
+            float32x4_t corr0 = vdupq_n_f32(0.0f);
+            float32x4_t corr1 = vdupq_n_f32(0.0f);
+            float32x4_t corr2 = vdupq_n_f32(0.0f);
+            float32x4_t corr3 = vdupq_n_f32(0.0f);
+            int s = 0;
+            for (; s + 15 < sketch_dim; s += 16) {
+                /* Load 2 bytes of sign bits covering 16 sketch dims */
+                uint32_t sign_bits = (uint32_t)block->qjl_signs[s / 8]
+                                   | ((uint32_t)block->qjl_signs[s / 8 + 1] << 8);
+                /* Expand bits to float +1/-1 for 4 lanes at a time */
+                float signs_f[16];
+                for (int i = 0; i < 16; i++) {
+                    signs_f[i] = ((sign_bits >> i) & 1) ? 1.0f : -1.0f;
+                }
+                float32x4_t s0 = vld1q_f32(&signs_f[0]);
+                float32x4_t s1 = vld1q_f32(&signs_f[4]);
+                float32x4_t s2 = vld1q_f32(&signs_f[8]);
+                float32x4_t s3 = vld1q_f32(&signs_f[12]);
+                corr0 = vfmaq_f32(corr0, vld1q_f32(&q_proj[s]),      s0);
+                corr1 = vfmaq_f32(corr1, vld1q_f32(&q_proj[s + 4]),  s1);
+                corr2 = vfmaq_f32(corr2, vld1q_f32(&q_proj[s + 8]),  s2);
+                corr3 = vfmaq_f32(corr3, vld1q_f32(&q_proj[s + 12]), s3);
+            }
+            corr0 = vaddq_f32(vaddq_f32(corr0, corr1), vaddq_f32(corr2, corr3));
+            for (; s + 3 < sketch_dim; s += 4) {
+                float signs_f[4];
+                uint8_t byte = block->qjl_signs[s / 8];
+                int bit_off = s % 8;
+                for (int i = 0; i < 4; i++) {
+                    signs_f[i] = ((byte >> (bit_off + i)) & 1) ? 1.0f : -1.0f;
+                }
+                corr0 = vfmaq_f32(corr0, vld1q_f32(&q_proj[s]), vld1q_f32(signs_f));
+            }
+            qjl_correction = vaddvq_f32(corr0);
+            for (; s < sketch_dim; s++) {
+                int bit = (block->qjl_signs[s / 8] >> (s % 8)) & 1;
+                float key_sign = bit ? 1.0f : -1.0f;
+                qjl_correction += q_proj[s] * key_sign;
+            }
+        }
+#else
+        for (int s = 0; s < sketch_dim; s++) {
             int bit = (block->qjl_signs[s / 8] >> (s % 8)) & 1;
             float key_sign = bit ? 1.0f : -1.0f;
-            qjl_correction += proj * key_sign;
+            qjl_correction += q_proj[s] * key_sign;
         }
+#endif
         qjl_correction *= qjl_scale * r_norm;
 
         scores[seq] = norm * mse_dot + norm * qjl_correction;
@@ -430,6 +485,10 @@ void tq_turbo_kv_4b_dequantize_ref(const void* src, float* dst, int n) {
 
 /* ============================================================
  * TurboQuant KV 4-bit: attention (two-stage inner product estimation)
+ *
+ * Same optimized pipeline as 3-bit:
+ *   1. RHT(query) once  2. QJL projection once  3. Rotated-space dot
+ *   4. NEON vectorization with scalar fallback
  * ============================================================ */
 
 void tq_turbo_kv_4b_attention_ref(const float* query, const void* kv_cache,
@@ -441,37 +500,105 @@ void tq_turbo_kv_4b_attention_ref(const float* query, const void* kv_cache,
     int sketch_dim = dim;
     float qjl_scale = sqrtf(TQ_PI_2) / (float)sketch_dim;
 
+    /* Optimization #1: RHT(query) computed ONCE. */
+    float q_rot[TQ_BK];
+    memcpy(q_rot, query, (size_t)dim * sizeof(float));
+    for (int i = dim; i < TQ_BK; i++) q_rot[i] = 0.0f;
+    tq_rht_transform(q_rot, dim, TKV_DEFAULT_SEED);
+
+    /* Optimization #2: Pre-compute QJL query projection ONCE. */
+    float q_proj[TQ_BK];
+    for (int s = 0; s < sketch_dim; s++) {
+        float proj = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            proj += q_rot[d] * tkv_qjl_random_entry(d, s);
+        }
+        q_proj[s] = proj;
+    }
+
     for (int seq = 0; seq < seq_len; seq++) {
         const block_tq_turbo_kv_4b* block = &blocks[seq];
         float norm = tkv_fp16_to_fp32(block->norm);
         float r_norm = tkv_fp16_to_fp32(block->residual_norm);
-        uint32_t seed = block->rht_seed;
 
-        /* MSE stage */
+        /* MSE stage: dequantize in rotated space, dot with q_rot directly. */
         float rotated[TQ_BK];
         dequant_mse_rotated_3bit(block, rotated, dim);
-        tq_rht_inverse(rotated, dim, seed);
 
         float mse_dot = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            mse_dot += query[d] * rotated[d];
-        }
-
-        /* QJL residual correction */
-        float q_rot[TQ_BK];
-        memcpy(q_rot, query, (size_t)dim * sizeof(float));
-        tq_rht_transform(q_rot, dim, seed);
-
-        float qjl_correction = 0.0f;
-        for (int s = 0; s < sketch_dim; s++) {
-            float proj = 0.0f;
-            for (int d = 0; d < dim; d++) {
-                proj += q_rot[d] * tkv_qjl_random_entry(d, s);
+#ifdef __ARM_NEON
+        {
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            float32x4_t acc2 = vdupq_n_f32(0.0f);
+            float32x4_t acc3 = vdupq_n_f32(0.0f);
+            int d = 0;
+            for (; d + 15 < dim; d += 16) {
+                acc0 = vfmaq_f32(acc0, vld1q_f32(&q_rot[d]),      vld1q_f32(&rotated[d]));
+                acc1 = vfmaq_f32(acc1, vld1q_f32(&q_rot[d + 4]),  vld1q_f32(&rotated[d + 4]));
+                acc2 = vfmaq_f32(acc2, vld1q_f32(&q_rot[d + 8]),  vld1q_f32(&rotated[d + 8]));
+                acc3 = vfmaq_f32(acc3, vld1q_f32(&q_rot[d + 12]), vld1q_f32(&rotated[d + 12]));
             }
+            acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            for (; d + 3 < dim; d += 4) {
+                acc0 = vfmaq_f32(acc0, vld1q_f32(&q_rot[d]), vld1q_f32(&rotated[d]));
+            }
+            mse_dot = vaddvq_f32(acc0);
+            for (; d < dim; d++) {
+                mse_dot += q_rot[d] * rotated[d];
+            }
+        }
+#else
+        for (int d = 0; d < dim; d++) {
+            mse_dot += q_rot[d] * rotated[d];
+        }
+#endif
+
+        /* QJL residual correction using pre-computed q_proj. */
+        float qjl_correction = 0.0f;
+#ifdef __ARM_NEON
+        {
+            float32x4_t corr0 = vdupq_n_f32(0.0f);
+            float32x4_t corr1 = vdupq_n_f32(0.0f);
+            float32x4_t corr2 = vdupq_n_f32(0.0f);
+            float32x4_t corr3 = vdupq_n_f32(0.0f);
+            int s = 0;
+            for (; s + 15 < sketch_dim; s += 16) {
+                uint32_t sign_bits = (uint32_t)block->qjl_signs[s / 8]
+                                   | ((uint32_t)block->qjl_signs[s / 8 + 1] << 8);
+                float signs_f[16];
+                for (int i = 0; i < 16; i++) {
+                    signs_f[i] = ((sign_bits >> i) & 1) ? 1.0f : -1.0f;
+                }
+                corr0 = vfmaq_f32(corr0, vld1q_f32(&q_proj[s]),      vld1q_f32(&signs_f[0]));
+                corr1 = vfmaq_f32(corr1, vld1q_f32(&q_proj[s + 4]),  vld1q_f32(&signs_f[4]));
+                corr2 = vfmaq_f32(corr2, vld1q_f32(&q_proj[s + 8]),  vld1q_f32(&signs_f[8]));
+                corr3 = vfmaq_f32(corr3, vld1q_f32(&q_proj[s + 12]), vld1q_f32(&signs_f[12]));
+            }
+            corr0 = vaddq_f32(vaddq_f32(corr0, corr1), vaddq_f32(corr2, corr3));
+            for (; s + 3 < sketch_dim; s += 4) {
+                float signs_f[4];
+                uint8_t byte = block->qjl_signs[s / 8];
+                int bit_off = s % 8;
+                for (int i = 0; i < 4; i++) {
+                    signs_f[i] = ((byte >> (bit_off + i)) & 1) ? 1.0f : -1.0f;
+                }
+                corr0 = vfmaq_f32(corr0, vld1q_f32(&q_proj[s]), vld1q_f32(signs_f));
+            }
+            qjl_correction = vaddvq_f32(corr0);
+            for (; s < sketch_dim; s++) {
+                int bit = (block->qjl_signs[s / 8] >> (s % 8)) & 1;
+                float key_sign = bit ? 1.0f : -1.0f;
+                qjl_correction += q_proj[s] * key_sign;
+            }
+        }
+#else
+        for (int s = 0; s < sketch_dim; s++) {
             int bit = (block->qjl_signs[s / 8] >> (s % 8)) & 1;
             float key_sign = bit ? 1.0f : -1.0f;
-            qjl_correction += proj * key_sign;
+            qjl_correction += q_proj[s] * key_sign;
         }
+#endif
         qjl_correction *= qjl_scale * r_norm;
 
         scores[seq] = norm * mse_dot + norm * qjl_correction;
