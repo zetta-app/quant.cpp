@@ -26,7 +26,7 @@
 
 #define TP_MAX 16
 
-typedef void (*tp_fn)(void*);
+typedef void* (*tp_fn)(void*);
 
 static struct {
     pthread_t       thr[TP_MAX];
@@ -237,7 +237,7 @@ void tq_matmul(float* out, const float* x, const float* w, int n, int d) {
     }
 
     if (g_tp.active && n_threads == g_tp.n_workers) {
-        tp_run((tp_fn)matmul_worker, ptrs, n_threads);
+        tp_run(matmul_worker, ptrs, n_threads);
     } else {
         pthread_t threads[TP_MAX];
         for (int t = 0; t < n_threads; t++)
@@ -478,8 +478,8 @@ void tq_quantize_row_q4(const float* src, uint8_t* dst_qs, float* dst_scales, in
         for (int j = 0; j < 16; j++) {
             int q0 = (int)roundf(block[2 * j] * id) + 8;
             int q1 = (int)roundf(block[2 * j + 1] * id) + 8;
-            if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-            if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+            if (q0 < 0) { q0 = 0; } if (q0 > 15) { q0 = 15; }
+            if (q1 < 0) { q1 = 0; } if (q1 > 15) { q1 = 15; }
             qb[j] = (uint8_t)((q1 << 4) | q0);
         }
     }
@@ -500,13 +500,13 @@ void tq_quantize_row_q4(const float* src, uint8_t* dst_qs, float* dst_scales, in
         for (int j = 0; j < n_pairs; j++) {
             int q0 = (int)roundf(block[2 * j] * id) + 8;
             int q1 = (int)roundf(block[2 * j + 1] * id) + 8;
-            if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-            if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+            if (q0 < 0) { q0 = 0; } if (q0 > 15) { q0 = 15; }
+            if (q1 < 0) { q1 = 0; } if (q1 > 15) { q1 = 15; }
             qb[j] = (uint8_t)((q1 << 4) | q0);
         }
         if (remainder & 1) {
             int q0 = (int)roundf(block[remainder - 1] * id) + 8;
-            if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+            if (q0 < 0) { q0 = 0; } if (q0 > 15) { q0 = 15; }
             qb[n_pairs] = (uint8_t)(q0);
         }
     }
@@ -536,9 +536,11 @@ static void matmul_q4_rows(float* out, const float* x,
                             const int8_t* x_q8, const float* x_scales,
                             int start_row, int end_row, int d) {
     int n_blocks = d / 32;
+    (void)x; /* activation already in x_q8 */
+#ifdef __ARM_NEON
     const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
     const uint8x16_t v8 = vdupq_n_u8(8);
-    (void)x; /* activation already in x_q8 */
+#endif
 
     for (int i = start_row; i < end_row - 1; i += 2) {
         /* Process 2 rows simultaneously for better ILP */
@@ -763,7 +765,7 @@ void tq_matmul_q4(float* out, const float* x, const uint8_t* w_qs, const float* 
     }
 
     if (g_tp.active && n_threads == g_tp.n_workers) {
-        tp_run((tp_fn)matmul_q4_worker, ptrs, n_threads);
+        tp_run(matmul_q4_worker, ptrs, n_threads);
     } else {
         pthread_t threads[TP_MAX];
         for (int t = 0; t < n_threads; t++)
@@ -811,7 +813,7 @@ void tq_matmul_q4_preq(float* out, const uint8_t* w_qs, const float* w_scales,
     }
 
     if (g_tp.active && n_threads == g_tp.n_workers) {
-        tp_run((tp_fn)matmul_q4_worker, ptrs, n_threads);
+        tp_run(matmul_q4_worker, ptrs, n_threads);
     } else {
         pthread_t threads[TP_MAX];
         for (int t = 0; t < n_threads; t++)
@@ -937,7 +939,7 @@ void tq_matmul_bf16(float* out, const float* x, const uint16_t* w_bf16, int n, i
     }
 
     if (g_tp.active && n_threads == g_tp.n_workers) {
-        tp_run((tp_fn)matmul_bf16_worker, ptrs, n_threads);
+        tp_run(matmul_bf16_worker, ptrs, n_threads);
     } else {
         pthread_t threads[TP_MAX];
         for (int t = 0; t < n_threads; t++)
