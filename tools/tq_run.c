@@ -20,6 +20,10 @@
  *   --info           Print model info and exit
  *   -M, --memory     Print KV cache memory stats after generation
  *   --profile-kv     Profile KV activation distributions (pre/post RHT)
+ *   --recommend      Run --profile-kv and output per-layer bit recommendations
+ *   --attn-entropy   Compute per-layer, per-head attention entropy during generation
+ *   -V <N>           V highres window: recent N tokens get FP16 V (0=disabled)
+ *   --calibrate      Run online Lloyd-Max codebook calibration analysis
  *   --ppl <file>     Compute perplexity on a text file (teacher-forced)
  *   --bench-memory   Benchmark memory bandwidth (tok/s at varying context lengths)
  */
@@ -77,6 +81,10 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --info           Print model info and exit\n");
     fprintf(stderr, "  -M, --memory     Print KV cache memory stats after generation\n");
     fprintf(stderr, "  --profile-kv     Profile KV activation distributions (pre/post RHT)\n");
+    fprintf(stderr, "  --recommend      Per-layer bit allocation recommendation (kurtosis-based)\n");
+    fprintf(stderr, "  --attn-entropy   Compute per-layer, per-head attention entropy\n");
+    fprintf(stderr, "  -V <N>           V highres window: recent N tokens get FP16 V (0=disabled)\n");
+    fprintf(stderr, "  --calibrate      Online Lloyd-Max codebook calibration analysis\n");
     fprintf(stderr, "  --ppl <file>     Compute perplexity on text file (teacher-forced)\n");
     fprintf(stderr, "  --bench-memory   Benchmark memory bandwidth at varying context lengths\n");
 }
@@ -101,6 +109,10 @@ int main(int argc, char** argv) {
     int info_only = 0;
     int show_memory = 0;
     int profile_kv = 0;
+    int recommend_mode = 0;
+    int attn_entropy_mode = 0;
+    int v_highres_window = 0;
+    int calibrate_mode = 0;
     const char* ppl_file = NULL;
     int bench_memory = 0;
 
@@ -157,6 +169,16 @@ int main(int argc, char** argv) {
             show_memory = 1;
         } else if (strcmp(argv[i], "--profile-kv") == 0) {
             profile_kv = 1;
+        } else if (strcmp(argv[i], "--recommend") == 0) {
+            recommend_mode = 1;
+            profile_kv = 1;  /* --recommend implies --profile-kv */
+        } else if (strcmp(argv[i], "--attn-entropy") == 0) {
+            attn_entropy_mode = 1;
+        } else if (strcmp(argv[i], "-V") == 0 && i + 1 < argc) {
+            v_highres_window = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--calibrate") == 0) {
+            calibrate_mode = 1;
+            profile_kv = 1;  /* --calibrate implies --profile-kv */
         } else if (strcmp(argv[i], "--ppl") == 0 && i + 1 < argc) {
             ppl_file = argv[++i];
         } else if (strcmp(argv[i], "--bench-memory") == 0) {
@@ -563,10 +585,240 @@ int main(int argc, char** argv) {
         fprintf(stderr, "==========================================\n");
         fprintf(stderr, "Target: post-RHT kurtosis ~ 3.0 (normal), KL-div < 0.05\n");
 
+        /* --recommend: per-layer bit allocation based on kurtosis */
+        if (recommend_mode) {
+            /* Collect post-RHT kurtosis values */
+            float* kurtosis_vals = (float*)calloc((size_t)c->n_layers, sizeof(float));
+            int* rec_bits = (int*)calloc((size_t)c->n_layers, sizeof(int));
+            if (kurtosis_vals && rec_bits) {
+                for (int l = 0; l < c->n_layers; l++) {
+                    double* acc = state->profile_accum + (size_t)l * 8;
+                    double pm = acc[4] / n_samples;
+                    double pv = acc[5] / n_samples - pm * pm;
+                    double ps = (pv > 1e-20) ? sqrt(pv) : 1e-10;
+                    double pk = (ps > 1e-10) ?
+                        (acc[7] / n_samples - 4.0 * pm * acc[6] / n_samples
+                         + 6.0 * pm * pm * acc[5] / n_samples
+                         - 3.0 * pm * pm * pm * pm)
+                        / (pv * pv) : 0.0;
+                    kurtosis_vals[l] = (float)pk;
+                }
+                float avg_bits = 0.0f;
+                tq_recommend_layer_bits(kurtosis_vals, c->n_layers, rec_bits, &avg_bits);
+
+                fprintf(stderr, "\n=== Per-Layer Bit Allocation Recommendations ===\n");
+                int n_3bit = 0, n_1bit = 0;
+                for (int l = 0; l < c->n_layers; l++) {
+                    const char* type_name = (rec_bits[l] == 3) ? "turbo_kv_3b" : "turbo_kv_1b";
+                    fprintf(stderr, "Layer %2d: kurtosis=%.2f -> recommend %s (%d-bit)\n",
+                            l, kurtosis_vals[l], type_name, rec_bits[l]);
+                    if (rec_bits[l] == 3) n_3bit++;
+                    else n_1bit++;
+                }
+                fprintf(stderr, "Summary: %d layers @ 3-bit, %d layers @ 1-bit\n", n_3bit, n_1bit);
+                fprintf(stderr, "Average: %.1f bits (vs 3.0 uniform) -> %.0f%% memory savings\n",
+                        avg_bits, (1.0f - avg_bits / 3.0f) * 100.0f);
+                fprintf(stderr, "=================================================\n");
+            }
+            free(kurtosis_vals);
+            free(rec_bits);
+        }
+
+        /* --calibrate: Lloyd-Max codebook optimization on post-RHT data */
+        if (calibrate_mode) {
+            fprintf(stderr, "\n=== Online Codebook Calibration ===\n");
+            fprintf(stderr, "Collecting post-RHT activations for calibration...\n");
+
+            /* Re-run a smaller forward pass to collect actual values */
+            tq_state_t* cal_state = tq_create_state_ex(&model->config, kv_type, value_quant_bits);
+            if (cal_state) {
+                int cal_tokens = 100;
+                if (cal_tokens > c->max_seq_len) cal_tokens = c->max_seq_len;
+
+                /* Allocate sample buffer: cal_tokens * head_dim values per layer */
+                int sample_size = cal_tokens * head_dim;
+                float* samples = (float*)calloc((size_t)sample_size, sizeof(float));
+                if (samples) {
+                    /* Run forward, collect post-RHT key values from layer 0 */
+                    for (int i = 0; i < cal_tokens; i++) {
+                        int tok = (i < n_prompt) ? ptokens[i] : 1;
+                        tq_forward(model, cal_state, tok, i);
+                        /* Copy key from layer 0, apply RHT */
+                        float k_rht[TQ_BK];
+                        int rd = head_dim;
+                        if (rd > TQ_BK) rd = TQ_BK;
+                        memcpy(k_rht, cal_state->k, (size_t)rd * sizeof(float));
+                        tq_rht_transform(k_rht, rd, 0x12345678u);
+                        memcpy(samples + (size_t)i * head_dim, k_rht, (size_t)rd * sizeof(float));
+                    }
+
+                    /* Normalize samples to unit variance for codebook comparison */
+                    double sum = 0.0, sum_sq = 0.0;
+                    for (int i = 0; i < sample_size; i++) {
+                        sum += (double)samples[i];
+                        sum_sq += (double)samples[i] * (double)samples[i];
+                    }
+                    double smean = sum / (double)sample_size;
+                    double svar = sum_sq / (double)sample_size - smean * smean;
+                    double sstd = (svar > 0) ? sqrt(svar) : 1.0;
+                    for (int i = 0; i < sample_size; i++) {
+                        samples[i] = (float)(((double)samples[i] - smean) / sstd);
+                    }
+
+                    /* Calibrate 2-bit codebook (4 levels) */
+                    float centroids_4[4], boundaries_3[3];
+                    float mse_cal = tq_calibrate_codebook(samples, sample_size, 4, 20,
+                                                          centroids_4, boundaries_3);
+
+                    /* Compare with default N(0,1) Lloyd-Max centroids */
+                    float default_centroids[4] = {-1.510f, -0.453f, 0.453f, 1.510f};
+                    double mse_default = 0.0;
+                    for (int i = 0; i < sample_size; i++) {
+                        float val = samples[i];
+                        float best_dist = fabsf(val - default_centroids[0]);
+                        for (int ci = 1; ci < 4; ci++) {
+                            float dist = fabsf(val - default_centroids[ci]);
+                            if (dist < best_dist) best_dist = dist;
+                        }
+                        mse_default += (double)(best_dist * best_dist);
+                    }
+                    mse_default /= (double)sample_size;
+
+                    fprintf(stderr, "\n2-bit codebook (4 levels):\n");
+                    fprintf(stderr, "  Default N(0,1):  centroids = [%.3f, %.3f, %.3f, %.3f]  MSE = %.6f\n",
+                            default_centroids[0], default_centroids[1],
+                            default_centroids[2], default_centroids[3], mse_default);
+                    fprintf(stderr, "  Calibrated:      centroids = [%.3f, %.3f, %.3f, %.3f]  MSE = %.6f\n",
+                            centroids_4[0], centroids_4[1], centroids_4[2], centroids_4[3],
+                            (double)mse_cal);
+                    fprintf(stderr, "  Boundaries:      [%.3f, %.3f, %.3f]\n",
+                            boundaries_3[0], boundaries_3[1], boundaries_3[2]);
+                    double improvement = (mse_default > 0) ?
+                        (1.0 - (double)mse_cal / mse_default) * 100.0 : 0.0;
+                    fprintf(stderr, "  MSE improvement: %.1f%%\n", improvement);
+
+                    /* Calibrate 3-bit codebook (8 levels) */
+                    float centroids_8[8], boundaries_7[7];
+                    float mse_cal_8 = tq_calibrate_codebook(samples, sample_size, 8, 20,
+                                                            centroids_8, boundaries_7);
+                    fprintf(stderr, "\n3-bit codebook (8 levels):\n");
+                    fprintf(stderr, "  Calibrated:      centroids = [");
+                    for (int ci = 0; ci < 8; ci++) {
+                        fprintf(stderr, "%.3f%s", centroids_8[ci], ci < 7 ? ", " : "");
+                    }
+                    fprintf(stderr, "]  MSE = %.6f\n", (double)mse_cal_8);
+
+                    free(samples);
+                }
+                tq_free_state(cal_state);
+            }
+            fprintf(stderr, "===================================\n");
+        }
+
         free(state->profile_accum);
         state->profile_accum = NULL;
         free(state->profile_stats);
         state->profile_stats = NULL;
+        tq_free_state(state);
+        if (tokenizer) tq_free_tokenizer(tokenizer);
+        tq_free_model(model);
+        return 0;
+    }
+
+    /* ================================================================
+     * Mode: --attn-entropy  (Attention entropy analysis)
+     * Runs inference and tracks per-layer, per-head attention entropy.
+     * ================================================================ */
+    if (attn_entropy_mode) {
+        tq_state_t* state = tq_create_state_ex(&model->config, kv_type, value_quant_bits);
+        if (!state) {
+            fprintf(stderr, "Error: failed to allocate state\n");
+            if (tokenizer) tq_free_tokenizer(tokenizer);
+            tq_free_model(model);
+            return 1;
+        }
+
+        /* Enable entropy tracking */
+        state->attn_entropy = 1;
+        state->entropy_count = 0;
+        state->entropy_accum = (double*)calloc(
+            (size_t)c->n_layers * c->n_heads, sizeof(double));
+        if (!state->entropy_accum) {
+            fprintf(stderr, "Error: failed to allocate entropy buffers\n");
+            tq_free_state(state);
+            if (tokenizer) tq_free_tokenizer(tokenizer);
+            tq_free_model(model);
+            return 1;
+        }
+
+        /* Set up V highres window if requested */
+        if (v_highres_window > 0 && (value_quant_bits == 4 || value_quant_bits == 2)) {
+            int kv_dim_e = c->n_kv_heads * c->head_dim;
+            state->v_highres_window = v_highres_window;
+            state->value_highres_fp16 = (uint16_t*)calloc(
+                (size_t)c->n_layers * v_highres_window * kv_dim_e, sizeof(uint16_t));
+        }
+
+        /* Encode prompt */
+        int ptokens_e[4096];
+        int n_prompt_e = 0;
+        if (tokenizer) {
+            n_prompt_e = tq_encode(tokenizer, prompt, ptokens_e, 4096, 1);
+        }
+        if (n_prompt_e <= 0) {
+            ptokens_e[0] = (c->model_type == 1) ? 2 : 1;
+            n_prompt_e = 1;
+        }
+
+        int total_run = n_prompt_e + max_tokens;
+        if (total_run > c->max_seq_len) total_run = c->max_seq_len;
+
+        fprintf(stderr, "Running attention entropy analysis for %d tokens...\n", total_run);
+        for (int i = 0; i < total_run; i++) {
+            int tok = (i < n_prompt_e) ? ptokens_e[i] : 1;
+            float* logits_e = tq_forward(model, state, tok, i);
+            if (i >= 1) {
+                state->entropy_count++;
+            }
+            if (i >= n_prompt_e && logits_e) {
+                int next = tq_sample_argmax(logits_e, c->vocab_size);
+                (void)next;
+            }
+        }
+
+        /* Print entropy report */
+        int en_count = state->entropy_count;
+        fprintf(stderr, "\n=== Attention Entropy Analysis ===\n");
+        fprintf(stderr, "Tokens analyzed: %d\n", en_count);
+        fprintf(stderr, "Entropy unit: bits (log2). Low = sharp, High = diffuse.\n\n");
+
+        /* Per-layer summary */
+        fprintf(stderr, "%-8s %-12s %-12s %-12s\n",
+                "Layer", "AvgEntropy", "MinHead", "MaxHead");
+        fprintf(stderr, "-------- ------------ ------------ ------------\n");
+
+        for (int l = 0; l < c->n_layers; l++) {
+            double layer_sum = 0.0;
+            double min_h = 1e30, max_h = -1e30;
+            for (int h = 0; h < c->n_heads; h++) {
+                double avg_e = (en_count > 0) ?
+                    state->entropy_accum[(size_t)l * c->n_heads + h] / (double)en_count : 0.0;
+                layer_sum += avg_e;
+                if (avg_e < min_h) min_h = avg_e;
+                if (avg_e > max_h) max_h = avg_e;
+            }
+            double layer_avg = layer_sum / (double)c->n_heads;
+            fprintf(stderr, "%-8d %-12.4f %-12.4f %-12.4f\n",
+                    l, layer_avg, min_h, max_h);
+        }
+
+        /* Interpretation */
+        fprintf(stderr, "\nInterpretation:\n");
+        fprintf(stderr, "  Low entropy layers: quantization error matters less (sharp attention)\n");
+        fprintf(stderr, "  High entropy layers: quantization error matters more (diffuse attention)\n");
+        fprintf(stderr, "  Consider using higher precision for high-entropy layers.\n");
+        fprintf(stderr, "==================================\n");
+
         tq_free_state(state);
         if (tokenizer) tq_free_tokenizer(tokenizer);
         tq_free_model(model);
@@ -580,6 +832,7 @@ int main(int argc, char** argv) {
     config.max_tokens = max_tokens;
     config.kv_type = kv_type;
     config.value_quant_bits = value_quant_bits;
+    config.v_highres_window = v_highres_window;
     config.on_token = print_token;
     config.user_data = NULL;
 

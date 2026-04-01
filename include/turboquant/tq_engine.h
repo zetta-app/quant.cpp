@@ -254,6 +254,16 @@ typedef struct {
      * [n_layers * 8] = sum, sum_sq, sum_cube, sum_quad (pre/post RHT) */
     double* profile_accum;
 
+    /* Attention entropy tracking (opt-in via attn_entropy flag) */
+    int attn_entropy;           /* 1 = compute attention entropy per head per layer */
+    /* Per-layer, per-head entropy accumulators: [n_layers * n_heads] */
+    double* entropy_accum;      /* running sum of entropy values */
+    int entropy_count;          /* number of tokens accumulated */
+
+    /* V highres window: store recent N tokens as FP16 even when V is quantized */
+    int v_highres_window;       /* number of recent tokens stored as FP16 (0 = disabled) */
+    uint16_t* value_highres_fp16; /* FP16 V cache for recent tokens [n_layers, window, kv_dim] */
+
     /* Quantized KV cache for integer attention */
     void* quant_key_cache;   /* [n_layers, max_seq_len, n_kv_heads, blocks_per_head * type_size] */
     size_t quant_kv_stride;  /* bytes per layer in quant_key_cache */
@@ -269,6 +279,7 @@ typedef struct {
     int max_tokens;
     tq_type kv_type;     /* KV cache quantization type */
     int value_quant_bits;/* V cache quantization: 0=FP16/FP32(default), 4=Q4, 2=Q2 */
+    int v_highres_window;/* recent N tokens get FP16 V even when V is quantized (0=disabled) */
     int n_threads;
     float rep_penalty;    /* repetition penalty (default: 1.1, 1.0 = disabled) */
     int rep_window;       /* how many recent tokens to penalize (default: 32) */
@@ -431,6 +442,41 @@ void tq_mul(float* out, const float* a, const float* b, int n);
 
 /* Default generation config */
 tq_gen_config_t tq_default_gen_config(void);
+
+/* ============================================================
+ * Adaptive compression utilities
+ * ============================================================ */
+
+/** Per-layer bit allocation recommendation based on kurtosis.
+ * @param kurtosis_values  Post-RHT kurtosis per layer [n_layers]
+ * @param n_layers         Number of layers
+ * @param recommended_bits Output: recommended bits per layer [n_layers] (3 or 1)
+ * @param avg_bits         Output: average bits across all layers
+ */
+void tq_recommend_layer_bits(const float* kurtosis_values, int n_layers,
+                             int* recommended_bits, float* avg_bits);
+
+/** Compute attention entropy from softmax distribution.
+ * H = -sum(p * log2(p)), where p_i = 0 contributes 0.
+ * @param probs   Softmax attention weights [seq_len]
+ * @param seq_len Length of the attention distribution
+ * @return        Entropy in bits
+ */
+float tq_attention_entropy(const float* probs, int seq_len);
+
+/** Online Lloyd-Max codebook calibration.
+ * Runs Lloyd-Max iterations on empirical data to find optimal centroids.
+ * @param data       Input samples (post-RHT values)
+ * @param n_samples  Number of samples
+ * @param n_levels   Number of codebook levels (4 for 2-bit, 8 for 3-bit)
+ * @param iterations Number of Lloyd-Max iterations
+ * @param centroids  Output: optimized centroid values [n_levels]
+ * @param boundaries Output: decision boundaries [n_levels - 1] (can be NULL)
+ * @return           MSE of the calibrated codebook
+ */
+float tq_calibrate_codebook(const float* data, int n_samples,
+                            int n_levels, int iterations,
+                            float* centroids, float* boundaries);
 
 /* Thread control for matmul parallelism */
 void tq_set_threads(int n_threads);

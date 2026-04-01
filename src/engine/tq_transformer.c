@@ -224,6 +224,10 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
         s->quant_key_cache = NULL;
     }
 
+    /* Adaptive compression: these are set later via flags, not at creation time.
+     * attn_entropy, entropy_accum, v_highres_window, value_highres_fp16
+     * are initialized to 0/NULL by calloc. */
+
     /* Verify critical allocations */
     int value_cache_ok;
     if (s->value_quant_bits == 4 || s->value_quant_bits == 2) {
@@ -276,6 +280,10 @@ void tq_free_state(tq_state_t* state) {
     free(state->quant_key_buf);
     free(state->quant_score_buf);
     free(state->quant_key_cache);
+    free(state->entropy_accum);
+    free(state->value_highres_fp16);
+    free(state->profile_stats);
+    free(state->profile_accum);
     free(state);
 }
 
@@ -924,12 +932,28 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         uint8_t* vqs = s->value_cache_qs + layer_off_qs + (size_t)pos * s->value_stride_qs;
         float*   vsc = s->value_cache_scales + layer_off_sc + (size_t)pos * s->value_stride_scales;
         tq_quantize_row_q4(s->v, vqs, vsc, kv_dim);
+        /* Also store FP16 copy in highres window for recent tokens */
+        if (s->v_highres_window > 0 && s->value_highres_fp16) {
+            int win_idx = pos % s->v_highres_window;
+            size_t hr_layer_stride = (size_t)s->v_highres_window * kv_dim;
+            uint16_t* hr_dst = s->value_highres_fp16
+                + (size_t)l * hr_layer_stride + (size_t)win_idx * kv_dim;
+            f32_to_fp16_vec(s->v, hr_dst, kv_dim);
+        }
     } else if (s->value_quant_bits == 2) {
         size_t layer_off_qs = (size_t)l * max_seq * s->value_stride_qs;
         size_t layer_off_sc = (size_t)l * max_seq * s->value_stride_scales;
         uint8_t* vqs = s->value_cache_qs + layer_off_qs + (size_t)pos * s->value_stride_qs;
         float*   vsc = s->value_cache_scales + layer_off_sc + (size_t)pos * s->value_stride_scales;
         tq_quantize_row_q2(s->v, vqs, vsc, kv_dim);
+        /* Also store FP16 copy in highres window for recent tokens */
+        if (s->v_highres_window > 0 && s->value_highres_fp16) {
+            int win_idx = pos % s->v_highres_window;
+            size_t hr_layer_stride = (size_t)s->v_highres_window * kv_dim;
+            uint16_t* hr_dst = s->value_highres_fp16
+                + (size_t)l * hr_layer_stride + (size_t)win_idx * kv_dim;
+            f32_to_fp16_vec(s->v, hr_dst, kv_dim);
+        }
     } else if (s->use_fp16_values) {
         uint16_t* val_fp16_layer = s->value_cache_fp16 + l * kv_layer_stride;
         f32_to_fp16_vec(s->v, val_fp16_layer + (size_t)pos * kv_dim, kv_dim);
@@ -1039,10 +1063,78 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         /* Softmax */
         tq_softmax(atth, seq_len);
 
+        /* Attention entropy tracking (opt-in) */
+        if (s->attn_entropy && s->entropy_accum) {
+            double ent = 0.0;
+            for (int t = 0; t < seq_len; t++) {
+                float p = atth[t];
+                if (p > 1e-10f) {
+                    ent -= (double)p * log2((double)p);
+                }
+            }
+            s->entropy_accum[(size_t)l * n_heads + h] += ent;
+        }
+
         /* Weighted sum of values */
         float* xbh = s->xb + h * head_dim;
         memset(xbh, 0, head_dim * sizeof(float));
-        if (s->value_quant_bits == 4 || s->value_quant_bits == 2) {
+
+        /* V highres window: for recent tokens, use FP16 V instead of quantized.
+         * This improves quality for tokens that typically receive high attention weight. */
+        if (s->v_highres_window > 0 && s->value_highres_fp16 &&
+            (s->value_quant_bits == 4 || s->value_quant_bits == 2)) {
+            /* Hybrid path: quantized V for old tokens, FP16 V for recent tokens */
+            int window_start = pos - s->v_highres_window + 1;
+            if (window_start < 0) window_start = 0;
+
+            /* Old tokens: use quantized V path */
+            float v_tmp[512];
+            size_t layer_off_qs = (size_t)l * max_seq * s->value_stride_qs;
+            size_t layer_off_sc = (size_t)l * max_seq * s->value_stride_scales;
+            int n_blocks_per_head = (head_dim + 31) / 32;
+            size_t packed_per_block = (s->value_quant_bits == 4) ? 16 : 8;
+            size_t head_qs_off = (size_t)kv_h * n_blocks_per_head * packed_per_block;
+            size_t head_sc_off = (size_t)kv_h * n_blocks_per_head;
+            for (int t = 0; t < window_start && t < seq_len; t++) {
+                float a = atth[t];
+                if (a == 0.0f) continue;
+                const uint8_t* vqs = s->value_cache_qs + layer_off_qs
+                    + (size_t)t * s->value_stride_qs + head_qs_off;
+                const float* vsc = s->value_cache_scales + layer_off_sc
+                    + (size_t)t * s->value_stride_scales + head_sc_off;
+                if (s->value_quant_bits == 4) {
+                    tq_dequantize_row_q4(vqs, vsc, v_tmp, head_dim);
+                } else {
+                    tq_dequantize_row_q2(vqs, vsc, v_tmp, head_dim);
+                }
+                for (int d = 0; d < head_dim; d++) {
+                    xbh[d] += a * v_tmp[d];
+                }
+            }
+
+            /* Recent tokens: use FP16 V from highres window */
+            int window_size = s->v_highres_window;
+            size_t hr_layer_stride = (size_t)window_size * kv_dim;
+            const uint16_t* hr_layer = s->value_highres_fp16 + (size_t)l * hr_layer_stride;
+            for (int t = window_start; t < seq_len; t++) {
+                float a = atth[t];
+                if (a == 0.0f) continue;
+                int win_idx = t % window_size;
+                const uint16_t* vt16 = hr_layer + (size_t)win_idx * kv_dim + kv_h * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    /* fp16_to_f32 inline: extract sign/exp/mant */
+                    uint16_t hv = vt16[d];
+                    union { float f; uint32_t u; } bits;
+                    uint32_t sign = (hv & 0x8000) << 16;
+                    uint32_t exp = (hv >> 10) & 0x1F;
+                    uint32_t mant = hv & 0x03FF;
+                    if (exp == 0) { bits.u = sign; }
+                    else if (exp == 31) { bits.u = sign | 0x7F800000 | (mant << 13); }
+                    else { exp = exp - 15 + 127; bits.u = sign | (exp << 23) | (mant << 13); }
+                    xbh[d] += a * bits.f;
+                }
+            }
+        } else if (s->value_quant_bits == 4 || s->value_quant_bits == 2) {
             /* Quantized value path: dequantize V per position on the fly.
              * We dequantize all kv_dim values for the position, then index into it.
              * Use a stack buffer for the head_dim portion. */

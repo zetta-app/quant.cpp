@@ -165,6 +165,17 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         return -1;
     }
 
+    /* Set up V highres window if requested */
+    if (config->v_highres_window > 0 &&
+        (config->value_quant_bits == 4 || config->value_quant_bits == 2)) {
+        int n_layers = model->config.n_layers;
+        int kv_dim = model->config.n_kv_heads * model->config.head_dim;
+        int window = config->v_highres_window;
+        state->v_highres_window = window;
+        state->value_highres_fp16 = (uint16_t*)calloc(
+            (size_t)n_layers * window * kv_dim, sizeof(uint16_t));
+    }
+
     /* Encode prompt */
     int prompt_tokens[4096];
     int n_prompt = 0;
