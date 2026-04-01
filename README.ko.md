@@ -40,7 +40,7 @@ ctest --test-dir build   # 31/31 통과해야 합니다
 
 | 모델 | 파라미터 | 포맷 | 속도 (6T) | KV 압축 |
 |------|----------|------|-----------|---------|
-| **Qwen3.5-35B-A3B** | 35B (3B 활성) | GGUF IQ2_XXS | 3.0 tok/s | 1-bit K ✓ (byte-identical) |
+| **Qwen3.5-35B-A3B** | 35B (3B 활성) | GGUF IQ2_XXS | ~1.0 tok/s | 1-bit K ✓ (byte-identical) |
 | **Gemma 3 4B** | 4B | TQM | 20.2 tok/s | PPL +0.03%, 모든 KV 타입 ✓ |
 | **Qwen3.5-0.8B** | 752M | TQM/GGUF | 80.1 tok/s | 모든 KV 타입 ✓ |
 | **Gemma 3 270M** | 270M | TQM | 176 tok/s | 모든 KV 타입 ✓ |

@@ -40,7 +40,7 @@ ctest --test-dir build   # 31/31 should pass
 
 | Model | Params | Format | Speed (6T) | KV Verified |
 |-------|--------|--------|------------|-------------|
-| **Qwen3.5-35B-A3B** | 35B (3B active) | GGUF IQ2_XXS | 3.0 tok/s | 1-bit K ✓ (byte-identical) |
+| **Qwen3.5-35B-A3B** | 35B (3B active) | GGUF IQ2_XXS | ~1.0 tok/s | 1-bit K ✓ (byte-identical) |
 | **Gemma 3 4B** | 4B | TQM | 20.2 tok/s | PPL +0.03%, all KV types ✓ |
 | **Qwen3.5-0.8B** | 752M | TQM/GGUF | 80.1 tok/s | all KV types ✓ |
 | **Gemma 3 270M** | 270M | TQM | 176 tok/s | all KV types ✓ |
