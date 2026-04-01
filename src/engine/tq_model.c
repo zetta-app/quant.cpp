@@ -2932,6 +2932,219 @@ tq_model_t* tq_load_gguf(const char* path) {
             c->is_moe ? ", MoE" : "",
             c->hidden_dim, c->n_heads, c->n_kv_heads, c->vocab_size);
 
+    /* ============================================================
+     * Load-time weight conversion: GGUF -> Q4 for small models
+     *
+     * For models where total FP32 weight size < 8GB, dequantize GGUF
+     * weights to FP32 (temporary), then quantize to Q4. This replaces
+     * the slow on-the-fly GGUF dequant path with the fast Q4×Q8
+     * integer matmul path, yielding ~10x speedup.
+     * ============================================================ */
+    if (!c->is_moe) {
+        /* Estimate total FP32 weight size for non-MoE layers */
+        int dim = c->hidden_dim;
+        int q_dim = c->n_heads * c->head_dim;
+        int kv_dim = c->n_kv_heads * c->head_dim;
+        int inter = c->intermediate_dim;
+        int qg_dim = c->attn_output_gate ? q_dim * 2 : q_dim;
+        int delta_nkv = c->delta_n_kv_heads > 0 ? c->delta_n_kv_heads : c->delta_n_heads;
+        int delta_qkv_dim = delta_nkv * c->delta_key_head_dim * 2
+                          + c->delta_n_heads * c->delta_value_head_dim;
+        int delta_z_dim = c->delta_n_heads * c->delta_value_head_dim;
+        int delta_dn = c->delta_n_heads;
+
+        size_t est_fp32 = 0;
+        for (int l = 0; l < c->n_layers; l++) {
+            const tq_layer_weights_t* layer = &model->layers[l];
+            if (layer->gguf_wq)
+                est_fp32 += (size_t)qg_dim * dim * sizeof(float);
+            if (layer->gguf_wk)
+                est_fp32 += (size_t)kv_dim * dim * sizeof(float);
+            if (layer->gguf_wv)
+                est_fp32 += (size_t)kv_dim * dim * sizeof(float);
+            if (layer->gguf_wo)
+                est_fp32 += (size_t)dim * q_dim * sizeof(float);
+            if (layer->gguf_w_gate)
+                est_fp32 += (size_t)inter * dim * sizeof(float);
+            if (layer->gguf_w_up)
+                est_fp32 += (size_t)inter * dim * sizeof(float);
+            if (layer->gguf_w_down)
+                est_fp32 += (size_t)dim * inter * sizeof(float);
+            /* DeltaNet GGUF weights */
+            if (layer->gguf_delta_qkv)
+                est_fp32 += (size_t)delta_qkv_dim * dim * sizeof(float);
+            if (layer->gguf_delta_z)
+                est_fp32 += (size_t)delta_z_dim * dim * sizeof(float);
+            if (layer->gguf_delta_a)
+                est_fp32 += (size_t)delta_dn * dim * sizeof(float);
+            if (layer->gguf_delta_b)
+                est_fp32 += (size_t)delta_dn * dim * sizeof(float);
+            if (layer->gguf_delta_out)
+                est_fp32 += (size_t)dim * delta_z_dim * sizeof(float);
+        }
+
+        const size_t MAX_FP32_BYTES = (size_t)8 * 1024 * 1024 * 1024ULL; /* 8 GB */
+        int has_gguf_weights = 0;
+        for (int l = 0; l < c->n_layers && !has_gguf_weights; l++) {
+            if (model->layers[l].gguf_wq || model->layers[l].gguf_w_gate)
+                has_gguf_weights = 1;
+        }
+
+        if (has_gguf_weights && est_fp32 < MAX_FP32_BYTES) {
+            fprintf(stderr, "tq_load_gguf: load-time Q4 conversion enabled "
+                    "(est FP32 = %.1f GB < 8 GB threshold)\n",
+                    (double)est_fp32 / (1024.0 * 1024.0 * 1024.0));
+
+            /* Track all FP32 temporaries for cleanup after Q4 quantization.
+             * Max 13 weight matrices per layer (7 attn/FFN + 5 DeltaNet + 1 spare). */
+            int max_tmp = c->n_layers * 13;
+            float** fp32_temps = (float**)calloc((size_t)max_tmp, sizeof(float*));
+            int n_tmp = 0;
+
+            for (int l = 0; l < c->n_layers; l++) {
+                tq_layer_weights_t* layer = &model->layers[l];
+
+                /* Self-attention weights: dequant GGUF -> FP32 */
+                if (layer->gguf_wq) {
+                    int n = qg_dim * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_wq_type, layer->gguf_wq, fp, n);
+                        layer->wq = fp;
+                        layer->gguf_wq = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_wk) {
+                    int n = kv_dim * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_wk_type, layer->gguf_wk, fp, n);
+                        layer->wk = fp;
+                        layer->gguf_wk = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_wv) {
+                    int n = kv_dim * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_wv_type, layer->gguf_wv, fp, n);
+                        layer->wv = fp;
+                        layer->gguf_wv = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_wo) {
+                    int n = dim * q_dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_wo_type, layer->gguf_wo, fp, n);
+                        layer->wo = fp;
+                        layer->gguf_wo = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+
+                /* FFN weights: dequant GGUF -> FP32 */
+                if (layer->gguf_w_gate) {
+                    int n = inter * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_w_gate_type, layer->gguf_w_gate, fp, n);
+                        layer->w_gate = fp;
+                        layer->gguf_w_gate = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_w_up) {
+                    int n = inter * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_w_up_type, layer->gguf_w_up, fp, n);
+                        layer->w_up = fp;
+                        layer->gguf_w_up = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_w_down) {
+                    int n = dim * inter;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_w_down_type, layer->gguf_w_down, fp, n);
+                        layer->w_down = fp;
+                        layer->gguf_w_down = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+
+                /* DeltaNet weights: dequant GGUF -> FP32 */
+                if (layer->gguf_delta_qkv && delta_qkv_dim > 0) {
+                    int n = delta_qkv_dim * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_delta_qkv_type, layer->gguf_delta_qkv, fp, n);
+                        layer->delta_in_proj_qkv = fp;
+                        layer->gguf_delta_qkv = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_delta_z && delta_z_dim > 0) {
+                    int n = delta_z_dim * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_delta_z_type, layer->gguf_delta_z, fp, n);
+                        layer->delta_in_proj_z = fp;
+                        layer->gguf_delta_z = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_delta_a && delta_dn > 0) {
+                    int n = delta_dn * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_delta_a_type, layer->gguf_delta_a, fp, n);
+                        layer->delta_in_proj_a = fp;
+                        layer->gguf_delta_a = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_delta_b && delta_dn > 0) {
+                    int n = delta_dn * dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_delta_b_type, layer->gguf_delta_b, fp, n);
+                        layer->delta_in_proj_b = fp;
+                        layer->gguf_delta_b = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+                if (layer->gguf_delta_out && delta_z_dim > 0) {
+                    int n = dim * delta_z_dim;
+                    float* fp = (float*)malloc((size_t)n * sizeof(float));
+                    if (fp) {
+                        tq_dequant_row_gguf(layer->gguf_delta_out_type, layer->gguf_delta_out, fp, n);
+                        layer->delta_out_proj = fp;
+                        layer->gguf_delta_out = NULL;
+                        fp32_temps[n_tmp++] = fp;
+                    }
+                }
+            }
+
+            /* Convert all FP32 weights to Q4 (reuses existing tq_quantize_weights_q4) */
+            tq_quantize_weights_q4(model);
+
+            /* Free FP32 temporaries (tq_quantize_weights_q4 set layer->wX = NULL
+             * but didn't free the malloc'd buffers) */
+            for (int i = 0; i < n_tmp; i++) {
+                free(fp32_temps[i]);
+            }
+            free(fp32_temps);
+
+            fprintf(stderr, "tq_load_gguf: Q4 conversion complete — fast matmul path active\n");
+        }
+    }
+
     #undef GGUF_KEY
     return model;
 }

@@ -1,147 +1,80 @@
 # TurboQuant.cpp — Session State
 
-**Last updated**: 2026-03-29 (v0.9.3 bugfixes: weights label, think filter, repetition penalty)
-**Last commit**: pending
-
-## Speed Progression
-```
-PyTorch CPU:        0.8 tok/s
-v0.8 FP32:          5   tok/s  (6x PyTorch)
-v0.8 Q8+threads:   21   tok/s  (26x)
-v0.9 Q4+threads:   38   tok/s  (48x)
-v0.9.1 optimized:  ??   tok/s  ← measure after this change
-llama.cpp Q4_K_M:  ~50   tok/s  ← target
-```
+**Last updated**: 2026-04-02
+**Score**: 98.1% (structure 90%, correctness 100%, quality 100%, perf 100%, integration 100%)
+**Tests**: 31/31 pass, 0 warnings, ASan clean
 
 ## What Works
-- All 20 tests pass, zero warnings
-- Q4 weights: 270 MB, Q8: 533 MB (vs 2.1 GB FP32)
-- Self-contained C inference engine, 0 dependencies
-- DeltaNet + Self-Attention hybrid forward pass
-- KV cache quantization (Q4, 7.5x compression)
-- Integer Q4×Q8 attention
 
-## v0.9.1 Changes — Non-matmul Overhead Optimization
+### Core Engine
+- 15,000+ lines C, self-built inference engine (not a fork/wrapper)
+- Gemma 3 (4B, 270M) + Qwen3.5 (0.8B) + Qwen3.5-35B-A3B MoE
+- TQM format (instant mmap loading) + GGUF v3 (Q8_0, Q4_K_M, IQ2_XXS)
+- DeltaNet hybrid + sliding window + GQA + MoE (256 experts, top-8, shared)
+- GGUF tokenizer loading from metadata
 
-### Strategy A: NEON-optimized DeltaNet inner loops
-- Fused decay + sk computation in a single NEON pass over state rows
-- NEON outer product (S += outer(K, d)) fused with output (o = S @ Q)
-- Eliminates 3 separate passes over dk×dv state matrix → 2 passes
-- NEON L2 normalize with vectorized sum-of-squares and scaling
-- NEON group norm (RMSNorm sum-of-squares)
-- NEON swish(z) gate with fast_expf
+### TurboQuant KV Compression (핵심 가치)
+- 12 KV quantization types (RHT + Lloyd-Max + QJL)
+- 1-bit K: byte-identical output on ALL verified models (270M~35B)
+- Gemma 4B PPL: +0.03% with 1-bit K + Q4 V (4.9x compression)
+- Q4 V fused attention (packed nibble direct accumulation)
+- Adaptive: per-layer bit recommendation, codebook calibration (49.7% MSE gain)
+- Formal: unbiasedness < 0.2% (100K samples), cosine = 2/pi (theoretical limit)
 
-### Strategy B: Batched conv1d + SiLU
-- Combined conv1d + SiLU into single `causal_conv1d_silu_batch()`
-- Specialized path for conv_width=4: unrolled dot product (no loop)
-- Processes 4 channels together with NEON SiLU
-- Eliminates per-channel function call overhead (6144 calls → 1536)
+### Verification
+- 31 test suites: PPL, unbiasedness, attention distribution, codebook theory, NEON consistency, edge cases, rate-distortion, cumulative error
+- ASan + UBSan clean
+- Activation profiling (--profile-kv), perplexity (--ppl), layer recommendation (--recommend)
 
-### Strategy C: Cached Q8 activation quantization
-- Added `tq_matmul_q4_preq()` — takes pre-quantized int8 activation
-- DeltaNet: quantize xb once, reuse for 4 Q4 matmuls (QKV, Z, A, B)
-  - Saves 3× tq_quantize_row_q8 + 3× malloc/free per DeltaNet layer
-  - 18 DeltaNet layers × 3 saved = 54 redundant quantizations eliminated
-- Self-attention: quantize xb once, reuse for Q, K, V projections
-  - Saves 2× quantization per self-attn layer
-  - 6 self-attn layers × 2 saved = 12 redundant quantizations eliminated
-- FFN: quantize xb once, reuse for gate + up projections
-  - Saves 1× quantization per layer (all 24 layers)
-  - 24 layers × 1 saved = 24 redundant quantizations eliminated
-- Total: ~90 redundant Q8 quantizations eliminated per token
+### GPU
+- Metal: matmul shaders (IQ2_XXS, Q8_0, Q4_K), runtime compile, batched dispatch
+- Metal functional but not faster than CPU yet (dispatch overhead)
 
-### Strategy D: Fast exp approximation
-- `fast_expf()` using Schraudolph's algorithm (~6x faster than expf)
-- Applied to: sigmoid in beta, softplus in gate, decay exp(gate), SiLU
-- Kept precise expf() only for model parameters (A_log) that need accuracy
-- Clamped to avoid overflow/underflow (|x| > 20 fallback)
+## Speed
 
-### Files Modified
-- `src/engine/tq_transformer.c` — All 4 strategies
-- `src/engine/tq_ops.c` — Added tq_matmul_q4_preq(), fixed unused var warning
-- `include/turboquant/tq_engine.h` — Added tq_matmul_q4_preq() declaration
+```
+Model                  Format       CPU (6T)    Metal
+Gemma 270M (TQM)      Q4           176 tok/s   -
+Qwen 0.8B (TQM)       Q4           80.1 tok/s  -
+Qwen 0.8B (GGUF)      Q8_0         7.4 tok/s   3.7 tok/s
+Qwen 0.8B (GGUF)      Q4_K_M       4.8 tok/s   3.1 tok/s
+Gemma 4B (TQM)        Q4           20.2 tok/s  -
+35B MoE (GGUF)        IQ2_XXS      ~1.0 tok/s  ~0.7 tok/s
+```
 
-## v0.9.2 Changes — TQM Format (Instant Model Loading)
+## What Needs Work (Priority Order)
 
-### Problem
-Loading safetensors BF16 models requires: mmap → parse JSON → BF16→FP32 convert → Q4 quantize.
-This takes ~6s for an 0.8B model. Goal: <0.5s via pre-quantized mmap-ready format.
+### P0: GPU Performance (biggest user-facing gap)
+- Metal per-matmul dispatch overhead → need full forward GPU graph
+- 35B: 1 tok/s CPU vs llama.cpp ~8-12 tok/s Metal — 10x gap
+- GGUF matmul on GPU needs architecture redesign (batch entire layers)
 
-### Solution: TQM (TurboQuant Model) binary format
-- 512-byte packed header (tqm_header_t) with full model config
-- Embedded tokenizer.json (raw bytes, variable size)
-- Pre-quantized Q4 weights + FP32 norms + BF16 embeddings
-- All sections 64-byte aligned for efficient mmap access
-- Zero-copy loading: weight pointers point directly into mmap'd file
+### P1: GGUF Speed Parity
+- GGUF path 10x slower than TQM path (7.4 vs 80.1 tok/s on 0.8B)
+- Root cause: on-the-fly dequant per matmul, no weight pre-processing
+- Solution: pre-dequant to Q8 at load time (like TQM Q4 path)
 
-### Components Implemented
-1. **Format definition** (`include/turboquant/tq_engine.h`)
-   - `tqm_header_t` — 512-byte packed struct with magic, config, section offsets
-   - `TQM_MAGIC` (0x4D515454 = "TTQM"), `TQM_VERSION` (1), `TQM_ALIGN` (64)
+### P2: Model Coverage
+- No Llama/Phi/Mistral support
+- No 8B model verified (gap between 4B and 35B)
+- Need Qwen3.5-7B or Llama-3.1-8B for mid-range PPL verification
 
-2. **TQM loader** (`src/engine/tq_model.c`)
-   - `tq_load_tqm()` — mmap file, cast header, set weight pointers directly
-   - Zero malloc for weights, zero conversion — all pointers into mmap'd data
-   - `tq_load_model()` auto-detects TQM vs safetensors by magic bytes
+### P3: GGUF Tokenizer for PPL
+- --ppl works on TQM (embedded tokenizer) but not GGUF
+- GGUF tokenizer loads for generation but not for PPL path
+- Need to wire GGUF tokenizer into PPL mode
 
-3. **TQM saver** (`src/engine/tq_model.c`)
-   - `tq_save_tqm()` — writes header + tokenizer + Q4 weights sequentially
-   - Handles BF16 embed passthrough and FP32→BF16 on-the-fly conversion
-   - Supports tied/untied output weights
+### P4: Metal Architecture Redesign
+- Current: individual matmul GPU dispatch
+- Need: compute graph (encode all layer ops, commit once per layer)
+- This is a major refactor but the only path to competitive GPU speed
 
-4. **Converter tool** (`tools/tq_convert.c`)
-   - CLI: `tq_convert model.safetensors tokenizer.json -o model.tqm`
-   - 3-step pipeline: load → quantize Q4 → write TQM
+### P5: Documentation Sync
+- state.md was stale (from v0.9.3, now updated)
+- docs/RELEASE_NOTES.md needs v0.4.0 entry for GGUF/MoE/Metal
+- WBS progress needs update (score.sh structure dimension)
 
-5. **Tokenizer from memory** (`src/engine/tq_tokenizer.c`)
-   - `tq_load_tokenizer_from_memory()` — parse JSON from buffer
-   - `tq_load_tokenizer_from_tqm()` — extract embedded tokenizer from .tqm file
-   - `tq_run` auto-loads embedded tokenizer when no -t flag given
-
-6. **Tests** (`tests/test_tqm.cpp`)
-   - Header size verification (512 bytes)
-   - Magic value verification
-   - Save/load roundtrip with synthetic model (norm + Q4 weight byte-exact match)
-   - Auto-detect format (tq_load_model dispatches correctly)
-   - Tokenizer from-memory loading
-   - All 20 tests pass (6 new TQM tests)
-
-### Files Modified/Created
-- `include/turboquant/tq_engine.h` — tqm_header_t, tq_load_tqm, tq_save_tqm, tq_load_tokenizer_from_memory/tqm
-- `src/engine/tq_model.c` — tq_load_tqm(), tq_save_tqm(), auto-detect in tq_load_model()
-- `src/engine/tq_tokenizer.c` — tq_load_tokenizer_from_memory(), tq_load_tokenizer_from_tqm()
-- `tools/tq_convert.c` — NEW converter tool
-- `tools/tq_run.c` — auto-load embedded tokenizer from TQM
-- `tests/test_tqm.cpp` — NEW test file (6 tests)
-- `CMakeLists.txt` — added tq_convert build target
-
-## v0.9.3 Changes — Inference Quality Fixes
-
-### Fix 1: TQM weights label shows "Q4" instead of "FP32"
-- `tools/tq_run.c`: Changed `wq_name` to check `model->use_q4_weights` / `model->use_q8_weights`
-  instead of the CLI `quant_mode` flag, so TQM-loaded models correctly report "Q4"
-- `tq_load_tqm()` already set `model->use_q4_weights = 1` (no change needed)
-
-### Fix 2: Filter `<think>` tags from output
-- `src/engine/tq_generate.c`: After `tq_decode()`, skip tokens containing `<think>` or `</think>`
-- Prevents Qwen3.5 thinking-mode artifacts from appearing in generated output
-
-### Fix 3: Repetition penalty to prevent degenerate loops
-- Added `rep_penalty` (float, default 1.1) and `rep_window` (int, default 32) to `tq_gen_config_t`
-- `include/turboquant/tq_engine.h`: New fields in gen config struct
-- `src/engine/tq_ops.c`: Default values in `tq_default_gen_config()`
-- `src/engine/tq_generate.c`: Circular buffer tracks recent tokens (up to 64);
-  before each `tq_sample_topp()` call, penalizes logits of recently generated tokens
-  (positive logits divided by penalty, negative logits multiplied)
-
-### Files Modified
-- `include/turboquant/tq_engine.h` — rep_penalty, rep_window fields in tq_gen_config_t
-- `src/engine/tq_generate.c` — think filter + repetition penalty logic
-- `src/engine/tq_ops.c` — default rep_penalty=1.1, rep_window=32
-- `tools/tq_run.c` — weights label based on model flags
-
-## What Needs Work
-1. Measure actual speed improvement (need model file for tq_run)
-2. Q4 quality on short prompts
-3. Metal GPU inference
-4. More model architectures
+### P6: IQ2_XXS Quality on 35B
+- Simple factual queries work ("Paris"), complex reasoning fails
+- This is IQ2 weight limitation, not TurboQuant issue
+- Need Q4_K or Q5_K 35B model (~15GB) to prove quality
