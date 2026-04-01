@@ -7,14 +7,15 @@
 [![ASan](https://img.shields.io/badge/ASan%2BUBSan-clean-brightgreen)]()
 
 ```
-Gemma 3 4B perplexity (101 tokens, teacher-forced):
-  FP16 KV:         PPL = 35.99
-  1-bit K + Q4 V:  PPL = 36.00  (+0.03%)   ← 4.9x compression, near-zero quality loss
+Qwen3.5-35B-A3B MoE (IQ2_XXS, GGUF):
+  baseline:        "The capital of France is Paris."     ✓
+  1-bit K:         "The capital of France is Paris."     ✓  ← same output at 1-bit
 
-32K context memory (Gemma 3 4B):
-  FP16 K+V:          4,352 MB
-  1-bit K + Q4 V:      885 MB   (4.9x, 3.4 GB saved)
-  1-bit K + Q2 V:      613 MB   (7.1x, 3.7 GB saved)
+Gemma 3 4B perplexity (101 tokens):
+  FP16 KV:         PPL = 35.99
+  1-bit K + Q4 V:  PPL = 36.00  (+0.03%)
+
+32K context (Gemma 3 4B):  FP16 4,352 MB → 1-bit K + Q4 V 885 MB (4.9x)
 ```
 
 ---
@@ -30,8 +31,8 @@ ctest --test-dir build   # 31/31 should pass
 ./build/tq_run model.tqm -p "Hello" -k turbo_kv_1b -v q4
 ```
 
-> This is a standalone inference engine built from scratch — not a llama.cpp fork or wrapper.
-> Models are loaded in TQM format (pre-quantized) or GGUF Q8_0 (experimental).
+> Standalone inference engine built from scratch — not a llama.cpp fork or wrapper.
+> Models: TQM format (pre-quantized) or GGUF (Q8_0, Q4_K_M, IQ2_XXS verified).
 
 ---
 
@@ -39,13 +40,14 @@ ctest --test-dir build   # 31/31 should pass
 
 | Model | Params | Format | Speed (6T) | KV Verified |
 |-------|--------|--------|------------|-------------|
+| **Qwen3.5-35B-A3B** | 35B (3B active) | GGUF IQ2_XXS | 0.4 tok/s | 1-bit K ✓ |
 | **Gemma 3 4B** | 4B | TQM | 20.2 tok/s | PPL +0.03%, all KV types ✓ |
-| **Qwen3.5-0.8B** | 752M | TQM | 80.1 tok/s | all KV types ✓ |
+| **Qwen3.5-0.8B** | 752M | TQM/GGUF | 80.1 tok/s | all KV types ✓ |
 | **Gemma 3 270M** | 270M | TQM | 176 tok/s | all KV types ✓ |
 
-Architectures: Gemma 3 (sliding window, GeGLU), Qwen3.5 (DeltaNet hybrid).
+Architectures: Gemma 3 (sliding window, GeGLU), Qwen3.5 (DeltaNet hybrid), Qwen2-MoE (top-K routing, shared expert).
 
-**Experimental:** GGUF Q8_0 loading verified for Qwen3.5-0.8B (3.7 tok/s). K-quant/IQ2 dequantization and MoE routing are implemented but not yet quality-verified.
+GGUF: Q8_0 and Q4_K_M verified. IQ2_XXS verified on 35B MoE. K-only 1-bit KV compression works across all formats.
 
 ---
 
@@ -150,7 +152,8 @@ The engine and KV compression are architecture-independent. Verified from 270M t
 - **Adaptive compression** — per-layer bit recommendation, online codebook calibration (49.7% MSE gain)
 - **NEON vectorized** — matmul, attention, RHT butterfly, Hamming distance, Q4 dequant
 - **31 test suites** — perplexity, unbiasedness, attention distribution, codebook theory, NEON consistency, edge cases, rate-distortion, cumulative error
-- **Experimental:** GGUF v3 loading (Q8_0 verified), MoE routing (quality WIP)
+- - **GGUF v3 loading** — Q8_0, Q4_K_M, IQ2_XXS verified; 35B MoE coherent output
+- **MoE routing** — top-K expert selection, shared expert, SwiGLU (verified on 35B)
 
 ---
 
