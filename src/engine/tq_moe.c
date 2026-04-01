@@ -3,7 +3,7 @@
  *
  * Implements top-K expert selection with softmax renormalization,
  * SwiGLU FFN dispatch per expert, shared expert support,
- * runtime LRU Q4 cache for routed experts, and memory advise hints.
+ * runtime LRU Q8_0 cache for routed experts, and memory advise hints.
  */
 
 #include "turboquant/tq_gguf.h"
@@ -88,27 +88,85 @@ static void swiglu_fused(float* restrict hb, const float* restrict hb2, int n) {
 #endif
 
 /* ============================================================
- * Runtime Expert Q4 LRU Cache
+ * Runtime Expert Q8_0 LRU Cache
  *
  * MoE models with 256 experts x 40 layers would need ~19 GB
- * if all experts were pre-converted to Q4. Instead, we cache
- * only the EXPERT_CACHE_SIZE most-recently-used experts per
- * layer. With 32 slots per layer, this is ~1.9 GB total.
+ * if all experts were pre-converted. Instead, we cache only the
+ * EXPERT_CACHE_SIZE most-recently-used experts per layer in Q8_0
+ * block format (34 bytes per 32 elements = ~1.06 bytes/elem).
  *
- * Cache hits use fast Q4 matmul; misses dequant from GGUF
- * mmap on the fly, then cache the result for next time.
+ * Q8_0 fused dot is ~3-5x faster than IQ2_XXS fused dot because
+ * it avoids E8 lattice codebook lookups — just int8*float FMA.
+ * On cache miss, we dequant IQ2_XXS → FP32 → Q8_0 blocks once.
+ * On cache hit, tq_matmul_gguf dispatches to fused_dot_q8_0.
+ *
+ * Memory: 34 bytes/32 elems ≈ 1.0625 B/elem. For expert with
+ * 3M params (gate+up+down), that's ~3.2 MB per cached expert.
+ * 32 slots/layer × 3.2 MB ≈ 102 MB/layer. For 30 layers: ~3 GB.
  * ============================================================ */
 
 #define EXPERT_CACHE_SIZE 32  /* per layer */
 
+/* FP32 → FP16 conversion for Q8_0 block scale fields */
+static inline uint16_t fp32_to_fp16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t  exp  = ((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3FF;
+
+    if (exp <= 0) {
+        /* Underflow to zero */
+        return (uint16_t)sign;
+    } else if (exp >= 31) {
+        /* Overflow to infinity */
+        return (uint16_t)(sign | 0x7C00);
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+/* Quantize FP32 array to Q8_0 block format in-place.
+ * Q8_0 block: 2-byte fp16 scale + 32 int8 values = 34 bytes per 32 elements.
+ * dst must have room for (n/32) * 34 bytes. n must be a multiple of 32. */
+static void quantize_fp32_to_q8_0(const float* src, void* dst, int n) {
+    const int nb = n / 32;
+    uint8_t* out = (uint8_t*)dst;
+
+    for (int b = 0; b < nb; b++) {
+        const float* block = src + b * 32;
+
+        /* Find max absolute value */
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float a = block[j] < 0 ? -block[j] : block[j];
+            if (a > amax) amax = a;
+        }
+
+        /* Scale: map [-amax, amax] to [-127, 127] */
+        float d = amax / 127.0f;
+        float id = (d > 0.0f) ? 127.0f / amax : 0.0f;
+
+        /* Write fp16 scale */
+        uint16_t d_fp16 = fp32_to_fp16(d);
+        memcpy(out + b * 34, &d_fp16, 2);
+
+        /* Write quantized int8 values */
+        int8_t* qs = (int8_t*)(out + b * 34 + 2);
+        for (int j = 0; j < 32; j++) {
+            float v = block[j] * id;
+            int32_t vi = (int32_t)(v + (v >= 0 ? 0.5f : -0.5f));
+            if (vi > 127) vi = 127;
+            if (vi < -127) vi = -127;
+            qs[j] = (int8_t)vi;
+        }
+    }
+}
+
 typedef struct {
     int      expert_id;       /* -1 = empty slot */
-    uint8_t* gate_q4_qs;
-    float*   gate_q4_scales;
-    uint8_t* up_q4_qs;
-    float*   up_q4_scales;
-    uint8_t* down_q4_qs;
-    float*   down_q4_scales;
+    void*    gate_q8;         /* Q8_0 block data for gate [inter*dim elems] */
+    void*    up_q8;           /* Q8_0 block data for up [inter*dim elems] */
+    void*    down_q8;         /* Q8_0 block data for down [dim*inter elems] */
     int      last_used;       /* token counter for LRU eviction */
 } expert_cache_entry_t;
 
@@ -154,21 +212,20 @@ void tq_moe_cache_init(int n_layers, const tq_moe_config_t* config, int hidden_d
     size_t max_elems     = gate_up_elems > down_elems ? gate_up_elems : down_elems;
     g_cache_fp32_temp = (float*)malloc(max_elems * sizeof(float));
 
+    /* Q8_0: 34 bytes per 32 elements = 1.0625 bytes/elem
+     * Per expert: 3 matrices × (inter*dim) elems × 1.0625 ≈ 3.2 MB (for 1024×512) */
     float cache_mb = (float)(n_layers * EXPERT_CACHE_SIZE) *
-                     (3.0f * (float)(gate_up_elems + 31) / 32.0f * 20.0f) /
+                     (3.0f * (float)gate_up_elems * 34.0f / 32.0f) /
                      (1024.0f * 1024.0f);
-    fprintf(stderr, "tq_moe_cache_init: LRU cache for %d layers x %d slots "
+    fprintf(stderr, "tq_moe_cache_init: Q8 LRU cache for %d layers x %d slots "
             "(max %.0f MB)\n", n_layers, EXPERT_CACHE_SIZE, (double)cache_mb);
 }
 
 static void free_cache_entry(expert_cache_entry_t* e)
 {
-    free(e->gate_q4_qs);     e->gate_q4_qs = NULL;
-    free(e->gate_q4_scales); e->gate_q4_scales = NULL;
-    free(e->up_q4_qs);       e->up_q4_qs = NULL;
-    free(e->up_q4_scales);   e->up_q4_scales = NULL;
-    free(e->down_q4_qs);     e->down_q4_qs = NULL;
-    free(e->down_q4_scales); e->down_q4_scales = NULL;
+    free(e->gate_q8);  e->gate_q8 = NULL;
+    free(e->up_q8);    e->up_q8 = NULL;
+    free(e->down_q8);  e->down_q8 = NULL;
     e->expert_id = -1;
 }
 
@@ -187,14 +244,19 @@ void tq_moe_cache_free(void)
     g_cache_n_layers = 0;
 }
 
+/* Q8_0 block byte size for n elements (n must be multiple of 32) */
+static inline size_t q8_0_bytes(int n) {
+    return (size_t)(n / 32) * 34;
+}
+
 /* Find a cached entry for expert_id in layer, or evict LRU and create one.
- * Returns the entry with Q4 data populated. */
+ * Returns the entry with Q8_0 data populated, or NULL on allocation failure. */
 static expert_cache_entry_t* cache_get_or_create(
     int layer_idx, int expert_id, const tq_expert_weights_t* exp)
 {
     expert_layer_cache_t* lc = &g_expert_cache[layer_idx];
 
-    /* Search for existing entry */
+    /* Search for existing entry (cache hit) */
     for (int s = 0; s < EXPERT_CACHE_SIZE; s++) {
         if (lc->entries[s].expert_id == expert_id) {
             lc->entries[s].last_used = g_token_counter;
@@ -232,40 +294,34 @@ static expert_cache_entry_t* cache_get_or_create(
     int dim = g_cache_hidden_dim;
     int inter = g_cache_exp_inter;
 
-    /* Convert gate: [inter, dim] */
+    /* Convert gate: [inter, dim] — dequant IQ2_XXS → FP32 → Q8_0 blocks */
     {
         int n = inter * dim;
-        int n_blocks = (n + 31) / 32;
-        tq_dequant_row_gguf(exp->gate_type, exp->w_gate, g_cache_fp32_temp, n);
-        ce->gate_q4_qs = (uint8_t*)malloc((size_t)n_blocks * 16);
-        ce->gate_q4_scales = (float*)malloc((size_t)n_blocks * sizeof(float));
-        if (ce->gate_q4_qs && ce->gate_q4_scales)
-            tq_quantize_row_q4(g_cache_fp32_temp, ce->gate_q4_qs,
-                               ce->gate_q4_scales, n);
+        ce->gate_q8 = malloc(q8_0_bytes(n));
+        if (ce->gate_q8) {
+            tq_dequant_row_gguf(exp->gate_type, exp->w_gate, g_cache_fp32_temp, n);
+            quantize_fp32_to_q8_0(g_cache_fp32_temp, ce->gate_q8, n);
+        }
     }
 
     /* Convert up: [inter, dim] */
     {
         int n = inter * dim;
-        int n_blocks = (n + 31) / 32;
-        tq_dequant_row_gguf(exp->up_type, exp->w_up, g_cache_fp32_temp, n);
-        ce->up_q4_qs = (uint8_t*)malloc((size_t)n_blocks * 16);
-        ce->up_q4_scales = (float*)malloc((size_t)n_blocks * sizeof(float));
-        if (ce->up_q4_qs && ce->up_q4_scales)
-            tq_quantize_row_q4(g_cache_fp32_temp, ce->up_q4_qs,
-                               ce->up_q4_scales, n);
+        ce->up_q8 = malloc(q8_0_bytes(n));
+        if (ce->up_q8) {
+            tq_dequant_row_gguf(exp->up_type, exp->w_up, g_cache_fp32_temp, n);
+            quantize_fp32_to_q8_0(g_cache_fp32_temp, ce->up_q8, n);
+        }
     }
 
     /* Convert down: [dim, inter] */
     {
         int n = dim * inter;
-        int n_blocks = (n + 31) / 32;
-        tq_dequant_row_gguf(exp->down_type, exp->w_down, g_cache_fp32_temp, n);
-        ce->down_q4_qs = (uint8_t*)malloc((size_t)n_blocks * 16);
-        ce->down_q4_scales = (float*)malloc((size_t)n_blocks * sizeof(float));
-        if (ce->down_q4_qs && ce->down_q4_scales)
-            tq_quantize_row_q4(g_cache_fp32_temp, ce->down_q4_qs,
-                               ce->down_q4_scales, n);
+        ce->down_q8 = malloc(q8_0_bytes(n));
+        if (ce->down_q8) {
+            tq_dequant_row_gguf(exp->down_type, exp->w_down, g_cache_fp32_temp, n);
+            quantize_fp32_to_q8_0(g_cache_fp32_temp, ce->down_q8, n);
+        }
     }
 
     return ce;
@@ -427,26 +483,27 @@ void tq_moe_forward(const tq_moe_layer_t* layer,
         if (eid < 0 || eid >= config->num_experts) continue; /* safety check */
         const tq_expert_weights_t* exp = &layer->experts[eid];
 
-        /* LRU cache disabled — cache miss dequant+Q4 overhead dominates.
-         * Direct fused GGUF dot product is faster than cache miss penalty. */
+        /* Q8 LRU cache DISABLED: cache miss conversion cost (IQ2→FP32→Q8)
+         * exceeds fused IQ2 dot cost. Direct fused_dot_iq2_xxs_neon is faster
+         * than any cache scheme when expert reuse rate is low. */
         if (0 && g_expert_cache && layer_idx >= 0 && layer_idx < g_cache_n_layers
-            && exp->w_gate) {
+            && exp->w_gate && !exp->q4_converted) {
             expert_cache_entry_t* ce = cache_get_or_create(layer_idx, eid, exp);
-            if (ce->gate_q4_qs && ce->up_q4_qs && ce->down_q4_qs) {
-                /* Fast Q4 matmul path from LRU cache */
-                tq_matmul_q4(state->expert_hb, input,
-                             ce->gate_q4_qs, ce->gate_q4_scales,
-                             expert_dim, hidden_dim);
-                tq_matmul_q4(state->expert_hb2, input,
-                             ce->up_q4_qs, ce->up_q4_scales,
-                             expert_dim, hidden_dim);
+            if (ce && ce->gate_q8 && ce->up_q8 && ce->down_q8) {
+                /* Fast Q8_0 matmul path — dispatches to fused_dot_q8_0 (NEON) */
+                tq_matmul_gguf(state->expert_hb, input,
+                               ce->gate_q8, TQ_GGML_TYPE_Q8_0,
+                               expert_dim, hidden_dim);
+                tq_matmul_gguf(state->expert_hb2, input,
+                               ce->up_q8, TQ_GGML_TYPE_Q8_0,
+                               expert_dim, hidden_dim);
 
                 /* SwiGLU activation: hb = silu(gate) * up */
                 swiglu_fused(state->expert_hb, state->expert_hb2, expert_dim);
 
-                tq_matmul_q4(state->expert_out, state->expert_hb,
-                             ce->down_q4_qs, ce->down_q4_scales,
-                             hidden_dim, expert_dim);
+                tq_matmul_gguf(state->expert_out, state->expert_hb,
+                               ce->down_q8, TQ_GGML_TYPE_Q8_0,
+                               hidden_dim, expert_dim);
 
                 /* Weighted accumulation: output += weight * down_proj */
                 for (int i = 0; i < hidden_dim; i++)
