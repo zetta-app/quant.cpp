@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![Release](https://img.shields.io/github/v/release/quantumaikr/TurboQuant.cpp)]()
-[![Tests](https://img.shields.io/badge/tests-26%20suites-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-30%20suites-brightgreen)]()
 
 ### Up to 7.1x total K+V compression. Quality preserved.
 
@@ -121,21 +121,51 @@ Multi-architecture: Qwen3.5 (DeltaNet hybrid) + Gemma 3 (sliding window). Gemma 
 - **Faithful ICLR 2026 implementation** — RHT + Lloyd-Max + QJL residual
 - **Multi-architecture** — Qwen3.5 (DeltaNet) + Gemma 3 (sliding window + GeGLU)
 - **NEON vectorized** — matmul, attention, RHT butterfly, Hamming distance, Q4 dequant, FP16 conversion
-- **26 test suites** — KV roundtrip, attention distribution, codebook theory, NEON/scalar consistency, edge cases, Q2 weights
+- **Fused Q4 attention** — weighted sum directly from packed nibbles, no dequant buffer
+- **Adaptive compression** — per-layer bit recommendation, codebook calibration, attention entropy
+- **30 test suites** — KV roundtrip, attention distribution, codebook theory, NEON consistency, edge cases, unbiasedness, rate-distortion, cumulative error
 
 ### Verification Summary
 
 | Category | Tests | What's Verified |
 |----------|-------|-----------------|
+| Perplexity | `--ppl` | Gemma 4B: 1b K + Q4 V = PPL 36.00 (+0.03% vs FP16) |
+| Unbiasedness | 100K pairs | All types: relative bias < 0.2% |
 | NEON/scalar consistency | 14 | Every NEON path matches scalar reference (Q4, Q2, RHT, RoPE, matmul, RMSNorm, Hamming) |
 | Attention distribution | 8 | Cosine similarity, Spearman rank, top-k overlap vs FP32 reference |
 | Codebook theory | 5 | Lloyd-Max centroids match literature, MSE within 1.18x of info-theoretic optimal |
 | Edge cases | 29 | n=1, dim=0, NaN, Inf, all-same, all-zero, n=10000 |
-| ASan + UBSan | 26 | Full suite under sanitizers, zero memory errors |
+| Rate-distortion | 5 | Info-theoretic lower bound gap: Q4 2.41x, Lloyd-Max < 0.15 bits wasted |
+| Cumulative error | 3 | 16-layer cosine: 0.998 (Q4), errors grow sub-linearly |
+| ASan + UBSan | 30 | Full suite under sanitizers, zero memory errors |
 | Thread safety | mutex | Global workspace realloc protected against concurrent access |
 | Numerical stability | 4 | Overflow-safe norm (max-abs rescaling), NaN/Inf input guards |
 
 Full details: [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md)
+
+---
+
+## Analysis Tools
+
+```bash
+# Perplexity measurement
+./build/tq_run model.tqm --ppl input.txt -k turbo_kv_1b -v q4
+
+# Per-layer bit allocation recommendation
+./build/tq_run model.tqm --recommend -k turbo_kv_1b -p "calibration text"
+
+# Online codebook calibration (measures MSE improvement)
+./build/tq_run model.tqm --calibrate -k turbo_kv_1b -p "calibration text"
+
+# Activation distribution profiling (pre/post-RHT)
+./build/tq_run model.tqm --profile-kv -k turbo_kv_1b -p "text"
+
+# Attention entropy analysis
+./build/tq_run model.tqm --attn-entropy -k turbo_kv_1b -p "text"
+
+# Full auto-profile pipeline
+bash bench/auto_profile.sh model.tqm
+```
 
 ---
 

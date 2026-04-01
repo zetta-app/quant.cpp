@@ -6,6 +6,52 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.0] — 2026-04-01
+
+### Highlights
+
+**Real-model validation**, **adaptive compression**, and **information-theoretic foundations**. Every theoretical claim is now backed by measured data from actual model inference.
+
+### Added
+
+#### Real-Model Validation (Phase A)
+- **Perplexity pipeline** (`--ppl <file>`): Teacher-forced PPL measurement. Gemma 4B results: 1-bit K + Q4 V PPL = 36.00 vs FP16 PPL = 35.99 — **+0.03% degradation** (effectively lossless).
+- **Formal unbiasedness** (`tests/test_unbiased.cpp`): 100K random vector pairs prove all TurboQuant types have < 0.2% relative bias. The "unbiased inner product" claim is empirically verified.
+- **Activation profiling** (`--profile-kv`): Per-layer pre/post-RHT distribution statistics. RHT reduces kurtosis from 10-99 to 3.9-7.9 and eliminates skewness. Honest finding: post-RHT is not perfectly Gaussian.
+- **Memory bandwidth benchmark** (`--bench-memory`): tok/s vs context length across KV types.
+
+#### Adaptive Compression (Phase B)
+- **Per-layer bit recommendation** (`--recommend`): Profiles activation kurtosis, recommends 1-bit or 3-bit per layer. Gemma 270M: average 2.0 bits (vs 3.0 uniform) → 33% memory savings potential.
+- **Attention entropy analysis** (`--attn-entropy`): Per-head Shannon entropy identifies sharp vs diffuse attention patterns.
+- **V highres window** (`-V N`): Recent N tokens stored as FP16 alongside Q4/Q2 V. Test showed Q4 V already near-lossless (PPL +0.03%), so hybrid adds no measurable benefit.
+- **Online codebook calibration** (`--calibrate`): Lloyd-Max iteration on real activation data. **MSE improved 49.7%** over default N(0,1) codebook — proves model-specific calibration matters.
+
+#### Engine (Phase C)
+- **Fused Q4 domain attention**: Weighted sum computed directly from packed nibbles without dequantize buffer. NEON `vfmaq_f32` path. Reduces memory traffic.
+- **Prefill benchmark** (`--bench-prefill`): Measures KV quantization overhead during prompt processing.
+- **CoW benchmark** (`bench/cow_bench.sh`): Analytical memory savings for shared-prefix serving.
+- **Auto compression profile** (`bench/auto_profile.sh`): Full pipeline: profile → recommend → calibrate → JSON output.
+
+#### Theory (Phase D)
+- **Rate-distortion bounds** (`tests/test_rate_distortion.cpp`): Computes info-theoretic minimum MSE at each bit-width. Q4 uniform: 2.41x gap. Lloyd-Max: < 0.15 bits wasted.
+- **Cumulative error analysis** (`tests/test_cumulative_error.cpp`): 16-layer simulation shows errors grow sub-linearly. Cosine similarity after 16 layers: 0.998 (Q4), 0.951 (Q2).
+
+### Measured Results
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| Gemma 4B PPL (uniform_4b) | 35.99 | `--ppl` |
+| Gemma 4B PPL (1b K + Q4 V) | 36.00 (+0.03%) | `--ppl` |
+| Gemma 4B PPL (1b K + Q2 V) | 42.23 (+17.3%) | `--ppl` |
+| Unbiasedness (all types) | < 0.2% rel_bias | `test_unbiased` |
+| Post-RHT kurtosis range | 3.9 – 7.9 | `--profile-kv` |
+| Adaptive bit average | 2.0 bits (33% saving) | `--recommend` |
+| Calibrated codebook MSE improvement | 49.7% | `--calibrate` |
+| 16-layer cumulative cosine (Q4) | 0.998 | `test_cumulative_error` |
+| Rate-distortion gap (Q4 uniform) | 2.41x | `test_rate_distortion` |
+
+---
+
 ## [v0.2.0] — 2026-04-01
 
 ### Highlights
