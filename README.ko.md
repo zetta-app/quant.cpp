@@ -120,8 +120,22 @@ Value (가중합 — MSE 최적 복원 필요):
 - **K+V 독립 압축** — 1-bit key (XOR+popcount) + Q4/Q2 value
 - **ICLR 2026 논문 충실 구현** — RHT + Lloyd-Max + QJL 잔차
 - **멀티 아키텍처** — Qwen3.5 (DeltaNet) + Gemma 3 (슬라이딩 윈도우 + GeGLU)
-- **NEON 벡터화** — matmul, attention, Hamming distance, FP16 변환
-- **26개 테스트 스위트** — KV 라운드트립, attention 정확도, 코드북, Q2 가중치, NEON 일치성, attention 분포
+- **NEON 벡터화** — matmul, attention, RHT butterfly, Hamming distance, Q4 dequant, FP16 변환
+- **26개 테스트 스위트** — KV 라운드트립, attention 분포, 코드북 이론, NEON/스칼라 일치성, 엣지케이스, Q2 가중치
+
+### 검증 요약
+
+| 범주 | 테스트 | 검증 내용 |
+|------|--------|----------|
+| NEON/스칼라 일치성 | 14개 | 모든 NEON 경로가 스칼라 참조와 일치 (Q4, Q2, RHT, RoPE, matmul, RMSNorm, Hamming) |
+| Attention 분포 | 8개 | 코사인 유사도, Spearman 순위, top-k 겹침 vs FP32 참조 |
+| 코드북 이론 | 5개 | Lloyd-Max centroid 문헌 일치, MSE가 정보이론 최적의 1.18배 이내 |
+| 엣지케이스 | 29개 | n=1, dim=0, NaN, Inf, 동일값, 영벡터, n=10000 |
+| ASan + UBSan | 26개 | 전체 스위트 sanitizer 통과, 메모리 오류 없음 |
+| 스레드 안전성 | mutex | 글로벌 워크스페이스 realloc 동시 접근 보호 |
+| 수치 안정성 | 4개 | overflow 안전 norm (max-abs rescaling), NaN/Inf 입력 가드 |
+
+상세: [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md)
 
 ---
 

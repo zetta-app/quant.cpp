@@ -1,0 +1,157 @@
+# Release Notes
+
+All notable changes to TurboQuant.cpp are documented here.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [v0.2.0] — 2026-04-01
+
+### Highlights
+
+**V cache quantization** and **expert-grade validation** — total K+V compression reaches 4.9x (Q4) to 7.1x (Q2), with every claim backed by measured data.
+
+### Added
+
+#### V Cache Quantization
+- **Q4 value quantization** (`-v q4`): 4-bit per-block scale + packed nibbles. V compression 3.8x.
+- **Q2 value quantization** (`-v q2`): 2-bit Lloyd-Max codebook. V compression 7.6x.
+- **FP16 value auto-enable**: Values stored as FP16 when KV quantization is active (was FP32).
+- Combined 1-bit K + Q4 V: **27.62 KB/token, 4.9x total K+V** (was 136 KB FP16).
+- Combined 1-bit K + Q2 V: **19.12 KB/token, 7.1x total K+V**.
+- CLI flag `-v q4|q2|fp16` for value quantization control.
+- Memory reporting (`-M`) shows K and V breakdown separately.
+
+#### Validation Suite
+- **NEON/scalar consistency** (`tests/test_neon_scalar.cpp`): 14 tests verify every NEON path against pure C reference — Q4 dequant, Q2 dequant, RHT butterfly, RoPE, matmul, RMSNorm, Hamming attention.
+- **Attention distribution** (`tests/test_attention_distribution.cpp`): 8 tests measure cosine similarity (0.996/0.918/0.634), Spearman rank correlation, top-k overlap. Proves compression is non-trivial (random K = 0.089).
+- **Codebook theory** (`tests/test_codebook_theory.cpp`): 5 tests verify Lloyd-Max centroids match N(0,1) literature values within 0.001, MSE within 1.18x of information-theoretic optimal.
+- **Edge cases** (`tests/test_edge_cases.cpp`): 29 tests — n=1 (single token), dim=0, NaN input, Inf input, all-same values, all-zero, n=10000 large sequence.
+- **Numerical stability**: 4 tests for overflow-safe norm computation and NaN/Inf input guards.
+
+#### Benchmark Scripts
+- `bench/ablation_test.sh`: Divergence analysis at 50-300 tokens across KV types.
+- `bench/long_quality_test.sh`: Coherence at 200/500/1000 tokens.
+- `bench/sampling_test.sh`: Temperature sampling (T=0.3, T=0.7) comparison.
+- `bench/quant_time_bench.sh`: Quantization timing wrapper.
+- `bench/bench_kv_overhead.cpp`: Microbenchmark — uniform 148 ns, 1b 659 ns, 3b 11066 ns per vector.
+- `bench/attention_dist_test.sh`: Attention distribution analysis wrapper.
+- `scripts/sanitize.sh`: ASan + UBSan build and full test run.
+
+### Fixed
+
+- **Q4 dequant NEON nibble interleaving bug**: Lo/hi nibbles were written contiguously instead of interleaved, causing MSE 0.525 (300x worse than correct). Fixed with `vzip_u8` interleave.
+- **QJL sign bias**: `proj >= 0.0f` → `proj > 0.0f` across 11 occurrences (CPU, CUDA, Metal). Eliminates asymmetric bias at zero projection boundary.
+- **Norm overflow**: QJL norm computation now uses max-abs rescaling to prevent float overflow on large vectors.
+- **NaN/Inf input guard**: Quantization functions zero-fill output block on NaN/Inf input instead of producing undefined output.
+
+### Changed
+
+- **Thread safety**: Global Q8 workspace (`g_q8_buf`) and sampler probability index (`g_probindex`) protected by mutex against concurrent realloc races.
+- **RHT NEON vectorized**: Walsh-Hadamard butterfly uses `float32x4_t` for stages with len >= 4.
+- **Q4 dequant NEON restored**: Properly vectorized with `vzip_u8` after bug fix (was scalar fallback).
+- Test suite count: 23 → 26. Edge case count: 16 → 29.
+
+### Measured Results
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| Total K+V compression (1b K + Q4 V) | 4.9x | `tq_run -M` |
+| Total K+V compression (1b K + Q2 V) | 7.1x | `tq_run -M` |
+| 32K context savings (Q4 V) | 3.4 GB | calculated |
+| Attention cosine (uniform_4b) | 0.996 | `test_attention_distribution` |
+| Attention cosine (turbo_kv_3b) | 0.918 | `test_attention_distribution` |
+| Attention cosine (turbo_kv_1b) | 0.634 (= 2/pi) | `test_attention_distribution` |
+| Random K cosine | 0.089 | `test_attention_distribution` |
+| Lloyd-Max MSE vs theory | < 1.18x | `test_codebook_theory` |
+| RHT overhead | 147 ns/vec | `bench_kv_overhead` |
+| 1-bit attention | 1.2 ns/key | `bench_kv_overhead` |
+| ASan + UBSan | 26/26 clean | `scripts/sanitize.sh` |
+
+---
+
+## [v0.1.0] — 2026-03-31
+
+### Highlights
+
+**Initial release** — pure C inference engine with TurboQuant KV cache compression. 1-bit keys, 10.7x key compression, byte-identical greedy output at 100 tokens.
+
+### Added
+
+#### Core Engine
+- Complete transformer inference engine in pure C11 (10,000+ lines).
+- Multi-architecture support: Gemma 3 (sliding window, GeGLU, dual RoPE) + Qwen3.5 (DeltaNet hybrid).
+- Multi-shard safetensors loading (Gemma 4B = 2 shards, 883 tensors).
+- Dual tokenizer: GPT2 byte-level BPE + SentencePiece auto-detect.
+- TQM binary format: pre-quantized mmap, instant loading.
+
+#### KV Cache Quantization (11 types)
+- **TurboQuant KV 1-bit**: Sign-only after RHT. XOR + popcount attention (NEON `vcntq_u8`).
+- **TurboQuant KV 3-bit**: 2-bit Lloyd-Max codebook + 1-bit QJL residual.
+- **TurboQuant KV 4-bit**: 3-bit codebook + 1-bit QJL.
+- **Uniform 4-bit / 2-bit**: Standard min-max quantization.
+- **PolarQuant**: Polar coordinate (theta + radius) quantization.
+- **QJL**: Quantized Johnson-Lindenstrauss sign hash.
+- **Mixed / TurboQuant base**: Combined polar + QJL.
+
+#### Weight Quantization
+- Q4 weight quantization (4-bit per-block).
+- Q2 weight quantization (2-bit Lloyd-Max codebook, Q2xQ8 integer matmul).
+- BF16 weight support.
+
+#### Performance
+- NEON vectorized: 2-row matmul batching, fused dot products, Hamming distance.
+- Thread pool with configurable thread count.
+- Apple Silicon optimized.
+
+#### Quality Verification
+- 30/30 byte-identical greedy matches (K-only, 100 tokens, 10 diverse prompts).
+- 23 test suites (Google Test).
+- Qwen3.5: 0.999 cosine similarity vs PyTorch reference.
+- Gemma 270M: per-layer exact match.
+
+### Models Verified
+
+| Model | Params | Speed (Q4, 6T) |
+|-------|--------|----------------|
+| Gemma 3 4B | 4B | 20.2 tok/s |
+| Qwen3.5-0.8B | 752M | 80.1 tok/s |
+| Gemma 3 270M | 270M | 176 tok/s |
+
+---
+
+## Release Process
+
+### Version Scheme
+
+```
+v{MAJOR}.{MINOR}.{PATCH}
+
+MAJOR: Breaking API changes
+MINOR: New features, backward-compatible
+PATCH: Bug fixes, performance improvements
+```
+
+### Checklist for New Releases
+
+1. Update version in `CMakeLists.txt` (`project(turboquant VERSION x.y.z)`)
+2. Add release section to this file (newest first)
+3. Update badge version in `README.md` and `README.ko.md`
+4. Run full validation:
+   ```bash
+   cmake --build build -j$(nproc) && ctest --test-dir build
+   bash scripts/sanitize.sh
+   ./build/tq_run gemma3-4b.tqm -p "The capital of France is" -j 6 -n 20 -T 0.0 -k turbo_kv_1b -v q4
+   ```
+5. Tag: `git tag -a v0.x.0 -m "Release v0.x.0"`
+6. Push: `git push origin v0.x.0`
+7. Create GitHub release with this section's content
+
+### What Goes in Release Notes
+
+- **Added**: New features, new tests, new benchmarks
+- **Fixed**: Bug fixes (with root cause and impact)
+- **Changed**: Behavior changes, performance improvements
+- **Measured Results**: Table of key metrics with source (test name or script)
+- **Breaking**: API changes that require user code modification

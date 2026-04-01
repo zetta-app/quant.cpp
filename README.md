@@ -120,8 +120,22 @@ Multi-architecture: Qwen3.5 (DeltaNet hybrid) + Gemma 3 (sliding window). Gemma 
 - **K+V independent compression** — 1-bit keys (XOR+popcount) + Q4/Q2 values
 - **Faithful ICLR 2026 implementation** — RHT + Lloyd-Max + QJL residual
 - **Multi-architecture** — Qwen3.5 (DeltaNet) + Gemma 3 (sliding window + GeGLU)
-- **NEON vectorized** — matmul, attention, Hamming distance, FP16 conversion
-- **26 test suites** — KV roundtrip, attention accuracy, codebook, Q2 weights, NEON consistency, attention distribution
+- **NEON vectorized** — matmul, attention, RHT butterfly, Hamming distance, Q4 dequant, FP16 conversion
+- **26 test suites** — KV roundtrip, attention distribution, codebook theory, NEON/scalar consistency, edge cases, Q2 weights
+
+### Verification Summary
+
+| Category | Tests | What's Verified |
+|----------|-------|-----------------|
+| NEON/scalar consistency | 14 | Every NEON path matches scalar reference (Q4, Q2, RHT, RoPE, matmul, RMSNorm, Hamming) |
+| Attention distribution | 8 | Cosine similarity, Spearman rank, top-k overlap vs FP32 reference |
+| Codebook theory | 5 | Lloyd-Max centroids match literature, MSE within 1.18x of info-theoretic optimal |
+| Edge cases | 29 | n=1, dim=0, NaN, Inf, all-same, all-zero, n=10000 |
+| ASan + UBSan | 26 | Full suite under sanitizers, zero memory errors |
+| Thread safety | mutex | Global workspace realloc protected against concurrent access |
+| Numerical stability | 4 | Overflow-safe norm (max-abs rescaling), NaN/Inf input guards |
+
+Full details: [docs/RELEASE_NOTES.md](docs/RELEASE_NOTES.md)
 
 ---
 
