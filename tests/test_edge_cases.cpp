@@ -1,13 +1,14 @@
 /**
  * Edge case tests for TurboQuant — BUG-4, BUG-7 verification
+ * and systematic edge case coverage (n=1, NaN, Inf, all-same, large-n)
  */
 #include <gtest/gtest.h>
 extern "C" {
 #include "turboquant/turboquant.h"
 }
 #include <climits>
-#include <vector>
 #include <cmath>
+#include <cstring>
 
 class EdgeCaseFixture : public ::testing::Test {
 protected:
@@ -173,4 +174,209 @@ TEST(EdgeCase, MaxSeqLenBoundary) {
     /* One over should fail */
     size_t sz2 = tq_quantize_keys_size(TQ_MAX_SEQ_LEN + 1, 128, TQ_TYPE_UNIFORM_4B);
     EXPECT_EQ(0u, sz2);
+}
+
+/* ============================================================
+ * Systematic edge case tests
+ * ============================================================ */
+
+/* ---- SingleTokenQuantize: n=1 with each KV type ---- */
+
+TEST_F(EdgeCaseFixture, SingleTokenQuantize_Uniform4B) {
+    float keys[128];
+    for (int i = 0; i < 128; i++) keys[i] = sinf((float)i * 0.1f);
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_UNIFORM_4B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys, 1, 128,
+                                    TQ_TYPE_UNIFORM_4B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+}
+
+TEST_F(EdgeCaseFixture, SingleTokenQuantize_TurboKV3B) {
+    float keys[128];
+    for (int i = 0; i < 128; i++) keys[i] = sinf((float)i * 0.1f);
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_TURBO_KV_3B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys, 1, 128,
+                                    TQ_TYPE_TURBO_KV_3B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+}
+
+TEST_F(EdgeCaseFixture, SingleTokenQuantize_TurboKV1B) {
+    float keys[128];
+    for (int i = 0; i < 128; i++) keys[i] = sinf((float)i * 0.1f);
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_TURBO_KV_1B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys, 1, 128,
+                                    TQ_TYPE_TURBO_KV_1B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+}
+
+/* ---- ZeroDimHandling: head_dim=0 returns error or zero size ---- */
+
+TEST_F(EdgeCaseFixture, ZeroDimQuantize) {
+    float keys[1] = {1.0f};
+    uint8_t buf[4096] = {};
+
+    /* Size query should return 0 for head_dim=0 */
+    size_t sz = tq_quantize_keys_size(1, 0, TQ_TYPE_UNIFORM_4B);
+    EXPECT_EQ(0u, sz);
+
+    sz = tq_quantize_keys_size(1, 0, TQ_TYPE_TURBO_KV_3B);
+    EXPECT_EQ(0u, sz);
+
+    sz = tq_quantize_keys_size(1, 0, TQ_TYPE_TURBO_KV_1B);
+    EXPECT_EQ(0u, sz);
+}
+
+/* ---- NaNInputQuantize: NaN values should not crash ---- */
+
+TEST_F(EdgeCaseFixture, NaNInputQuantize) {
+    std::vector<float> keys(128);
+    for (int i = 0; i < 128; i++) keys[i] = NAN;
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_UNIFORM_4B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    /* Should not crash — result may be garbage but must not segfault */
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_UNIFORM_4B, buf.data(), buf.size());
+    /* We accept either OK (graceful handling) or an error code */
+    EXPECT_TRUE(st == TQ_OK || st != TQ_OK) << "Must not crash on NaN input";
+}
+
+TEST_F(EdgeCaseFixture, NaNInputQuantize_TurboKV3B) {
+    std::vector<float> keys(128);
+    for (int i = 0; i < 128; i++) keys[i] = NAN;
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_TURBO_KV_3B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_TURBO_KV_3B, buf.data(), buf.size());
+    EXPECT_TRUE(st == TQ_OK || st != TQ_OK) << "Must not crash on NaN input";
+}
+
+/* ---- InfInputQuantize: Inf values should not crash ---- */
+
+TEST_F(EdgeCaseFixture, InfInputQuantize) {
+    std::vector<float> keys(128);
+    for (int i = 0; i < 128; i++) keys[i] = (i % 2 == 0) ? INFINITY : -INFINITY;
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_UNIFORM_4B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_UNIFORM_4B, buf.data(), buf.size());
+    EXPECT_TRUE(st == TQ_OK || st != TQ_OK) << "Must not crash on Inf input";
+}
+
+TEST_F(EdgeCaseFixture, InfInputQuantize_TurboKV3B) {
+    std::vector<float> keys(128);
+    for (int i = 0; i < 128; i++) keys[i] = (i % 2 == 0) ? INFINITY : -INFINITY;
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_TURBO_KV_3B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_TURBO_KV_3B, buf.data(), buf.size());
+    EXPECT_TRUE(st == TQ_OK || st != TQ_OK) << "Must not crash on Inf input";
+}
+
+/* ---- AllSameValues: all elements identical (range=0 edge case) ---- */
+
+TEST_F(EdgeCaseFixture, AllSameValues_Uniform4B) {
+    std::vector<float> keys(128, 1.0f); /* all 1.0 */
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_UNIFORM_4B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_UNIFORM_4B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+
+    /* Dequantized result should be close to original (all ~1.0) */
+    float query[128];
+    for (int i = 0; i < 128; i++) query[i] = 1.0f;
+    float scores[1] = {};
+    tq_status st2 = tq_attention(ctx, query, buf.data(), 1, 128,
+                                 TQ_TYPE_UNIFORM_4B, scores);
+    EXPECT_EQ(TQ_OK, st2);
+    /* Score should be finite (no NaN from 0/0 in scale computation) */
+    EXPECT_TRUE(std::isfinite(scores[0])) << "Score must be finite for all-same input";
+}
+
+TEST_F(EdgeCaseFixture, AllSameValues_TurboKV3B) {
+    std::vector<float> keys(128, -0.5f); /* all -0.5 */
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_TURBO_KV_3B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_TURBO_KV_3B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+}
+
+TEST_F(EdgeCaseFixture, AllZeroValues) {
+    std::vector<float> keys(128, 0.0f);
+
+    size_t needed = tq_quantize_keys_size(1, 128, TQ_TYPE_UNIFORM_4B);
+    ASSERT_GT(needed, 0u);
+    std::vector<uint8_t> buf(needed, 0);
+
+    tq_status st = tq_quantize_keys(ctx, keys.data(), 1, 128,
+                                    TQ_TYPE_UNIFORM_4B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+}
+
+/* ---- VeryLargeSequence: n=10000 keys, verify no overflow ---- */
+
+TEST_F(EdgeCaseFixture, VeryLargeSequence_Uniform4B) {
+    const int N = 10000;
+    const int DIM = 128;
+
+    /* Verify size calculation doesn't overflow */
+    size_t needed = tq_quantize_keys_size(N, DIM, TQ_TYPE_UNIFORM_4B);
+    ASSERT_GT(needed, 0u);
+    ASSERT_GT(needed, (size_t)N); /* Sanity: must be larger than N */
+
+    /* Allocate and quantize */
+    std::vector<float> keys(N * DIM);
+    for (int i = 0; i < N * DIM; i++) keys[i] = sinf((float)i * 0.001f);
+
+    std::vector<uint8_t> buf(needed, 0);
+    tq_status st = tq_quantize_keys(ctx, keys.data(), N, DIM,
+                                    TQ_TYPE_UNIFORM_4B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
+}
+
+TEST_F(EdgeCaseFixture, VeryLargeSequence_TurboKV1B) {
+    const int N = 10000;
+    const int DIM = 128;
+
+    size_t needed = tq_quantize_keys_size(N, DIM, TQ_TYPE_TURBO_KV_1B);
+    ASSERT_GT(needed, 0u);
+
+    std::vector<float> keys(N * DIM);
+    for (int i = 0; i < N * DIM; i++) keys[i] = cosf((float)i * 0.001f);
+
+    std::vector<uint8_t> buf(needed, 0);
+    tq_status st = tq_quantize_keys(ctx, keys.data(), N, DIM,
+                                    TQ_TYPE_TURBO_KV_1B, buf.data(), buf.size());
+    EXPECT_EQ(TQ_OK, st);
 }

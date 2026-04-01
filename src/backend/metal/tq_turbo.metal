@@ -272,7 +272,7 @@ kernel void tq_turbo_quantize(
             proj += tg_residual[d] * random_entry_m(int(d), sketch_idx);
         }
 
-        if (proj >= 0.0f) {
+        if (proj > 0.0f) {
             int byte_idx = sketch_idx / 8;
             int bit_pos  = sketch_idx % 8;
             /* Atomic OR at byte level via device atomic */

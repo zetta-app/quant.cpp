@@ -195,7 +195,7 @@ __global__ void tq_turbo_quantize_kernel(
 
         int byte_idx = sketch_idx / 8;
         int bit_pos  = sketch_idx % 8;
-        if (proj >= 0.0f) {
+        if (proj > 0.0f) {
             atomicOr(reinterpret_cast<unsigned int*>(
                          &out[block_idx].residual.hash[byte_idx & ~3u]),
                      (1u << bit_pos) << (8 * (byte_idx & 3)));

@@ -71,7 +71,7 @@ __global__ void tq_qjl_quantize_kernel(
 
         /* Lane 0 extracts the sign bit */
         if (lane == 0) {
-            if (dot >= 0.0f) {
+            if (dot > 0.0f) {
                 packed_byte |= (1u << bit);
             }
         }
@@ -188,7 +188,7 @@ __global__ void tq_qjl_attention_kernel(
                 for (int d = 0; d < head_dim; d++) {
                     proj += s_query[d] * tq_random_entry_d(d, sketch_idx);
                 }
-                if (proj >= 0.0f) {
+                if (proj > 0.0f) {
                     q_hash |= (1u << bit);
                 }
             }

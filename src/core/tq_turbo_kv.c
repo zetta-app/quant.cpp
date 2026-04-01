@@ -139,7 +139,7 @@ static void compute_qjl_signs(const float* residual, uint8_t* signs,
         for (int d = 0; d < dim; d++) {
             proj += residual[d] * tkv_qjl_random_entry(d, s);
         }
-        if (proj >= 0.0f) {
+        if (proj > 0.0f) {
             signs[s / 8] |= (uint8_t)(1 << (s % 8));
         }
     }
@@ -647,7 +647,7 @@ void tq_turbo_kv_1b_quantize_ref(const float* src, void* dst, int n) {
     int sign_bytes = dim / 8;
     memset(block->signs, 0, (size_t)sign_bytes);
     for (int i = 0; i < dim; i++) {
-        if (rotated[i] >= 0.0f) {
+        if (rotated[i] > 0.0f) {
             block->signs[i / 8] |= (uint8_t)(1 << (i % 8));
         }
     }
@@ -730,7 +730,7 @@ void tq_turbo_kv_1b_attention_ref(const float* query, const void* kv_cache,
     uint8_t q_signs[TQ_BK / 8];
     memset(q_signs, 0, (size_t)sign_bytes);
     for (int i = 0; i < dim; i++) {
-        if (q_rot[i] >= 0.0f) {
+        if (q_rot[i] > 0.0f) {
             q_signs[i / 8] |= (uint8_t)(1 << (i % 8));
         }
     }

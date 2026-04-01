@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <pthread.h>
 
 /* ============================================================
  * Argmax sampling: return token with highest logit
@@ -60,9 +61,12 @@ static int compare_prob_desc(const void* a, const void* b) {
     return 0;
 }
 
-/* Persistent workspace to avoid per-token malloc */
+/* Persistent workspace to avoid per-token malloc.
+ * Protected by mutex for thread safety when multiple model instances
+ * call tq_sample_topp concurrently. */
 static prob_index_t* g_probindex = NULL;
 static int g_probindex_size = 0;
+static pthread_mutex_t g_probindex_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int tq_sample_topp(const float* logits, int vocab_size,
                    float temperature, float top_p,
@@ -81,13 +85,17 @@ int tq_sample_topp(const float* logits, int vocab_size,
 
     float threshold = max_val - 16.0f * temperature; /* exp(-16) ≈ 1e-7 */
 
-    /* Allocate/reuse workspace */
+    /* Allocate/reuse workspace (mutex-protected for concurrent callers) */
+    pthread_mutex_lock(&g_probindex_mutex);
     if (g_probindex_size < vocab_size) {
         free(g_probindex);
         g_probindex = (prob_index_t*)malloc(vocab_size * sizeof(prob_index_t));
         g_probindex_size = vocab_size;
     }
-    if (!g_probindex) return tq_sample_argmax(logits, vocab_size);
+    if (!g_probindex) {
+        pthread_mutex_unlock(&g_probindex_mutex);
+        return tq_sample_argmax(logits, vocab_size);
+    }
 
     /* Collect only candidates above threshold */
     int n_candidates = 0;
@@ -133,6 +141,7 @@ int tq_sample_topp(const float* logits, int vocab_size,
         }
     }
 
+    pthread_mutex_unlock(&g_probindex_mutex);
     return sampled;
 }
 

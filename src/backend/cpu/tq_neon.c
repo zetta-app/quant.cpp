@@ -523,7 +523,7 @@ void tq_qjl_quantize_neon(const float* src, void* dst, int n) {
         for (; d < dim; d++) {
             proj += src[d] * neon_qjl_random_entry(d, s);
         }
-        if (proj >= 0.0f) {
+        if (proj > 0.0f) {
             block->hash[s / 8] |= (1 << (s % 8));
         }
     }
@@ -576,7 +576,7 @@ void tq_qjl_attention_neon(const float* query, const void* kv_cache,
     uint8_t q_sign_bits[TQ_SKETCH_DIM / 8];
     memset(q_sign_bits, 0, TQ_SKETCH_DIM / 8);
     for (int s = 0; s < TQ_SKETCH_DIM; s++) {
-        if (q_proj[s] >= 0.0f) {
+        if (q_proj[s] > 0.0f) {
             q_sign_bits[s / 8] |= (1 << (s % 8));
         }
     }

@@ -17,6 +17,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 /* ---------- Random sign generation from seed ---------- */
 
 static int random_sign(uint32_t seed, int idx) {
@@ -33,11 +37,30 @@ static int random_sign(uint32_t seed, int idx) {
 static void walsh_hadamard(float* data, int n) {
     for (int len = 1; len < n; len <<= 1) {
         for (int i = 0; i < n; i += len << 1) {
-            for (int j = 0; j < len; j++) {
-                float u = data[i + j];
-                float v = data[i + j + len];
-                data[i + j]       = u + v;
-                data[i + j + len] = u - v;
+#ifdef __ARM_NEON
+            if (len >= 4) {
+                int j = 0;
+                for (; j + 3 < len; j += 4) {
+                    float32x4_t u = vld1q_f32(data + i + j);
+                    float32x4_t v = vld1q_f32(data + i + j + len);
+                    vst1q_f32(data + i + j,       vaddq_f32(u, v));
+                    vst1q_f32(data + i + j + len,  vsubq_f32(u, v));
+                }
+                for (; j < len; j++) {
+                    float u = data[i + j];
+                    float v = data[i + j + len];
+                    data[i + j]       = u + v;
+                    data[i + j + len] = u - v;
+                }
+            } else
+#endif
+            {
+                for (int j = 0; j < len; j++) {
+                    float u = data[i + j];
+                    float v = data[i + j + len];
+                    data[i + j]       = u + v;
+                    data[i + j + len] = u - v;
+                }
             }
         }
     }

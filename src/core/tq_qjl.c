@@ -53,12 +53,29 @@ void tq_qjl_quantize_ref(const float* src, void* dst, int n) {
     int dim = n;
     if (dim > TQ_BK_QJL) dim = TQ_BK_QJL;
 
-    /* Compute L2 norm */
+    /* Quick NaN check on first and last element */
+    if (src[0] != src[0] || src[dim-1] != src[dim-1]) {
+        memset(block, 0, sizeof(*block));
+        return;
+    }
+
+    /* Compute L2 norm with max-abs rescaling for overflow protection */
+    float max_abs = 0.0f;
+    for (int d = 0; d < dim; d++) {
+        float a = fabsf(src[d]);
+        if (a > max_abs) max_abs = a;
+    }
+    if (max_abs == 0.0f) {
+        memset(block, 0, sizeof(*block));
+        return;
+    }
+    float inv_max = 1.0f / max_abs;
     float norm_sq = 0.0f;
     for (int d = 0; d < dim; d++) {
-        norm_sq += src[d] * src[d];
+        float v = src[d] * inv_max;
+        norm_sq += v * v;
     }
-    block->norm = qjl_fp32_to_fp16(sqrtf(norm_sq));
+    block->norm = qjl_fp32_to_fp16(max_abs * sqrtf(norm_sq));
 
     /* Find outlier dimensions (largest absolute values) */
     float abs_vals[TQ_BK_QJL];
@@ -89,7 +106,7 @@ void tq_qjl_quantize_ref(const float* src, void* dst, int n) {
         for (int d = 0; d < dim; d++) {
             proj += src[d] * qjl_random_entry(d, s);
         }
-        if (proj >= 0.0f) {
+        if (proj > 0.0f) {
             block->hash[s / 8] |= (1 << (s % 8));
         }
     }
@@ -192,7 +209,7 @@ void tq_qjl_attention_ref(const float* query, const void* kv_cache,
     uint8_t q_hash[TQ_SKETCH_DIM / 8];
     memset(q_hash, 0, hash_bytes);
     for (int s = 0; s < sketch_dim; s++) {
-        if (q_sketch[s] >= 0.0f) {
+        if (q_sketch[s] > 0.0f) {
             q_hash[s / 8] |= (1 << (s % 8));
         }
     }

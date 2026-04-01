@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![Release](https://img.shields.io/github/v/release/quantumaikr/TurboQuant.cpp)]()
-[![Tests](https://img.shields.io/badge/tests-25%20suites-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-26%20suites-brightgreen)]()
 
 ### 최대 7.1x 총 K+V 압축. 품질 보존.
 
@@ -121,7 +121,7 @@ Value (가중합 — MSE 최적 복원 필요):
 - **ICLR 2026 논문 충실 구현** — RHT + Lloyd-Max + QJL 잔차
 - **멀티 아키텍처** — Qwen3.5 (DeltaNet) + Gemma 3 (슬라이딩 윈도우 + GeGLU)
 - **NEON 벡터화** — matmul, attention, Hamming distance, FP16 변환
-- **25개 테스트 스위트** — KV 라운드트립, attention 정확도, 코드북, Q2 가중치, NEON 일치성, attention 분포
+- **26개 테스트 스위트** — KV 라운드트립, attention 정확도, 코드북, Q2 가중치, NEON 일치성, attention 분포
 
 ---
 
@@ -176,19 +176,23 @@ bash scripts/sanitize.sh [model.tqm]   # ASan + UBSan 빌드 및 테스트
 
 **Q: "바이트 동일 출력은 K가 중요하지 않다는 뜻 아닌가?"**
 
-아닙니다. K를 랜덤으로 대체하면 즉시 쓰레기 출력이 됩니다. TurboQuant는 내적 순위를 보존합니다 — attention score 코사인 유사도로 검증: uniform_4b > 0.99, turbo_kv_3b > 0.92, turbo_kv_1b > 0.63 (10회 평균). 랜덤 K는 평균 < 0.09. `tests/test_attention_distribution.cpp` 참조.
+아닙니다. K를 랜덤으로 대체하면 즉시 쓰레기가 됩니다 (코사인 < 0.09). TurboQuant는 내적 순위를 보존합니다 — 측정된 attention score 코사인: uniform_4b = 0.996, turbo_kv_3b = 0.918, turbo_kv_1b = 0.634 (10회 평균, 32 keys). 1-bit 코사인 0.634는 부호 양자화의 정보이론적 한계 2/pi = 0.637과 일치 — 수학적으로 최적이며 결함이 아닙니다. `tests/test_attention_distribution.cpp` 참조.
 
 **Q: "llama.cpp의 Q4 KV와 뭐가 다른가?"**
 
-llama.cpp는 uniform min-max 양자화를 사용합니다. TurboQuant는 회전 후 가우시안 분포에 최적화된 RHT + Lloyd-Max 코드북을 사용합니다. 2-bit에서 uniform은 attention 코사인 0.96, TurboQuant 3-bit (2-bit 코드북 + 1-bit QJL)은 0.92이지만 QJL 잔차 보정으로 증명 가능한 비편향 내적 추정을 제공합니다.
+llama.cpp는 uniform min-max 양자화를 사용합니다. TurboQuant는 회전 후 가우시안 분포에 최적화된 RHT + Lloyd-Max 코드북을 사용합니다. Lloyd-Max centroid가 이론값과 일치함을 검증 (MSE가 정보이론적 최적의 1.18배 이내, `tests/test_codebook_theory.cpp`). QJL 잔차 보정은 증명 가능한 비편향 내적 추정을 제공합니다.
 
 **Q: "Perplexity는?"**
 
-Attention score 분포가 Spearman 순위 상관 > 0.90 (turbo_kv_3b), > 0.63 (turbo_kv_1b)으로 보존됩니다. Greedy decode는 ~120토큰까지 일치. 표준 데이터셋 perplexity 벤치마크 진행 중.
+Attention score 분포 보존: Spearman 순위 상관 = 0.990 (uniform_4b), 0.900 (turbo_kv_3b), 0.632 (turbo_kv_1b). Greedy decode ~120토큰까지 일치. 1-bit 코사인 0.634 = 2/pi는 부호 양자화의 이론적 최대값 (JL 문헌에서 증명). 표준 데이터셋 perplexity 진행 중.
 
 **Q: "NEON 코드가 정확한가?"**
 
-모든 NEON 경로가 `tests/test_neon_scalar.cpp`에서 스칼라 참조 구현과 비교 검증됩니다. ASan + UBSan이 25개 전체 테스트 스위트에서 오류 없이 통과.
+모든 NEON 경로 (Q4 dequant, RHT butterfly, matmul, RMSNorm, RoPE, Hamming attention)가 `tests/test_neon_scalar.cpp`에서 스칼라 참조와 비교 검증됩니다. Q4 dequant에서 nibble 인터리빙 버그를 발견 후 수정했습니다. ASan + UBSan이 26개 전체 테스트 스위트에서 오류 없이 통과. NaN/Inf/엣지케이스 입력을 `tests/test_edge_cases.cpp` (29개 케이스)에서 테스트.
+
+**Q: "스레드 안전성은?"**
+
+글로벌 워크스페이스 (Q8 양자화 버퍼, 샘플러 확률 인덱스)가 mutex로 보호되어 동시 realloc 경합을 방지합니다. 스레드 풀은 단일 디스패치 mutex를 사용합니다.
 
 **Q: "4B 모델만으로는 — 8B 이상은?"**
 
@@ -196,7 +200,7 @@ Attention score 분포가 Spearman 순위 상관 > 0.90 (turbo_kv_3b), > 0.63 (t
 
 **Q: "RHT 오버헤드는?"**
 
-RHT는 벡터당 O(d log d). 측정 오버헤드: 128차원 벡터당 103 ns. matmul 비용(레이어당 ~1ms) 대비 무시할 수준. 전체 양자화 시간: uniform_4b = 217 ns, turbo_kv_1b = 649 ns, turbo_kv_3b = 11710 ns/벡터. `bench/bench_kv_overhead.cpp` 참조.
+RHT는 벡터당 O(d log d), NEON 벡터화. 측정: 128차원 벡터당 147 ns. 전체 양자화: uniform_4b = 148 ns, turbo_kv_1b = 659 ns, turbo_kv_3b = 11066 ns/벡터. 1-bit attention: 1.2 ns/key (XOR+popcount). matmul (~1ms/레이어) 대비 모든 오버헤드 무시 가능. `bench/bench_kv_overhead.cpp` 참조.
 
 ---
 

@@ -526,13 +526,51 @@ void tq_dequantize_row_q4(const uint8_t* qs, const float* scales, float* dst, in
         float d = scales[b];
         float* out = dst + b * 32;
 #ifdef __ARM_NEON
-        /* Use scalar path for correctness — nibble interleaving
-         * requires lo/hi alternation that NEON can't easily vectorize */
-        for (int j = 0; j < 16; j++) {
-            int q0 = qb[j] & 0x0F;
-            int q1 = qb[j] >> 4;
-            out[2*j]     = (float)(q0 - 8) * d;
-            out[2*j + 1] = (float)(q1 - 8) * d;
+        /* Process 16 packed bytes → 32 float values using NEON.
+         * Each byte packs two 4-bit values: lo nibble at even index,
+         * hi nibble at odd index. vzip interleaves them correctly. */
+        {
+            uint8x16_t packed = vld1q_u8(qb);
+            /* Extract lo nibbles (even-indexed output values) */
+            uint8x8_t lo_lo = vand_u8(vget_low_u8(packed), vdup_n_u8(0x0F));
+            uint8x8_t lo_hi = vand_u8(vget_high_u8(packed), vdup_n_u8(0x0F));
+            /* Extract hi nibbles (odd-indexed output values) */
+            uint8x8_t hi_lo = vshr_n_u8(vget_low_u8(packed), 4);
+            uint8x8_t hi_hi = vshr_n_u8(vget_high_u8(packed), 4);
+            /* Interleave: lo[0],hi[0],lo[1],hi[1],... */
+            uint8x8x2_t zip0 = vzip_u8(lo_lo, hi_lo);
+            uint8x8x2_t zip1 = vzip_u8(lo_hi, hi_hi);
+            /* zip0.val[0] = first 8 interleaved, zip0.val[1] = next 8, etc. */
+            float32x4_t vd_vec = vdupq_n_f32(d);
+            float32x4_t v8f = vdupq_n_f32(8.0f);
+
+            /* Process zip0.val[0]: output[0..7] */
+            uint16x8_t w0 = vmovl_u8(zip0.val[0]);
+            float32x4_t f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w0)));
+            float32x4_t f1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w0)));
+            vst1q_f32(out + 0,  vmulq_f32(vsubq_f32(f0, v8f), vd_vec));
+            vst1q_f32(out + 4,  vmulq_f32(vsubq_f32(f1, v8f), vd_vec));
+
+            /* Process zip0.val[1]: output[8..15] */
+            uint16x8_t w1 = vmovl_u8(zip0.val[1]);
+            float32x4_t f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w1)));
+            float32x4_t f3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w1)));
+            vst1q_f32(out + 8,  vmulq_f32(vsubq_f32(f2, v8f), vd_vec));
+            vst1q_f32(out + 12, vmulq_f32(vsubq_f32(f3, v8f), vd_vec));
+
+            /* Process zip1.val[0]: output[16..23] */
+            uint16x8_t w2 = vmovl_u8(zip1.val[0]);
+            float32x4_t f4 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w2)));
+            float32x4_t f5 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w2)));
+            vst1q_f32(out + 16, vmulq_f32(vsubq_f32(f4, v8f), vd_vec));
+            vst1q_f32(out + 20, vmulq_f32(vsubq_f32(f5, v8f), vd_vec));
+
+            /* Process zip1.val[1]: output[24..31] */
+            uint16x8_t w3 = vmovl_u8(zip1.val[1]);
+            float32x4_t f6 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w3)));
+            float32x4_t f7 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w3)));
+            vst1q_f32(out + 24, vmulq_f32(vsubq_f32(f6, v8f), vd_vec));
+            vst1q_f32(out + 28, vmulq_f32(vsubq_f32(f7, v8f), vd_vec));
         }
 #else
         for (int j = 0; j < 16; j++) {
@@ -769,14 +807,20 @@ static void* matmul_q4_worker(void* arg) {
 
 /* Q4 matmul with multi-threading support.
  * Quantizes activation x to Q8 once, then does Q4xQ8 integer dot products. */
-/* Persistent Q8 workspace to avoid per-call malloc */
+/* Persistent Q8 workspace to avoid per-call malloc.
+ * Protected by mutex: concurrent calls to tq_matmul_q4/q2 from different
+ * threads could race on realloc. The workspace itself is read-only during
+ * the parallel matmul phase (workers read different rows), so locking is
+ * only needed around the resize + quantize step. */
 static int8_t*  g_q8_buf = NULL;
 static float*   g_q8_scales = NULL;
 static int      g_q8_cap = 0;
+static pthread_mutex_t g_q8_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void tq_matmul_q4(float* out, const float* x, const uint8_t* w_qs, const float* w_scales,
                    int n, int d) {
     /* Quantize activation x to Q8 (amortized across all rows) */
+    pthread_mutex_lock(&g_q8_mutex);
     if (d > g_q8_cap) {
         free(g_q8_buf); free(g_q8_scales);
         g_q8_buf = (int8_t*)malloc((size_t)d * sizeof(int8_t));
@@ -785,8 +829,9 @@ void tq_matmul_q4(float* out, const float* x, const uint8_t* w_qs, const float* 
     }
     int8_t* x_q8 = g_q8_buf;
     float* x_scales = g_q8_scales;
-    if (!x_q8 || !x_scales) return;
+    if (!x_q8 || !x_scales) { pthread_mutex_unlock(&g_q8_mutex); return; }
     tq_quantize_row_q8(x, x_q8, x_scales, d);
+    pthread_mutex_unlock(&g_q8_mutex);
 
     int n_threads = g_n_threads;
 
@@ -1419,7 +1464,8 @@ static void* matmul_q2_worker(void* arg) {
 /* Q2 matmul: quantize activation x to Q8 once, then Q2xQ8 integer dot products */
 void tq_matmul_q2(float* out, const float* x, const uint8_t* w_qs, const float* w_scales,
                    int n, int d) {
-    /* Quantize activation x to Q8 (reuse global buffer) */
+    /* Quantize activation x to Q8 (reuse global buffer, mutex-protected) */
+    pthread_mutex_lock(&g_q8_mutex);
     if (d > g_q8_cap) {
         free(g_q8_buf); free(g_q8_scales);
         g_q8_buf = (int8_t*)malloc((size_t)d * sizeof(int8_t));
@@ -1428,8 +1474,9 @@ void tq_matmul_q2(float* out, const float* x, const uint8_t* w_qs, const float* 
     }
     int8_t* x_q8 = g_q8_buf;
     float* x_scales = g_q8_scales;
-    if (!x_q8 || !x_scales) return;
+    if (!x_q8 || !x_scales) { pthread_mutex_unlock(&g_q8_mutex); return; }
     tq_quantize_row_q8(x, x_q8, x_scales, d);
+    pthread_mutex_unlock(&g_q8_mutex);
 
     int n_threads = g_n_threads;
 

@@ -218,7 +218,19 @@ TEST_F(AttentionDistribution, TurboKV3BPreservesDistribution) {
 }
 
 TEST_F(AttentionDistribution, TurboKV1BPreservesDistribution) {
-    /* Quantize keys with turbo_kv_1b, use native attention */
+    /* Quantize keys with turbo_kv_1b, use native attention.
+     *
+     * THEORETICAL LIMIT: For 1-bit sign quantization with random Gaussian
+     * vectors, the expected inner product correlation is 2/pi ~= 0.637.
+     * This is a fundamental information-theoretic limit — with only 1 bit
+     * per dimension, we can only capture the sign of each RHT-rotated
+     * component. The QJL norm correction (sqrt(pi/2) * ||q|| * ||k||)
+     * provides an unbiased estimator, but the variance from sign quantization
+     * limits the attention score cosine to approximately 2/pi.
+     *
+     * The attention function applies the full correction pipeline:
+     *   score = q_norm * k_norm * sqrt(pi/2) / dim * (2*agree - dim)
+     * where agree = number of matching sign bits after RHT rotation. */
     std::vector<block_tq_turbo_kv_1b> kv_blocks(SEQ_LEN);
     for (int s = 0; s < SEQ_LEN; s++) {
         tq_turbo_kv_1b_quantize_ref(keys[s].data(), &kv_blocks[s], DIM);
@@ -235,7 +247,11 @@ TEST_F(AttentionDistribution, TurboKV1BPreservesDistribution) {
 
     printf("  turbo_kv_1b: cosine=%.4f, spearman=%.4f, top5=%.2f, mse=%.4f\n",
            cos, spearman, top5, mse);
+    printf("  (theoretical limit for 1-bit sign: 2/pi = %.4f)\n", 2.0 / M_PI);
 
+    /* Threshold set near 2/pi ~= 0.637, the theoretical limit for
+     * 1-bit sign quantization. Values above 0.50 confirm the QJL
+     * correction is working as designed. */
     EXPECT_GT(cos, 0.50) << "TurboKV 1-bit attention cosine too low";
     EXPECT_GT(spearman, 0.30) << "TurboKV 1-bit Spearman too low";
 }
@@ -542,7 +558,77 @@ TEST(AttentionDistributionMultiTrial, AverageOverTrials) {
     EXPECT_GT(avg_cos_tkv3, avg_cos_random)
         << "TurboKV 3-bit should beat random";
 
-    /* TurboKV 1-bit should at least show some correlation */
-    EXPECT_GT(avg_cos_tkv1, 0.10)
-        << "TurboKV 1-bit should have some correlation";
+    /* TurboKV 1-bit should show correlation consistent with 2/pi theory.
+     * With norm-corrected QJL attention, the average cosine should approach
+     * 2/pi ~= 0.637 over many trials. We use a conservative lower bound. */
+    printf("  (1-bit theoretical limit: 2/pi = %.4f)\n", 2.0 / M_PI);
+    EXPECT_GT(avg_cos_tkv1, 0.40)
+        << "TurboKV 1-bit avg cosine should approach 2/pi ~= 0.637";
+}
+
+/* ============================================================
+ * QJL 1-bit Theory Verification
+ *
+ * Proves that the QJL norm correction mechanism works as designed:
+ * - Raw sign similarity: cosine ~= 2/pi ~= 0.637 (theoretical limit)
+ * - The correction factor sqrt(pi/2) provides unbiased estimation
+ * - Higher dimensions yield more stable estimates (law of large numbers)
+ *
+ * This is NOT a failure case — it is the expected behavior for 1-bit
+ * quantization. For better attention quality, use turbo_kv_3b (2-bit
+ * codebook + 1-bit QJL residual = effectively 3-bit).
+ * ============================================================ */
+
+TEST(QJL1BitTheory, NormCorrectionMatchesTwoPi) {
+    const int DIM = 128;
+    const int SEQ_LEN = 64;
+    const int N_TRIALS = 20;
+
+    double total_cos = 0.0;
+
+    for (int trial = 0; trial < N_TRIALS; trial++) {
+        std::mt19937 rng(trial * 777 + 13);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+
+        std::vector<float> query(DIM);
+        for (int i = 0; i < DIM; i++) query[i] = dist(rng);
+
+        std::vector<std::vector<float>> keys(SEQ_LEN);
+        std::vector<float> fp32_scores(SEQ_LEN);
+        for (int s = 0; s < SEQ_LEN; s++) {
+            keys[s].resize(DIM);
+            for (int i = 0; i < DIM; i++) keys[s][i] = dist(rng);
+            float dot = 0.0f;
+            for (int d = 0; d < DIM; d++) dot += query[d] * keys[s][d];
+            fp32_scores[s] = dot;
+        }
+
+        /* 1-bit quantize + corrected attention */
+        std::vector<block_tq_turbo_kv_1b> blocks(SEQ_LEN);
+        for (int s = 0; s < SEQ_LEN; s++)
+            tq_turbo_kv_1b_quantize_ref(keys[s].data(), &blocks[s], DIM);
+
+        std::vector<float> qjl_scores(SEQ_LEN);
+        tq_turbo_kv_1b_attention_ref(query.data(), blocks.data(),
+                                       qjl_scores.data(), SEQ_LEN, DIM);
+
+        total_cos += cosine_similarity(fp32_scores.data(), qjl_scores.data(), SEQ_LEN);
+    }
+
+    double avg_cos = total_cos / N_TRIALS;
+    double two_over_pi = 2.0 / M_PI; /* ~0.6366 */
+
+    printf("\n  === QJL 1-bit Theory Verification ===\n");
+    printf("  Average cosine over %d trials: %.4f\n", N_TRIALS, avg_cos);
+    printf("  Theoretical 2/pi limit:        %.4f\n", two_over_pi);
+    printf("  Deviation from theory:         %.4f\n", std::abs(avg_cos - two_over_pi));
+
+    /* The average cosine should be within reasonable range of 2/pi.
+     * We allow a generous band because:
+     * 1. Small seq_len introduces sampling variance
+     * 2. RHT rotation is pseudo-random (seed-dependent) */
+    EXPECT_GT(avg_cos, 0.45)
+        << "1-bit QJL corrected attention should show meaningful correlation";
+    EXPECT_LT(avg_cos, 0.90)
+        << "1-bit QJL should not exceed what 1-bit information allows";
 }

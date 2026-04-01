@@ -49,6 +49,12 @@ void tq_polar_quantize_ref(const float* src, void* dst, int n) {
     int pairs = n / 2;
     if (pairs > TQ_BK / 2) pairs = TQ_BK / 2;
 
+    /* Quick NaN check on first and last element */
+    if (n > 0 && (src[0] != src[0] || src[n-1] != src[n-1])) {
+        memset(block, 0, sizeof(*block));
+        return;
+    }
+
     /* Compute polar coordinates for each pair */
     float thetas[TQ_BK / 2];
     float radii[TQ_BK / 2];

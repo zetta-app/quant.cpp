@@ -141,7 +141,7 @@ kernel void tq_qjl_quantize(
         }
 
         float dot = simd_reduce_sum(partial);
-        if (lane == 0 && dot >= 0.0f) {
+        if (lane == 0 && dot > 0.0f) {
             packed_byte |= (1u << bit);
         }
     }
@@ -241,7 +241,7 @@ kernel void tq_qjl_attention(
             for (uint d = 0; d < head_dim; d++) {
                 proj += tg_query[d] * random_entry(int(d), int(sketch_idx));
             }
-            if (proj >= 0.0f) {
+            if (proj > 0.0f) {
                 q_hash |= (1u << bit);
             }
         }

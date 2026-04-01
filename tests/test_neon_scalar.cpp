@@ -32,6 +32,14 @@ void tq_uniform_4b_dequantize_ref(const void* src, float* dst, int n);
 void tq_turbo_kv_1b_quantize_ref(const float* src, void* dst, int n);
 void tq_turbo_kv_1b_attention_ref(const float* query, const void* kv,
                                     float* scores, int seq_len, int head_dim);
+
+/* QJL ref functions */
+void tq_qjl_quantize_ref(const float* src, void* dst, int n);
+void tq_qjl_dequantize_ref(const void* src, float* dst, int n);
+
+/* Polar ref functions */
+void tq_polar_quantize_ref(const float* src, void* dst, int n);
+void tq_polar_dequantize_ref(const void* src, float* dst, int n);
 }
 
 /* ============================================================
@@ -304,7 +312,7 @@ TEST(NeonScalarConsistency, HammingAttentionReference) {
     uint8_t q_signs[16];
     memset(q_signs, 0, 16);
     for (int i = 0; i < dim; i++) {
-        if (q_rot[i] >= 0.0f) {
+        if (q_rot[i] > 0.0f) {
             q_signs[i / 8] |= (uint8_t)(1 << (i % 8));
         }
     }
@@ -443,4 +451,228 @@ TEST(NeonScalarConsistency, DequantQ4Remainder) {
         EXPECT_FLOAT_EQ(ref[i], actual[i])
             << "DequantQ4 remainder mismatch at " << i;
     }
+}
+
+/* ============================================================
+ * Test: DequantQ2Reference
+ *
+ * Manually dequantize Q2 and compare with tq_dequantize_row_q2.
+ * Q2 uses Lloyd-Max centroids: {-1.5104, -0.4528, 0.4528, 1.5104}
+ * ============================================================ */
+
+TEST(NeonScalarConsistency, DequantQ2Reference) {
+    /* Lloyd-Max centroids for 2-bit N(0,1) */
+    const float Q2_C[4] = {-1.5104f, -0.4528f, 0.4528f, 1.5104f};
+    const int n = 128;  /* 4 blocks of 32 */
+    const int n_blocks = n / 32;
+
+    /* Create known Q2 data: 8 bytes per block (4 values per byte, 2 bits each) */
+    std::vector<uint8_t> qs(n_blocks * 8);
+    std::vector<float> scales(n_blocks);
+
+    std::mt19937 rng(2024);
+    for (int b = 0; b < n_blocks; b++) {
+        scales[b] = 0.1f * (b + 1);
+        for (int j = 0; j < 8; j++) {
+            uint8_t byte = 0;
+            for (int k = 0; k < 4; k++) {
+                uint8_t qi = rng() % 4;
+                byte |= (qi << (k * 2));
+            }
+            qs[b * 8 + j] = byte;
+        }
+    }
+
+    /* Manual reference dequantization */
+    std::vector<float> ref(n);
+    for (int b = 0; b < n_blocks; b++) {
+        for (int j = 0; j < 32; j++) {
+            int byte_idx = j / 4;
+            int bit_pos  = (j % 4) * 2;
+            int qi = (qs[b * 8 + byte_idx] >> bit_pos) & 0x03;
+            ref[b * 32 + j] = Q2_C[qi] * scales[b];
+        }
+    }
+
+    /* Call actual function */
+    std::vector<float> actual(n);
+    tq_dequantize_row_q2(qs.data(), scales.data(), actual.data(), n);
+
+    for (int i = 0; i < n; i++) {
+        EXPECT_FLOAT_EQ(ref[i], actual[i])
+            << "DequantQ2 mismatch at element " << i;
+    }
+}
+
+/* ============================================================
+ * Test: RoPE reference comparison
+ *
+ * Compute RoPE manually and compare with tq_rope.
+ * RoPE applies rotation to (q[2i], q[2i+1]) pairs:
+ *   q[2i]   = q0*cos(theta) - q1*sin(theta)
+ *   q[2i+1] = q0*sin(theta) + q1*cos(theta)
+ * ============================================================ */
+
+TEST(NeonScalarConsistency, RoPEReference) {
+    const int head_dim = 64;
+    const int n_heads = 2;
+    const int n_kv_heads = 2;
+    const int pos = 42;
+    const float freq_base = 10000.0f;
+
+    auto q_input = make_deterministic_input(n_heads * head_dim, 3000);
+    auto k_input = make_deterministic_input(n_kv_heads * head_dim, 4000);
+
+    /* Save copies for reference computation */
+    std::vector<float> q_ref(q_input);
+    std::vector<float> k_ref(k_input);
+
+    /* Manual reference RoPE */
+    for (int h = 0; h < n_heads; h++) {
+        float* qh = q_ref.data() + h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float freq = 1.0f / powf(freq_base, 2.0f * i / head_dim);
+            float theta = pos * freq;
+            float cos_t = cosf(theta);
+            float sin_t = sinf(theta);
+            float q0 = qh[2 * i];
+            float q1 = qh[2 * i + 1];
+            qh[2 * i]     = q0 * cos_t - q1 * sin_t;
+            qh[2 * i + 1] = q0 * sin_t + q1 * cos_t;
+        }
+    }
+    for (int h = 0; h < n_kv_heads; h++) {
+        float* kh = k_ref.data() + h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float freq = 1.0f / powf(freq_base, 2.0f * i / head_dim);
+            float theta = pos * freq;
+            float cos_t = cosf(theta);
+            float sin_t = sinf(theta);
+            float k0 = kh[2 * i];
+            float k1 = kh[2 * i + 1];
+            kh[2 * i]     = k0 * cos_t - k1 * sin_t;
+            kh[2 * i + 1] = k0 * sin_t + k1 * cos_t;
+        }
+    }
+
+    /* Call actual tq_rope (modifies q_input and k_input in-place) */
+    tq_rope(q_input.data(), k_input.data(), pos, head_dim,
+            n_heads, n_kv_heads, freq_base);
+
+    for (int i = 0; i < n_heads * head_dim; i++) {
+        EXPECT_NEAR(q_input[i], q_ref[i], 1e-5f)
+            << "RoPE query mismatch at element " << i;
+    }
+    for (int i = 0; i < n_kv_heads * head_dim; i++) {
+        EXPECT_NEAR(k_input[i], k_ref[i], 1e-5f)
+            << "RoPE key mismatch at element " << i;
+    }
+}
+
+/* ============================================================
+ * Task 5c: Edge case tests -- numerical stability
+ * ============================================================ */
+
+/* Test with all-zero input: should produce zero norm */
+TEST(NumericalStability, AllZeroInput) {
+    const int dim = 128;
+    std::vector<float> zeros(dim, 0.0f);
+
+    /* QJL quantize with zeros */
+    block_tq_qjl qjl_block;
+    memset(&qjl_block, 0, sizeof(qjl_block));
+    tq_qjl_quantize_ref(zeros.data(), &qjl_block, dim);
+
+    /* Norm should be zero (FP16 representation of 0) */
+    EXPECT_EQ(qjl_block.norm, 0u) << "QJL norm should be zero for all-zero input";
+
+    /* Polar quantize with zeros */
+    block_tq_polar polar_block;
+    memset(&polar_block, 0, sizeof(polar_block));
+    tq_polar_quantize_ref(zeros.data(), &polar_block, dim);
+
+    /* Should not crash -- that's the main test */
+}
+
+/* Test with very large values: should not overflow during quantization.
+ * We use values up to ~1000 which stress the norm computation but still
+ * fit in FP16 range (max ~65504). Values at 1e30 would overflow FP16,
+ * causing the stored norm to be Inf, which is a FP16 limitation, not a bug. */
+TEST(NumericalStability, LargeValues) {
+    const int dim = 256;
+    std::vector<float> large(dim);
+    std::mt19937 rng(999);
+    std::uniform_real_distribution<float> dist(-1000.0f, 1000.0f);
+    for (int i = 0; i < dim; i++) large[i] = dist(rng);
+
+    /* QJL quantize -- should not crash or produce NaN/Inf */
+    block_tq_qjl qjl_block;
+    memset(&qjl_block, 0, sizeof(qjl_block));
+    tq_qjl_quantize_ref(large.data(), &qjl_block, dim);
+
+    /* The L2 norm of ~256 values at ~1000 is about sqrt(256*500000) ~ 11313,
+     * well within FP16 range. Verify norm is not zero or NaN. */
+    EXPECT_NE(qjl_block.norm, 0u) << "Norm should not be zero for large input";
+
+    /* Dequantize and check for NaN */
+    std::vector<float> output(dim);
+    tq_qjl_dequantize_ref(&qjl_block, output.data(), dim);
+    for (int i = 0; i < dim; i++) {
+        EXPECT_FALSE(std::isnan(output[i]))
+            << "NaN in QJL dequantized output at index " << i;
+    }
+
+    /* Also test with truly extreme values (1e30) -- quantize should not crash */
+    std::vector<float> extreme(dim);
+    std::uniform_real_distribution<float> ext_dist(-1e30f, 1e30f);
+    for (int i = 0; i < dim; i++) extreme[i] = ext_dist(rng);
+
+    block_tq_qjl extreme_block;
+    memset(&extreme_block, 0, sizeof(extreme_block));
+    tq_qjl_quantize_ref(extreme.data(), &extreme_block, dim);
+    /* Quantize should not crash -- that's the main test.
+     * Norm will saturate to FP16 Inf (0x7C00), which is expected. */
+}
+
+/* Test with very small values (1e-30): should not underflow to zero norm */
+TEST(NumericalStability, SmallValues) {
+    const int dim = 256;
+    std::vector<float> small(dim);
+    std::mt19937 rng(888);
+    std::uniform_real_distribution<float> dist(-1e-30f, 1e-30f);
+    for (int i = 0; i < dim; i++) small[i] = dist(rng);
+
+    /* QJL quantize */
+    block_tq_qjl qjl_block;
+    memset(&qjl_block, 0, sizeof(qjl_block));
+    tq_qjl_quantize_ref(small.data(), &qjl_block, dim);
+
+    /* Norm may underflow to FP16 zero for very small values -- that's acceptable.
+     * The key test is no crash and no NaN. */
+    std::vector<float> output(dim);
+    tq_qjl_dequantize_ref(&qjl_block, output.data(), dim);
+    for (int i = 0; i < dim; i++) {
+        EXPECT_FALSE(std::isnan(output[i]))
+            << "NaN in QJL dequantized output at index " << i;
+    }
+}
+
+/* Test with NaN input: should zero-fill output and not crash */
+TEST(NumericalStability, NaNInputGuard) {
+    const int dim = 128;
+    std::vector<float> input(dim, 1.0f);
+    input[0] = std::numeric_limits<float>::quiet_NaN();
+
+    /* QJL quantize with NaN */
+    block_tq_qjl qjl_block;
+    memset(&qjl_block, 0xFF, sizeof(qjl_block));  /* fill with garbage */
+    tq_qjl_quantize_ref(input.data(), &qjl_block, dim);
+    EXPECT_EQ(qjl_block.norm, 0u) << "QJL should zero-fill on NaN input";
+
+    /* Polar quantize with NaN */
+    block_tq_polar polar_block;
+    memset(&polar_block, 0xFF, sizeof(polar_block));
+    tq_polar_quantize_ref(input.data(), &polar_block, dim);
+    /* Should not crash; block should be zeroed */
+    EXPECT_EQ(polar_block.tscale, 0u) << "Polar should zero-fill on NaN input";
 }
