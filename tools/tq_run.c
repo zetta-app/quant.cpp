@@ -256,6 +256,9 @@ int main(int argc, char** argv) {
         } else {
             tok = tq_load_tokenizer_from_tqm(model_path);
         }
+        if (!tok && model->gguf_ctx) {
+            tok = tq_load_tokenizer_from_gguf(model->gguf_ctx);
+        }
         if (!tok) {
             fprintf(stderr, "Error: --ppl requires a tokenizer\n");
             tq_free_model(model);
