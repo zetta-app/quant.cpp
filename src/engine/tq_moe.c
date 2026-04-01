@@ -669,9 +669,9 @@ void tq_moe_forward(const tq_moe_layer_t* layer,
         int num_active, int expert_dim, int hidden_dim, int num_experts_total, int weight_type,
         const int* gate_types, const int* up_types, const int* down_types);
 
-    /* Fused Metal MoE — re-enabled with IQ2_S shader disabled (falls back to IQ2_XXS for down).
-     * Keep code for future fix — re-enable by removing the 'if (0 && ...)'. */
-    if (0 && tq_metal_moe_available() && num_active > 0) {
+    /* Fused Metal MoE — re-enabled for per-phase hang isolation debugging.
+     * Each phase runs with waitUntilCompleted + NSLog to identify which phase hangs. */
+    if (tq_metal_moe_available() && num_active > 0) {
         /* Check that all active experts use IQ2_XXS and have valid weights */
         int can_fuse = 1;
         const void* base_ptr = NULL;

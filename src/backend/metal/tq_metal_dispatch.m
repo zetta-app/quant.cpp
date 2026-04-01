@@ -898,6 +898,20 @@ int tq_metal_moe_forward(
             [enc endEncoding];
         }
 
+        /* --- Phase 1: commit and wait to isolate hang --- */
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) {
+            NSLog(@"TurboQuant MoE: Phase 1 (gate+up) FAILED: %@", cmdBuf.error);
+            return -1;
+        }
+        NSLog(@"TurboQuant MoE: Phase 1 (gate+up) completed OK");
+
+        /* --- New command buffer for Phase 2 --- */
+        cmdBuf = [tq_mtl_queue commandBuffer];
+        if (!cmdBuf) return -1;
+
         /* ======== Phase 2: SwiGLU ======== */
         {
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
@@ -916,6 +930,20 @@ int tq_metal_moe_forward(
             [enc dispatchThreadgroups:gridSize threadsPerThreadgroup:tgSize];
             [enc endEncoding];
         }
+
+        /* --- Phase 2: commit and wait to isolate hang --- */
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) {
+            NSLog(@"TurboQuant MoE: Phase 2 (SwiGLU) FAILED: %@", cmdBuf.error);
+            return -1;
+        }
+        NSLog(@"TurboQuant MoE: Phase 2 (SwiGLU) completed OK");
+
+        /* --- New command buffer for Phase 3 --- */
+        cmdBuf = [tq_mtl_queue commandBuffer];
+        if (!cmdBuf) return -1;
 
         /* ======== Phase 3: down projection + weighted accumulation ======== */
         {
@@ -937,14 +965,15 @@ int tq_metal_moe_forward(
             [enc endEncoding];
         }
 
-        /* --- Commit, wait, copy result --- */
+        /* --- Phase 3: commit and wait --- */
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
 
         if (cmdBuf.status == MTLCommandBufferStatusError) {
-            NSLog(@"TurboQuant: MoE fused dispatch error: %@", cmdBuf.error);
+            NSLog(@"TurboQuant MoE: Phase 3 (down+accum) FAILED: %@", cmdBuf.error);
             return -1;
         }
+        NSLog(@"TurboQuant MoE: Phase 3 (down+accum) completed OK");
 
         memcpy(output, [output_buf contents], output_bytes);
         return 0;
