@@ -20,6 +20,7 @@
 
 #include "turboquant/tq_engine.h"
 #include "turboquant/turboquant.h"
+#include "turboquant/tq_gguf.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -224,6 +225,9 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
         s->quant_key_cache = NULL;
     }
 
+    /* MoE state allocation (set up later by tq_load_gguf when model is MoE) */
+    s->moe_state = NULL;
+
     /* Adaptive compression: these are set later via flags, not at creation time.
      * attn_entropy, entropy_accum, v_highres_window, value_highres_fp16
      * are initialized to 0/NULL by calloc. */
@@ -284,6 +288,9 @@ void tq_free_state(tq_state_t* state) {
     free(state->value_highres_fp16);
     free(state->profile_stats);
     free(state->profile_accum);
+    if (state->moe_state) {
+        tq_moe_free_state((tq_moe_state_t*)state->moe_state);
+    }
     free(state);
 }
 
@@ -1088,7 +1095,6 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             if (window_start < 0) window_start = 0;
 
             /* Old tokens: use quantized V path */
-            float v_tmp[512];
             size_t layer_off_qs = (size_t)l * max_seq * s->value_stride_qs;
             size_t layer_off_sc = (size_t)l * max_seq * s->value_stride_scales;
             int n_blocks_per_head = (head_dim + 31) / 32;
@@ -1103,12 +1109,27 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                 const float* vsc = s->value_cache_scales + layer_off_sc
                     + (size_t)t * s->value_stride_scales + head_sc_off;
                 if (s->value_quant_bits == 4) {
-                    tq_dequantize_row_q4(vqs, vsc, v_tmp, head_dim);
+                    /* Fused Q4 domain accumulation */
+                    for (int b = 0; b < n_blocks_per_head; b++) {
+                        float combined = a * vsc[b];
+                        const uint8_t* bqs = vqs + (size_t)b * 16;
+                        for (int j = 0; j < 16; j++) {
+                            int idx0 = b * 32 + 2 * j;
+                            int idx1 = idx0 + 1;
+                            if (idx0 >= head_dim) break;
+                            int q0 = bqs[j] & 0xF;
+                            int q1 = bqs[j] >> 4;
+                            xbh[idx0] += combined * (float)(q0 - 8);
+                            if (idx1 < head_dim)
+                                xbh[idx1] += combined * (float)(q1 - 8);
+                        }
+                    }
                 } else {
+                    float v_tmp[512];
                     tq_dequantize_row_q2(vqs, vsc, v_tmp, head_dim);
-                }
-                for (int d = 0; d < head_dim; d++) {
-                    xbh[d] += a * v_tmp[d];
+                    for (int d = 0; d < head_dim; d++) {
+                        xbh[d] += a * v_tmp[d];
+                    }
                 }
             }
 
@@ -1134,16 +1155,15 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                     xbh[d] += a * bits.f;
                 }
             }
-        } else if (s->value_quant_bits == 4 || s->value_quant_bits == 2) {
-            /* Quantized value path: dequantize V per position on the fly.
-             * We dequantize all kv_dim values for the position, then index into it.
-             * Use a stack buffer for the head_dim portion. */
-            float v_tmp[512]; /* max head_dim is 256, safe with margin */
+        } else if (s->value_quant_bits == 4) {
+            /* Fused Q4 domain accumulation: compute weighted sum directly
+             * from packed Q4 nibbles without full dequantization to v_tmp.
+             * out[d] += attn_weight * scale * (nibble - 8)
+             * This saves one intermediate buffer and reduces memory traffic. */
             size_t layer_off_qs = (size_t)l * max_seq * s->value_stride_qs;
             size_t layer_off_sc = (size_t)l * max_seq * s->value_stride_scales;
             int n_blocks_per_head = (head_dim + 31) / 32;
-            size_t packed_per_block = (s->value_quant_bits == 4) ? 16 : 8;
-            /* Offset within a position's quantized data to reach kv_h's head */
+            size_t packed_per_block = 16;
             size_t head_qs_off = (size_t)kv_h * n_blocks_per_head * packed_per_block;
             size_t head_sc_off = (size_t)kv_h * n_blocks_per_head;
             for (int t = 0; t < seq_len; t++) {
@@ -1153,11 +1173,81 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                     + (size_t)t * s->value_stride_qs + head_qs_off;
                 const float* vsc = s->value_cache_scales + layer_off_sc
                     + (size_t)t * s->value_stride_scales + head_sc_off;
-                if (s->value_quant_bits == 4) {
-                    tq_dequantize_row_q4(vqs, vsc, v_tmp, head_dim);
-                } else {
-                    tq_dequantize_row_q2(vqs, vsc, v_tmp, head_dim);
+                for (int b = 0; b < n_blocks_per_head; b++) {
+                    float combined = a * vsc[b];
+                    const uint8_t* bqs = vqs + (size_t)b * 16;
+#ifdef __ARM_NEON
+                    float32x4_t vc = vdupq_n_f32(combined);
+                    float32x4_t v8 = vdupq_n_f32(8.0f);
+                    for (int j = 0; j < 16; j += 4) {
+                        /* Unpack 4 bytes -> 8 Q4 values */
+                        int base = b * 32 + 2 * j;
+                        if (base + 7 >= head_dim) {
+                            /* Scalar tail for partial blocks */
+                            for (int jj = j; jj < 16 && b * 32 + 2 * jj + 1 < head_dim; jj++) {
+                                int q0 = bqs[jj] & 0xF;
+                                int q1 = bqs[jj] >> 4;
+                                xbh[b * 32 + 2 * jj]     += combined * (float)(q0 - 8);
+                                xbh[b * 32 + 2 * jj + 1] += combined * (float)(q1 - 8);
+                            }
+                            break;
+                        }
+                        /* Low nibbles: 4 values at even positions */
+                        float lo0 = (float)(bqs[j]   & 0xF);
+                        float lo1 = (float)(bqs[j+1] & 0xF);
+                        float lo2 = (float)(bqs[j+2] & 0xF);
+                        float lo3 = (float)(bqs[j+3] & 0xF);
+                        float32x4_t vlo = {lo0, lo1, lo2, lo3};
+                        vlo = vsubq_f32(vlo, v8);
+
+                        /* High nibbles: 4 values at odd positions */
+                        float hi0 = (float)(bqs[j]   >> 4);
+                        float hi1 = (float)(bqs[j+1] >> 4);
+                        float hi2 = (float)(bqs[j+2] >> 4);
+                        float hi3 = (float)(bqs[j+3] >> 4);
+                        float32x4_t vhi = {hi0, hi1, hi2, hi3};
+                        vhi = vsubq_f32(vhi, v8);
+
+                        /* Interleave: [lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3] */
+                        float32x4x2_t interleaved = vzipq_f32(vlo, vhi);
+
+                        float32x4_t vx0 = vld1q_f32(xbh + base);
+                        float32x4_t vx1 = vld1q_f32(xbh + base + 4);
+                        vst1q_f32(xbh + base,     vfmaq_f32(vx0, vc, interleaved.val[0]));
+                        vst1q_f32(xbh + base + 4, vfmaq_f32(vx1, vc, interleaved.val[1]));
+                    }
+#else
+                    for (int j = 0; j < 16; j++) {
+                        int idx0 = b * 32 + 2 * j;
+                        int idx1 = idx0 + 1;
+                        if (idx0 >= head_dim) break;
+                        int q0 = bqs[j] & 0xF;
+                        int q1 = bqs[j] >> 4;
+                        xbh[idx0] += combined * (float)(q0 - 8);
+                        if (idx1 < head_dim)
+                            xbh[idx1] += combined * (float)(q1 - 8);
+                    }
+#endif
                 }
+            }
+        } else if (s->value_quant_bits == 2) {
+            /* Q2 value path: dequantize and accumulate.
+             * Q2 has a more complex codebook, so we keep the dequant path. */
+            float v_tmp[512]; /* max head_dim is 256, safe with margin */
+            size_t layer_off_qs = (size_t)l * max_seq * s->value_stride_qs;
+            size_t layer_off_sc = (size_t)l * max_seq * s->value_stride_scales;
+            int n_blocks_per_head = (head_dim + 31) / 32;
+            size_t packed_per_block = 8;
+            size_t head_qs_off = (size_t)kv_h * n_blocks_per_head * packed_per_block;
+            size_t head_sc_off = (size_t)kv_h * n_blocks_per_head;
+            for (int t = 0; t < seq_len; t++) {
+                float a = atth[t];
+                if (a == 0.0f) continue;
+                const uint8_t* vqs = s->value_cache_qs + layer_off_qs
+                    + (size_t)t * s->value_stride_qs + head_qs_off;
+                const float* vsc = s->value_cache_scales + layer_off_sc
+                    + (size_t)t * s->value_stride_scales + head_sc_off;
+                tq_dequantize_row_q2(vqs, vsc, v_tmp, head_dim);
 #ifdef __ARM_NEON
                 float32x4_t va = vdupq_n_f32(a);
                 int d = 0;
@@ -1353,10 +1443,29 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
         /* else: skip (should not happen for valid models) */
 
-        /* FFN Block — SwiGLU (Qwen3.5) or GeGLU (Gemma3).
+        /* FFN Block — MoE or Dense SwiGLU/GeGLU */
+
+        /* MoE FFN path: route to top-K experts + shared expert */
+        if (layer->moe && s->moe_state && model->moe_config) {
+            float* ffn_norm_w = layer->ffn_norm;
+            if (is_gemma3 && layer->pre_ffn_norm)
+                ffn_norm_w = layer->pre_ffn_norm;
+            tq_rmsnorm(s->xb, s->x, ffn_norm_w, dim, c->rms_norm_eps);
+
+            tq_moe_forward((const tq_moe_layer_t*)layer->moe,
+                           (const tq_moe_config_t*)model->moe_config,
+                           (tq_moe_state_t*)s->moe_state,
+                           s->xb, s->xb2, dim);
+
+            if (is_gemma3 && layer->post_ffn_norm)
+                tq_rmsnorm(s->xb2, s->xb2, layer->post_ffn_norm, dim, c->rms_norm_eps);
+
+            tq_add(s->x, s->x, s->xb2, dim);
+        }
+        /* Dense FFN path — SwiGLU (Qwen3.5) or GeGLU (Gemma3).
          * Optimization: cache Q8 quantization of xb for gate+up projections,
          * and cache Q8 of hb for down projection. */
-        if ((layer->w_gate || layer->w_gate_q8 || layer->w_gate_q4 || layer->w_gate_q2) &&
+        else if ((layer->w_gate || layer->w_gate_q8 || layer->w_gate_q4 || layer->w_gate_q2) &&
             (layer->w_up || layer->w_up_q8 || layer->w_up_q4 || layer->w_up_q2) &&
             (layer->w_down || layer->w_down_q8 || layer->w_down_q4 || layer->w_down_q2)) {
 

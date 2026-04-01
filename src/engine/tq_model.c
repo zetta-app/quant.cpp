@@ -17,6 +17,7 @@
  */
 
 #include "turboquant/tq_engine.h"
+#include "turboquant/tq_gguf.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -568,16 +569,23 @@ static tq_model_t* tq_load_safetensors(const char* path);
 tq_model_t* tq_load_model(const char* path) {
     if (!path) return NULL;
 
-    /* Check magic bytes to detect TQM format */
+    /* Check magic bytes to detect format */
     FILE* probe = fopen(path, "rb");
     if (probe) {
         uint32_t magic = 0;
-        if (fread(&magic, 4, 1, probe) == 1 && magic == TQM_MAGIC) {
+        if (fread(&magic, 4, 1, probe) == 1) {
             fclose(probe);
-            fprintf(stderr, "tq_load_model: detected TQM format, using fast loader\n");
-            return tq_load_tqm(path);
+            if (magic == TQM_MAGIC) {
+                fprintf(stderr, "tq_load_model: detected TQM format, using fast loader\n");
+                return tq_load_tqm(path);
+            }
+            if (magic == 0x46475547) { /* "GGUF" */
+                fprintf(stderr, "tq_load_model: detected GGUF format\n");
+                return tq_load_gguf(path);
+            }
+        } else {
+            fclose(probe);
         }
-        fclose(probe);
     }
 
     /* Fall through to safetensors loader */
@@ -2425,6 +2433,371 @@ static int tqm_write_pad(FILE* f, uint64_t current_offset) {
     return 0;
 }
 
+/* ============================================================
+ * GGUF model loader — loads community GGUF models (Q2_K..IQ4_XS)
+ *
+ * Strategy:
+ *   - mmap the entire GGUF file via tq_gguf_open()
+ *   - Extract model config from GGUF metadata
+ *   - For attention weights: keep pointers into mmap (dequant on-the-fly)
+ *   - For MoE experts: keep pointers into mmap (demand-paged by OS)
+ *   - Router weights + norms: dequant to FP32 at load time (small)
+ *   - Embeddings: keep as mmap'd BF16/F16 or dequant
+ * ============================================================ */
+
+/* Helper: find a GGUF tensor with fallback name patterns */
+static const tq_gguf_tensor_t* find_gguf_tensor(const tq_gguf_ctx_t* ctx,
+                                                  const char* name) {
+    const tq_gguf_tensor_t* t = tq_gguf_find_tensor(ctx, name);
+    if (t) return t;
+    /* Try without "blk." prefix variants */
+    return NULL;
+}
+
+/* Helper: dequant a GGUF tensor to FP32, returns malloc'd buffer */
+static float* dequant_tensor_fp32(const tq_gguf_tensor_t* t) {
+    if (!t || !t->data) return NULL;
+    int64_t n_elem = 1;
+    for (uint32_t d = 0; d < t->n_dims; d++) n_elem *= t->shape[d];
+    float* out = (float*)malloc((size_t)n_elem * sizeof(float));
+    if (!out) return NULL;
+    tq_dequant_row_gguf(t->type, t->data, out, (int)n_elem);
+    return out;
+}
+
+tq_model_t* tq_load_gguf(const char* path) {
+    if (!path) return NULL;
+
+    /* Open GGUF file */
+    tq_gguf_ctx_t* gguf = tq_gguf_open(path);
+    if (!gguf) {
+        fprintf(stderr, "tq_load_gguf: failed to open '%s'\n", path);
+        return NULL;
+    }
+
+    fprintf(stderr, "tq_load_gguf: GGUF v%u, %llu tensors, %llu metadata keys\n",
+            gguf->version, (unsigned long long)gguf->n_tensors,
+            (unsigned long long)gguf->n_kv);
+    fprintf(stderr, "tq_load_gguf: architecture = '%s'\n", gguf->arch);
+
+    /* Extract model configuration from GGUF metadata */
+    tq_model_t* model = (tq_model_t*)calloc(1, sizeof(tq_model_t));
+    if (!model) { tq_gguf_close(gguf); return NULL; }
+
+    tq_model_config_t* c = &model->config;
+    char key[256];
+
+    /* Helper macro for arch-prefixed metadata keys */
+    #define GGUF_KEY(suffix) (snprintf(key, sizeof(key), "%s." suffix, gguf->arch), key)
+
+    c->n_layers         = tq_gguf_get_i32(gguf, GGUF_KEY("block_count"), 0);
+    c->hidden_dim       = tq_gguf_get_i32(gguf, GGUF_KEY("embedding_length"), 0);
+    c->intermediate_dim = tq_gguf_get_i32(gguf, GGUF_KEY("feed_forward_length"), 0);
+    c->n_heads          = tq_gguf_get_i32(gguf, GGUF_KEY("attention.head_count"), 0);
+    c->n_kv_heads       = tq_gguf_get_i32(gguf, GGUF_KEY("attention.head_count_kv"), c->n_heads);
+    c->vocab_size       = (int)tq_gguf_get_u32(gguf, GGUF_KEY("vocab_size"),
+                            tq_gguf_get_u32(gguf, "tokenizer.ggml.tokens", 0));
+    c->max_seq_len      = tq_gguf_get_i32(gguf, GGUF_KEY("context_length"), 131072);
+    c->rope_freq_base   = tq_gguf_get_f32(gguf, GGUF_KEY("rope.freq_base"), 1000000.0f);
+    c->rms_norm_eps     = tq_gguf_get_f32(gguf, GGUF_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
+
+    /* Cap context for memory safety on small machines */
+    if (c->max_seq_len > 131072) c->max_seq_len = 131072;
+
+    /* Compute head_dim */
+    if (c->n_heads > 0) c->head_dim = c->hidden_dim / c->n_heads;
+
+    /* MoE configuration */
+    c->num_experts        = tq_gguf_get_i32(gguf, GGUF_KEY("expert_count"), 0);
+    c->num_active_experts = tq_gguf_get_i32(gguf, GGUF_KEY("expert_used_count"), 0);
+    c->is_moe = (c->num_experts > 0);
+
+    if (c->is_moe) {
+        /* Try to get expert FFN dim from metadata, or infer from tensor shapes */
+        c->expert_intermediate_dim = tq_gguf_get_i32(gguf,
+            GGUF_KEY("expert_feed_forward_length"), 0);
+
+        /* Check for shared expert */
+        char shared_name[128];
+        snprintf(shared_name, sizeof(shared_name), "blk.0.ffn_gate_shexp.weight");
+        c->has_shared_expert = (tq_gguf_find_tensor(gguf, shared_name) != NULL) ? 1 : 0;
+        c->shared_expert_intermediate_dim = tq_gguf_get_i32(gguf,
+            GGUF_KEY("expert_shared_feed_forward_length"), 0);
+
+        /* Infer expert_intermediate_dim from tensor shape if not in metadata */
+        if (c->expert_intermediate_dim == 0) {
+            snprintf(shared_name, sizeof(shared_name), "blk.0.ffn_gate_exps.weight");
+            const tq_gguf_tensor_t* exp_t = tq_gguf_find_tensor(gguf, shared_name);
+            if (exp_t && exp_t->n_dims == 3) {
+                /* Shape: [num_experts, expert_inter_dim, hidden_dim] */
+                c->expert_intermediate_dim = (int)exp_t->shape[1];
+            }
+        }
+
+        fprintf(stderr, "tq_load_gguf: MoE — %d experts, %d active, expert_dim=%d, shared=%d\n",
+                c->num_experts, c->num_active_experts,
+                c->expert_intermediate_dim, c->has_shared_expert);
+    }
+
+    /* Model type detection */
+    if (c->is_moe) {
+        c->model_type = 2; /* qwen2moe / qwen3.5 moe */
+    } else {
+        c->model_type = 0; /* default qwen35 */
+    }
+
+    fprintf(stderr, "tq_load_gguf: config — layers=%d, dim=%d, heads=%d/%d, head_dim=%d, vocab=%d\n",
+            c->n_layers, c->hidden_dim, c->n_heads, c->n_kv_heads, c->head_dim, c->vocab_size);
+
+    if (c->n_layers == 0 || c->hidden_dim == 0) {
+        fprintf(stderr, "tq_load_gguf: invalid config, aborting\n");
+        free(model);
+        tq_gguf_close(gguf);
+        return NULL;
+    }
+
+    /* Store GGUF context in model for lifetime management */
+    model->gguf_ctx = gguf;
+
+    /* Allocate per-layer weights */
+    model->layers = (tq_layer_weights_t*)calloc((size_t)c->n_layers, sizeof(tq_layer_weights_t));
+    if (!model->layers) {
+        free(model);
+        tq_gguf_close(gguf);
+        return NULL;
+    }
+
+    /* MoE config storage */
+    tq_moe_config_t* moe_cfg = NULL;
+    if (c->is_moe) {
+        moe_cfg = (tq_moe_config_t*)calloc(1, sizeof(tq_moe_config_t));
+        moe_cfg->num_experts = c->num_experts;
+        moe_cfg->num_active = c->num_active_experts;
+        moe_cfg->expert_intermediate_dim = c->expert_intermediate_dim;
+        moe_cfg->has_shared_expert = c->has_shared_expert;
+        moe_cfg->shared_expert_intermediate_dim = c->shared_expert_intermediate_dim;
+        moe_cfg->norm_topk_prob = 1;
+        model->moe_config = moe_cfg;
+    }
+
+    /* Load per-layer weights */
+    char tname[256];
+    int n_attn_layers = 0;
+    int attn_indices[256]; /* max layers */
+
+    for (int l = 0; l < c->n_layers; l++) {
+        tq_layer_weights_t* layer = &model->layers[l];
+
+        /* RMSNorm weights (always FP32 in GGUF, dequant to FP32) */
+        snprintf(tname, sizeof(tname), "blk.%d.attn_norm.weight", l);
+        const tq_gguf_tensor_t* t = find_gguf_tensor(gguf, tname);
+        if (t) layer->attn_norm = dequant_tensor_fp32(t);
+
+        snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", l);
+        t = find_gguf_tensor(gguf, tname);
+        if (t) layer->ffn_norm = dequant_tensor_fp32(t);
+
+        /* QK-norm (optional) */
+        snprintf(tname, sizeof(tname), "blk.%d.attn_q_norm.weight", l);
+        t = find_gguf_tensor(gguf, tname);
+        if (t) { layer->q_norm = dequant_tensor_fp32(t); c->use_qk_norm = 1; }
+
+        snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", l);
+        t = find_gguf_tensor(gguf, tname);
+        if (t) layer->k_norm = dequant_tensor_fp32(t);
+
+        /* Attention weights — keep as GGUF quantized pointers for on-the-fly dequant.
+         * We store the raw data pointer + type info using a small struct packed into
+         * the existing FP32 weight pointer fields. For GGUF models, we use a special
+         * dispatch: if gguf_ctx is non-NULL, the forward pass uses tq_matmul_gguf. */
+        snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
+        t = find_gguf_tensor(gguf, tname);
+        int is_attn_layer = (t != NULL);
+        if (is_attn_layer) {
+            /* For now, dequant attention weights to FP32 at load time.
+             * These are used every token and are not MoE, so the cost is fixed.
+             * For 30B models with 10 attn layers, this is manageable (~500MB). */
+            layer->wq = dequant_tensor_fp32(t);
+
+            snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->wk = dequant_tensor_fp32(t);
+
+            snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->wv = dequant_tensor_fp32(t);
+
+            snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->wo = dequant_tensor_fp32(t);
+
+            attn_indices[n_attn_layers++] = l;
+        }
+
+        /* Check for DeltaNet weights */
+        snprintf(tname, sizeof(tname), "blk.%d.ssm_a_log", l);
+        t = find_gguf_tensor(gguf, tname);
+        if (!t) {
+            snprintf(tname, sizeof(tname), "blk.%d.time_decay", l);
+            t = find_gguf_tensor(gguf, tname);
+        }
+        if (t) {
+            layer->delta_a_log = dequant_tensor_fp32(t);
+            /* Load remaining DeltaNet tensors... */
+            /* TODO: full DeltaNet GGUF loading for hybrid models */
+        }
+
+        /* FFN weights */
+        if (c->is_moe) {
+            /* Check if this layer has MoE or dense FFN */
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_inp.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) {
+                /* MoE layer: allocate and set up expert pointers */
+                tq_moe_layer_t* moe = (tq_moe_layer_t*)calloc(1, sizeof(tq_moe_layer_t));
+                moe->experts = (tq_expert_weights_t*)calloc((size_t)c->num_experts,
+                                                              sizeof(tq_expert_weights_t));
+
+                /* Router weights (small, always dequant to FP32) */
+                moe->router_weight = dequant_tensor_fp32(t);
+
+                /* Expert weights: shape [num_experts, expert_dim, hidden_dim]
+                 * For GGUF, these are stored as 3D tensors. Each expert's
+                 * weights are a contiguous slice within the tensor. */
+                snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_exps.weight", l);
+                const tq_gguf_tensor_t* gate_t = find_gguf_tensor(gguf, tname);
+                snprintf(tname, sizeof(tname), "blk.%d.ffn_up_exps.weight", l);
+                const tq_gguf_tensor_t* up_t = find_gguf_tensor(gguf, tname);
+                snprintf(tname, sizeof(tname), "blk.%d.ffn_down_exps.weight", l);
+                const tq_gguf_tensor_t* down_t = find_gguf_tensor(gguf, tname);
+
+                if (gate_t && up_t && down_t) {
+                    int exp_inter = c->expert_intermediate_dim;
+                    /* Each expert's gate/up weight: [expert_inter, hidden_dim]
+                     * Stored contiguously: expert[i] starts at offset i * expert_size */
+                    size_t gate_exp_size = tq_ggml_type_size(gate_t->type) *
+                        ((size_t)exp_inter * c->hidden_dim / tq_ggml_type_blck(gate_t->type));
+                    size_t up_exp_size = tq_ggml_type_size(up_t->type) *
+                        ((size_t)exp_inter * c->hidden_dim / tq_ggml_type_blck(up_t->type));
+                    size_t down_exp_size = tq_ggml_type_size(down_t->type) *
+                        ((size_t)c->hidden_dim * exp_inter / tq_ggml_type_blck(down_t->type));
+
+                    for (int e = 0; e < c->num_experts; e++) {
+                        moe->experts[e].w_gate = (const uint8_t*)gate_t->data + e * gate_exp_size;
+                        moe->experts[e].gate_type = gate_t->type;
+                        moe->experts[e].w_up = (const uint8_t*)up_t->data + e * up_exp_size;
+                        moe->experts[e].up_type = up_t->type;
+                        moe->experts[e].w_down = (const uint8_t*)down_t->data + e * down_exp_size;
+                        moe->experts[e].down_type = down_t->type;
+                    }
+                }
+
+                /* Shared expert (if present) */
+                if (c->has_shared_expert) {
+                    snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_shexp.weight", l);
+                    t = find_gguf_tensor(gguf, tname);
+                    if (t) {
+                        moe->shared_expert.w_gate = t->data;
+                        moe->shared_expert.gate_type = t->type;
+                    }
+                    snprintf(tname, sizeof(tname), "blk.%d.ffn_up_shexp.weight", l);
+                    t = find_gguf_tensor(gguf, tname);
+                    if (t) {
+                        moe->shared_expert.w_up = t->data;
+                        moe->shared_expert.up_type = t->type;
+                    }
+                    snprintf(tname, sizeof(tname), "blk.%d.ffn_down_shexp.weight", l);
+                    t = find_gguf_tensor(gguf, tname);
+                    if (t) {
+                        moe->shared_expert.w_down = t->data;
+                        moe->shared_expert.down_type = t->type;
+                    }
+                    snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_shexp_gate.weight", l);
+                    t = find_gguf_tensor(gguf, tname);
+                    if (t) moe->shared_gate = dequant_tensor_fp32(t);
+                }
+
+                layer->moe = moe;
+            } else {
+                /* Dense FFN in an otherwise MoE model */
+                snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
+                t = find_gguf_tensor(gguf, tname);
+                if (t) layer->w_gate = dequant_tensor_fp32(t);
+                snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
+                t = find_gguf_tensor(gguf, tname);
+                if (t) layer->w_up = dequant_tensor_fp32(t);
+                snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
+                t = find_gguf_tensor(gguf, tname);
+                if (t) layer->w_down = dequant_tensor_fp32(t);
+            }
+        } else {
+            /* Dense model: load FFN weights (dequant to FP32) */
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->w_gate = dequant_tensor_fp32(t);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->w_up = dequant_tensor_fp32(t);
+            snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->w_down = dequant_tensor_fp32(t);
+        }
+    }
+
+    /* Hybrid architecture: record which layers have self_attn */
+    model->n_attn_layers = n_attn_layers;
+    if (n_attn_layers > 0 && n_attn_layers < c->n_layers) {
+        model->attn_layer_indices = (int*)malloc((size_t)n_attn_layers * sizeof(int));
+        memcpy(model->attn_layer_indices, attn_indices, (size_t)n_attn_layers * sizeof(int));
+        fprintf(stderr, "tq_load_gguf: hybrid architecture — %d attn layers out of %d total\n",
+                n_attn_layers, c->n_layers);
+    }
+
+    /* Load embedding + output weights */
+    const tq_gguf_tensor_t* emb_t = find_gguf_tensor(gguf, "token_embd.weight");
+    if (emb_t) {
+        if (emb_t->type == TQ_GGML_TYPE_F32) {
+            model->token_embedding = (float*)emb_t->data;
+        } else if (emb_t->type == TQ_GGML_TYPE_BF16 || emb_t->type == TQ_GGML_TYPE_F16) {
+            /* Keep as-is for streaming dequant */
+            model->embed_bf16 = (const uint16_t*)emb_t->data;
+        } else {
+            model->token_embedding = dequant_tensor_fp32(emb_t);
+        }
+    }
+
+    /* Get vocab size from embedding tensor shape if not in metadata */
+    if (c->vocab_size == 0 && emb_t && emb_t->n_dims >= 2) {
+        c->vocab_size = (int)emb_t->shape[1]; /* shape: [hidden_dim, vocab_size] in GGUF row-major */
+    }
+
+    const tq_gguf_tensor_t* out_t = find_gguf_tensor(gguf, "output.weight");
+    if (out_t) {
+        if (out_t->type == TQ_GGML_TYPE_F32) {
+            model->output_weight = (float*)out_t->data;
+        } else if (out_t->type == TQ_GGML_TYPE_BF16 || out_t->type == TQ_GGML_TYPE_F16) {
+            model->output_weight_bf16 = (const uint16_t*)out_t->data;
+        } else {
+            model->output_weight = dequant_tensor_fp32(out_t);
+        }
+    } else {
+        /* Weight tying: output weight = embedding weight */
+        model->output_weight = model->token_embedding;
+        model->output_weight_bf16 = model->embed_bf16;
+    }
+
+    const tq_gguf_tensor_t* onorm_t = find_gguf_tensor(gguf, "output_norm.weight");
+    if (onorm_t) model->output_norm = dequant_tensor_fp32(onorm_t);
+
+    fprintf(stderr, "tq_load_gguf: loaded %d layers (%d self_attn%s), dim=%d, heads=%d/%d, vocab=%d\n",
+            c->n_layers, n_attn_layers,
+            c->is_moe ? ", MoE" : "",
+            c->hidden_dim, c->n_heads, c->n_kv_heads, c->vocab_size);
+
+    #undef GGUF_KEY
+    return model;
+}
+
 int tq_save_tqm(tq_model_t* model, const char* tokenizer_path,
                 const char* output_path) {
     if (!model || !output_path) return -1;
@@ -2699,6 +3072,27 @@ void tq_free_model(tq_model_t* model) {
     free(model->_q2_data);
     free(model->attn_layer_indices);
     free(model->layer_is_sliding);
+
+    /* Free MoE resources */
+    if (model->config.is_moe && model->layers) {
+        for (int l = 0; l < model->config.n_layers; l++) {
+            tq_moe_layer_t* moe = (tq_moe_layer_t*)model->layers[l].moe;
+            if (moe) {
+                free(moe->router_weight);
+                free(moe->shared_gate);
+                free(moe->experts);
+                free(moe);
+            }
+        }
+    }
+    free(model->moe_config);
     free(model->layers);
+
+    /* Free GGUF context (handles munmap internally) */
+    if (model->gguf_ctx) {
+        tq_gguf_close((tq_gguf_ctx_t*)model->gguf_ctx);
+        model->_mmap_data = NULL; /* gguf_close handled it */
+    }
+
     free(model);
 }

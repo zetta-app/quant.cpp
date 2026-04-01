@@ -35,8 +35,16 @@ typedef struct {
     int use_qk_norm;         /* 1 if q_norm/k_norm weights present */
     int attn_output_gate;    /* 1 if q_proj includes output gate (doubled q_proj output) */
 
+    /* MoE (Mixture of Experts) configuration */
+    int is_moe;              /* 1 if model uses MoE FFN layers */
+    int num_experts;         /* total experts per MoE layer (e.g., 64) */
+    int num_active_experts;  /* active experts per token (e.g., 8) */
+    int expert_intermediate_dim; /* per-expert FFN intermediate dim */
+    int has_shared_expert;   /* 1 if shared expert present */
+    int shared_expert_intermediate_dim;
+
     /* Multi-architecture support */
-    int model_type;          /* 0=qwen35, 1=gemma3 */
+    int model_type;          /* 0=qwen35, 1=gemma3, 2=qwen2moe */
     int sliding_window;      /* sliding window size (512 for gemma3, 0 for unlimited) */
     float rope_local_base_freq; /* RoPE base freq for local/sliding layers (10000.0 for gemma3) */
     int n_norms_per_block;   /* 2 for qwen35, 4 for gemma3 */
@@ -125,6 +133,9 @@ typedef struct {
     uint8_t* delta_in_proj_b_q2;   float* delta_in_proj_b_q2s;
     uint8_t* delta_out_proj_q2;    float* delta_out_proj_q2s;
 
+    /* MoE expert weights (NULL for dense FFN layers) */
+    void* moe;               /* tq_moe_layer_t* (from tq_gguf.h), NULL if dense */
+
     /* DeltaNet (linear_attention) weights (NULL for self_attn layers) */
     float* delta_a_log;       /* [delta_n_heads] decay parameter (log scale) */
     float* delta_conv1d;      /* [qkv_dim, 1, conv_width] */
@@ -180,6 +191,12 @@ typedef struct {
     int use_q2_weights;       /* 1 if layer weights are Q2-quantized */
     void* _q2_data;           /* heap buffer for all Q2 quantized weights */
     size_t _q2_size;
+
+    /* GGUF context (non-NULL when loaded from GGUF, owns mmap lifetime) */
+    void* gguf_ctx;           /* tq_gguf_ctx_t* */
+
+    /* MoE config (valid when config.is_moe) */
+    void* moe_config;         /* tq_moe_config_t* */
 
     /* Memory management — supports multi-shard safetensors */
 #define TQ_MAX_SHARDS 16
@@ -263,6 +280,9 @@ typedef struct {
     /* V highres window: store recent N tokens as FP16 even when V is quantized */
     int v_highres_window;       /* number of recent tokens stored as FP16 (0 = disabled) */
     uint16_t* value_highres_fp16; /* FP16 V cache for recent tokens [n_layers, window, kv_dim] */
+
+    /* MoE runtime state */
+    void* moe_state;         /* tq_moe_state_t* (from tq_gguf.h), NULL if dense */
 
     /* Quantized KV cache for integer attention */
     void* quant_key_cache;   /* [n_layers, max_seq_len, n_kv_heads, blocks_per_head * type_size] */
@@ -366,9 +386,16 @@ typedef struct {
     int32_t n_norms_per_block;/* 2 for qwen35, 4 for gemma3 */
     float   query_pre_attn_scalar; /* attention scaling (0=use head_dim) */
 
-    /* Padding to 512 bytes.
-     * With pack(1): 376 + 20 = 396 used, 116 pad */
-    uint8_t _pad[116];
+    /* MoE fields */
+    int32_t is_moe;
+    int32_t num_experts;
+    int32_t num_active_experts;
+    int32_t expert_intermediate_dim;
+    int32_t has_shared_expert;
+    int32_t shared_expert_intermediate_dim;
+
+    /* Padding to 512 bytes */
+    uint8_t _pad[92];
 } tqm_header_t;
 #pragma pack(pop)
 
@@ -377,8 +404,9 @@ typedef struct {
  * ============================================================ */
 
 /* Model loading */
-tq_model_t* tq_load_model(const char* path);
-tq_model_t* tq_load_tqm(const char* path);
+tq_model_t* tq_load_model(const char* path);  /* auto-detect format */
+tq_model_t* tq_load_tqm(const char* path);    /* TQM format */
+tq_model_t* tq_load_gguf(const char* path);   /* GGUF format */
 int tq_save_tqm(tq_model_t* model, const char* tokenizer_path,
                 const char* output_path);
 void tq_free_model(tq_model_t* model);

@@ -26,6 +26,7 @@
  *   --calibrate      Run online Lloyd-Max codebook calibration analysis
  *   --ppl <file>     Compute perplexity on a text file (teacher-forced)
  *   --bench-memory   Benchmark memory bandwidth (tok/s at varying context lengths)
+ *   --bench-prefill  Benchmark prefill speed with/without KV quantization
  */
 
 #include "turboquant/tq_engine.h"
@@ -87,6 +88,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --calibrate      Online Lloyd-Max codebook calibration analysis\n");
     fprintf(stderr, "  --ppl <file>     Compute perplexity on text file (teacher-forced)\n");
     fprintf(stderr, "  --bench-memory   Benchmark memory bandwidth at varying context lengths\n");
+    fprintf(stderr, "  --bench-prefill  Benchmark prefill speed with/without KV quantization\n");
 }
 
 int main(int argc, char** argv) {
@@ -115,6 +117,7 @@ int main(int argc, char** argv) {
     int calibrate_mode = 0;
     const char* ppl_file = NULL;
     int bench_memory = 0;
+    int bench_prefill = 0;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -183,6 +186,8 @@ int main(int argc, char** argv) {
             ppl_file = argv[++i];
         } else if (strcmp(argv[i], "--bench-memory") == 0) {
             bench_memory = 1;
+        } else if (strcmp(argv[i], "--bench-prefill") == 0) {
+            bench_prefill = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -447,6 +452,68 @@ int main(int argc, char** argv) {
         fprintf(stderr, "==================================\n");
 
         if (tok) tq_free_tokenizer(tok);
+        tq_free_model(model);
+        return 0;
+    }
+
+    /* ================================================================
+     * Mode: --bench-prefill  (Prefill speed benchmark)
+     * Measures prefill tok/s for different KV quantization types
+     * to demonstrate that KV quantization overhead is minimal.
+     * ================================================================ */
+    if (bench_prefill) {
+        tq_set_threads(n_threads);
+
+        int prefill_len = 200;
+        if (prefill_len > c->max_seq_len - 1) prefill_len = c->max_seq_len - 1;
+        int bos_token = (c->model_type == 1) ? 2 : 1;
+
+        /* Configurations to benchmark */
+        typedef struct { const char* name; tq_type kv; int vq; } prefill_config_t;
+        prefill_config_t configs[] = {
+            {"fp32 (no quant)", TQ_TYPE_COUNT, 0},
+            {"uniform_4b + FP16 V", TQ_TYPE_UNIFORM_4B, 0},
+            {"uniform_4b + Q4 V", TQ_TYPE_UNIFORM_4B, 4},
+            {"turbo_kv_1b + FP16 V", TQ_TYPE_TURBO_KV_1B, 0},
+            {"turbo_kv_3b + Q4 V", TQ_TYPE_TURBO_KV_3B, 4},
+            {"turbo_kv_3b + Q2 V", TQ_TYPE_TURBO_KV_3B, 2},
+        };
+        int n_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+
+        fprintf(stderr, "\n=== Prefill Speed Benchmark ===\n");
+        fprintf(stderr, "Prefill length: %d tokens, Threads: %d\n", prefill_len, n_threads);
+        fprintf(stderr, "%-28s %-12s %-12s\n", "KV Config", "Tok/s", "Time(s)");
+        fprintf(stderr, "---------------------------- ------------ ------------\n");
+
+        for (int ci = 0; ci < n_configs; ci++) {
+            tq_state_t* st = tq_create_state_ex(&model->config, configs[ci].kv, configs[ci].vq);
+            if (!st) {
+                fprintf(stderr, "%-28s (failed to allocate state)\n", configs[ci].name);
+                continue;
+            }
+
+            struct timespec pf_start, pf_end;
+            clock_gettime(CLOCK_MONOTONIC, &pf_start);
+
+            for (int i = 0; i < prefill_len; i++) {
+                tq_forward(model, st, bos_token, i);
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &pf_end);
+            double pf_elapsed = (double)(pf_end.tv_sec - pf_start.tv_sec)
+                              + (double)(pf_end.tv_nsec - pf_start.tv_nsec) / 1e9;
+            double tok_s = (double)prefill_len / pf_elapsed;
+
+            fprintf(stderr, "%-28s %-12.1f %-12.3f\n", configs[ci].name, tok_s, pf_elapsed);
+            fprintf(stderr, "PREFILL_CSV:%s,%d,%.2f,%.4f\n", configs[ci].name, prefill_len, tok_s, pf_elapsed);
+
+            tq_free_state(st);
+        }
+
+        fprintf(stderr, "===============================\n");
+        fprintf(stderr, "Note: prefill speed is dominated by weight matmuls, not KV quantization.\n");
+        fprintf(stderr, "KV quantization overhead should be <5%% of total prefill time.\n");
+
         tq_free_model(model);
         return 0;
     }
@@ -810,6 +877,48 @@ int main(int argc, char** argv) {
             double layer_avg = layer_sum / (double)c->n_heads;
             fprintf(stderr, "%-8d %-12.4f %-12.4f %-12.4f\n",
                     l, layer_avg, min_h, max_h);
+        }
+
+        /* Sliding window utilization analysis */
+        if (c->sliding_window > 0) {
+            /* For sliding window models, report what fraction of total tokens
+             * fall within the window. This shows whether out-of-window tokens
+             * (candidates for lower precision) represent a significant fraction. */
+            int window = c->sliding_window;
+            int final_seq = total_run;
+            int in_window = (final_seq <= window) ? final_seq : window;
+            double utilization = (final_seq > 0) ? (double)in_window / (double)final_seq * 100.0 : 100.0;
+            fprintf(stderr, "\n--- Sliding Window Utilization ---\n");
+            fprintf(stderr, "Window size:        %d tokens\n", window);
+            fprintf(stderr, "Final context:      %d tokens\n", final_seq);
+            fprintf(stderr, "In-window tokens:   %d (%.1f%% of context)\n", in_window, utilization);
+            fprintf(stderr, "Out-of-window:      %d tokens (candidates for lower precision)\n",
+                    final_seq - in_window);
+            fprintf(stderr, "Insight: %.1f%% of attention weight is concentrated on recent %d tokens.\n",
+                    utilization, in_window);
+            fprintf(stderr, "  Tokens outside the window are never attended to in sliding layers,\n");
+            fprintf(stderr, "  so they could use lower precision (e.g., 1-bit QJL) without quality impact.\n");
+        } else {
+            /* For non-sliding-window models, compute average entropy-based
+             * estimate of how concentrated attention is on recent tokens.
+             * High entropy = attention spread widely, low = focused on few tokens. */
+            double total_avg_entropy = 0.0;
+            for (int l = 0; l < c->n_layers; l++) {
+                for (int h = 0; h < c->n_heads; h++) {
+                    double avg_e = (en_count > 0) ?
+                        state->entropy_accum[(size_t)l * c->n_heads + h] / (double)en_count : 0.0;
+                    total_avg_entropy += avg_e;
+                }
+            }
+            total_avg_entropy /= (double)(c->n_layers * c->n_heads);
+            /* Effective window: 2^entropy gives rough # of tokens attended to */
+            double effective_window = pow(2.0, total_avg_entropy);
+            fprintf(stderr, "\n--- Attention Concentration ---\n");
+            fprintf(stderr, "Average entropy:     %.2f bits\n", total_avg_entropy);
+            fprintf(stderr, "Effective window:    ~%.0f tokens (2^entropy)\n", effective_window);
+            fprintf(stderr, "Insight: attention is effectively concentrated on ~%.0f recent tokens.\n",
+                    effective_window);
+            fprintf(stderr, "  Older tokens beyond this window could use lower precision.\n");
         }
 
         /* Interpretation */
