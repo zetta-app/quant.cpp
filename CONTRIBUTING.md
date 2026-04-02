@@ -12,6 +12,30 @@ cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ctest --test-dir build --output-on-failure
 ```
 
+Or with Docker:
+
+```bash
+docker build -t turboquant .
+docker run turboquant models/model.tqm -p "Hello" -k turbo_kv_1b
+```
+
+## Running Tests
+
+```bash
+# All tests
+ctest --test-dir build --output-on-failure
+
+# Specific test
+./build/test_polar
+./build/test_qjl
+
+# With scoring harness (5-dimension evaluation)
+bash score.sh              # Full evaluation
+bash score.sh --quick      # Build + correctness only
+bash score.sh --bench      # Performance benchmarks
+bash score.sh --quality    # Quantization quality metrics
+```
+
 ## What to Work On
 
 Check [Issues](https://github.com/quantumaikr/TurboQuant.cpp/issues) for tasks labeled `good first issue` or `help wanted`.
@@ -22,12 +46,31 @@ Check [Issues](https://github.com/quantumaikr/TurboQuant.cpp/issues) for tasks l
 - Metal GPU compute shaders
 - Long context benchmarks (8K, 32K, 128K tokens)
 
+## Adding a New Model Architecture
+
+1. Add the model config struct to `include/turboquant/tq_engine.h`
+2. Implement the forward pass in `src/engine/` (one file per architecture)
+3. Register the architecture in `tq_load_model()` in `src/engine/tq_model_loader.c`
+4. Add a test in `tests/` and an example in `examples/`
+5. Verify with `bash score.sh --quick`
+
+## Adding a New KV Cache Type
+
+1. Define the type enum in `include/turboquant/tq_types.h` (append to `tq_type` enum)
+2. Add block struct + `static_assert` size check in `include/turboquant/tq_spec.h`
+3. Implement `quantize`/`dequantize`/`attention` in `src/core/tq_<name>.c`
+4. Register in the dispatch table in `src/core/tq_traits.c`
+5. Add unit tests in `tests/test_<name>.cpp`
+6. Update `tools/tq_run.c` to accept the new type name in `parse_kv_type()`
+
 ## Code Standards
 
-- **C11** for core library (`src/`), **C++17** for tests
+- **C11** for core library (`src/`), **C++17** for tests and CUDA/Metal wrappers
 - No external dependencies in core (libc/libm/pthread only)
-- Every public function needs a test
-- Run tests before submitting: `ctest --test-dir build`
+- Every block struct must have `static_assert` size verification
+- Every public function needs a unit test
+- ONNX LSB-first bit-packing convention for all quantized formats
+- Use `refs/` code as algorithm reference -- port to C, don't wrap Python
 
 ## Module Ownership
 
@@ -38,16 +81,10 @@ Each module has exclusive files to prevent merge conflicts:
 | `polar` | `src/core/tq_polar.*`, `tests/test_polar.*` |
 | `qjl` | `src/core/tq_qjl.*`, `tests/test_qjl.*` |
 | `turbo` | `src/core/tq_turbo.*`, `tests/test_turbo.*` |
+| `uniform` | `src/core/tq_uniform.*`, `src/core/tq_value_quant.*` |
 | `engine` | `src/engine/*` |
 | `cache` | `src/cache/*` |
 | `simd` | `src/backend/cpu/*` |
-
-## Pull Request Process
-
-1. Fork and create a feature branch
-2. Make your changes
-3. Ensure all tests pass and no new warnings
-4. Submit a PR with a clear description
 
 ## Cross-Platform Checklist
 
@@ -55,6 +92,14 @@ Before submitting, verify:
 - [ ] NEON intrinsics are inside `#ifdef __ARM_NEON` guards
 - [ ] No GCC warnings (`-Wall -Wextra -Wpedantic`)
 - [ ] Scalar fallback exists for all SIMD code paths
+- [ ] Function pointer types match their typedefs
+
+## Pull Request Process
+
+1. Fork and create a feature branch
+2. Make your changes
+3. Ensure all tests pass and no new warnings
+4. Submit a PR with a clear description
 
 ## License
 

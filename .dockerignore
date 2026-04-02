@@ -1,0 +1,12 @@
+build/
+build-*/
+.git/
+.claude/
+refs/
+models/
+*.gguf
+*.tqm
+*.safetensors
+__pycache__/
+*.pyc
+.venv/
