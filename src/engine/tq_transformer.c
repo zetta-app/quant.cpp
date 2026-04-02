@@ -26,6 +26,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
+#include <limits.h>
 
 /* Unified Q2/1-bit matmul dispatch.
  * When model->use_1bit_weights, Q2 fields contain sign bits + norms,
@@ -273,6 +274,9 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
     } else {
         s->quant_key_cache = NULL;
     }
+
+    /* Note: low-bit KV quantization (1b/2b/3b) with head_dim < 128 is now handled
+     * by expanding sketch_dim to 128 (QJL paper: m/d >= 2). No fallback needed. */
 
     /* MoE state allocation (set up later by tq_load_gguf when model is MoE) */
     s->moe_state = NULL;
@@ -1068,7 +1072,11 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     }
 
     /* Quantize the new key into the quantized cache for integer attention.
-     * Each KV head's key vector is quantized independently into blocks. */
+     * Each KV head's key vector is quantized independently into blocks.
+     *
+     * Note: 1-bit/2b/3b sign-based quantization now expands sketch_dim to
+     * at least 128 bits for small head_dim (QJL paper: m/d >= 2), so no
+     * fallback is needed. */
     int use_int_attn = (s->kv_quant_type < TQ_TYPE_COUNT && s->quant_key_cache != NULL);
     if (use_int_attn) {
         const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
@@ -1087,8 +1095,12 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     /* Multi-head attention */
     TQ_PROF_START(_tp);
     int seq_len = pos + 1;
-    /* Use integer attention when enough cached keys to amortize overhead */
-    int int_attn_threshold = 128; /* only use integer attention for long contexts */
+    /* Integer (Hamming) attention DISABLED: sign-based attention scores have
+     * only ~68% sign accuracy, causing catastrophic PPL explosion at long
+     * sequences. FP32 attention on dequantized keys is used instead.
+     * Memory savings come from 1-bit KV STORAGE, not integer attention.
+     * TODO: fix Hamming attention or implement proper QJL sketch attention. */
+    int int_attn_threshold = INT_MAX; /* effectively disabled */
 
     /* Attention scaling: Gemma3 uses 1/sqrt(query_pre_attn_scalar), others use 1/sqrt(head_dim) */
     float attn_scale_dim = (float)head_dim;
