@@ -48,6 +48,11 @@ extern void tq_turbo_kv_1b_dequantize_ref(const void* src, float* dst, int n);
 extern void tq_turbo_kv_1b_attention_ref(const float* query, const void* kv,
                                           float* scores, int seq_len, int head_dim);
 
+extern void tq_turbo_kv_2b_quantize_ref(const float* src, void* dst, int n);
+extern void tq_turbo_kv_2b_dequantize_ref(const void* src, float* dst, int n);
+extern void tq_turbo_kv_2b_attention_ref(const float* query, const void* kv,
+                                          float* scores, int seq_len, int head_dim);
+
 const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
     [TQ_TYPE_POLAR_3B] = {
         .name       = "polar_3b",
@@ -159,6 +164,16 @@ const tq_type_traits_t TQ_TRAITS[TQ_TYPE_COUNT] = {
         .attention  = tq_turbo_kv_1b_attention_ref,
         .residual_type = TQ_TYPE_COUNT, /* none */
     },
+    [TQ_TYPE_TURBO_KV_2B] = {
+        .name       = "turbo_kv_2b",
+        .block_size = TQ_BK,
+        .type_size  = sizeof(block_tq_turbo_kv_2b),
+        .bpe        = (float)sizeof(block_tq_turbo_kv_2b) * 8.0f / TQ_BK,
+        .quantize   = tq_turbo_kv_2b_quantize_ref,
+        .dequantize = tq_turbo_kv_2b_dequantize_ref,
+        .attention  = tq_turbo_kv_2b_attention_ref,
+        .residual_type = TQ_TYPE_QJL_1B,
+    },
 };
 
 const char* tq_type_name(tq_type type) {
@@ -231,6 +246,9 @@ tq_format_spec_t tq_get_format_spec(tq_type type) {
             spec.flags = TQ_FLAG_HAS_RESIDUAL; break;
         case TQ_TYPE_TURBO_KV_1B:
             spec.algorithm = TQ_ALG_TURBO; spec.key_bits = 1; break;
+        case TQ_TYPE_TURBO_KV_2B:
+            spec.algorithm = TQ_ALG_TURBO; spec.key_bits = 2;
+            spec.flags = TQ_FLAG_HAS_RESIDUAL; break;
         default: break;
     }
     return spec;

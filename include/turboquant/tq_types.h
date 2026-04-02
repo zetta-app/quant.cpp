@@ -52,7 +52,8 @@ typedef enum {
     TQ_TYPE_TURBO_KV_3B = 8, /* TurboQuant KV: 2-bit codebook + 1-bit QJL residual */
     TQ_TYPE_TURBO_KV_4B = 9, /* TurboQuant KV: 3-bit codebook + 1-bit QJL residual */
     TQ_TYPE_TURBO_KV_1B = 10,/* TurboQuant KV: 1-bit Hamming (sign only)           */
-    TQ_TYPE_COUNT     = 11
+    TQ_TYPE_TURBO_KV_2B = 11,/* TurboQuant KV: 2-bit (1-bit codebook + 1-bit QJL) */
+    TQ_TYPE_COUNT     = 12
 } tq_type;
 
 /* ============================================================
@@ -216,6 +217,19 @@ typedef struct {
     uint8_t  signs[TQ_BK / 8]; /* 1 bit per dim = 16 bytes for 128   */
 } block_tq_turbo_kv_1b;
 
+/* TurboQuant KV cache block: 2-bit variant
+ * 1-bit codebook (2 levels, sign only) + 1-bit QJL sign hash
+ * Pipeline: normalize -> RHT -> 1-bit MSE (sign) + 1-bit QJL residual.
+ * Layout: norm(2) + residual_norm(2) + rht_seed(4) + mse_1bit(16) + qjl_signs(16) = 40 bytes
+ */
+typedef struct {
+    uint16_t norm;                     /* L2 norm of original vector (fp16)      */
+    uint16_t residual_norm;            /* L2 norm of residual after MSE (fp16)   */
+    uint32_t rht_seed;                 /* RHT random seed for this block         */
+    uint8_t  mse_indices[TQ_BK / 8];  /* 1-bit packed codebook indices (16B)    */
+    uint8_t  qjl_signs[TQ_BK / 8];    /* 1-bit QJL sign hash on residual (16B) */
+} block_tq_turbo_kv_2b;
+
 /* ============================================================
  * Block size verification (compile-time, C/C++ compatible)
  * Uses negative-size array trick for universal compatibility.
@@ -231,5 +245,6 @@ TQ_CHECK_SIZE(block_tq_mixed_4b8, 4 + TQ_MIXED_OUTLIERS + TQ_MIXED_OUTLIERS * 2 
 TQ_CHECK_SIZE(block_tq_turbo_kv_3b, 8 + TQ_BK / 4 + TQ_BK / 8);
 TQ_CHECK_SIZE(block_tq_turbo_kv_4b, 8 + TQ_BK * 3 / 8 + TQ_BK / 8);
 TQ_CHECK_SIZE(block_tq_turbo_kv_1b, 8 + TQ_BK / 8);
+TQ_CHECK_SIZE(block_tq_turbo_kv_2b, 8 + TQ_BK / 8 + TQ_BK / 8);
 
 #endif /* TQ_TYPES_H */

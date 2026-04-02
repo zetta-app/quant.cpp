@@ -773,3 +773,154 @@ void tq_turbo_kv_1b_attention_ref(const float* query, const void* kv_cache,
         scores[seq] = score;
     }
 }
+
+/* ============================================================
+ * TurboQuant KV 2-bit: 1-bit codebook + 1-bit QJL residual
+ *
+ * Lightweight 2-bit variant that stores the sign bit from
+ * 1-bit MSE quantization plus a 1-bit QJL hash on the residual.
+ * Total: 2 bits per element.
+ * ============================================================ */
+
+void tq_turbo_kv_2b_quantize_ref(const float* src, void* dst, int n) {
+    const int dim = (n < TQ_BK) ? n : TQ_BK;
+    block_tq_turbo_kv_2b* blk = (block_tq_turbo_kv_2b*)dst;
+    memset(blk, 0, sizeof(*blk));
+
+    /* Step 1: Compute L2 norm */
+    float norm_sq = 0.0f;
+    for (int i = 0; i < dim; i++) norm_sq += src[i] * src[i];
+    float norm = sqrtf(norm_sq);
+    blk->norm = tkv_fp32_to_fp16(norm);
+
+    if (norm < 1e-12f) return;
+
+    /* Step 2: Normalize and copy to working buffer */
+    float inv_norm = 1.0f / norm;
+    float rotated[TQ_BK];
+    memset(rotated, 0, sizeof(rotated));
+    for (int i = 0; i < dim; i++) rotated[i] = src[i] * inv_norm;
+
+    /* Step 3: Apply RHT with default seed (matching 1b/3b/4b patterns) */
+    uint32_t seed = TKV_DEFAULT_SEED;
+    blk->rht_seed = seed;
+    tq_rht_transform(rotated, dim, seed);
+
+    /* Step 4: 1-bit MSE quantization (sign only)
+     * After RHT, coordinates are ~N(0, 1/sqrt(dim)).
+     * Expected |x| for half-normal = sqrt(2/pi) / sqrt(dim). */
+    float scale = sqrtf(2.0f / TQ_PI) / sqrtf((float)dim);
+    float residual[TQ_BK];
+    memset(residual, 0, sizeof(residual));
+    for (int i = 0; i < dim; i++) {
+        int sign_bit = (rotated[i] > 0.0f) ? 1 : 0;
+        if (sign_bit)
+            blk->mse_indices[i / 8] |= (uint8_t)(1 << (i % 8));
+        float recon = sign_bit ? scale : -scale;
+        residual[i] = rotated[i] - recon;
+    }
+
+    /* Step 5: QJL 1-bit sign hash on residual */
+    float res_norm_sq = 0.0f;
+    for (int i = 0; i < dim; i++) res_norm_sq += residual[i] * residual[i];
+    blk->residual_norm = tkv_fp32_to_fp16(sqrtf(res_norm_sq));
+
+    for (int i = 0; i < dim; i++) {
+        if (residual[i] > 0.0f) {
+            blk->qjl_signs[i / 8] |= (uint8_t)(1 << (i % 8));
+        }
+    }
+}
+
+void tq_turbo_kv_2b_dequantize_ref(const void* src, float* dst, int n) {
+    const int dim = (n < TQ_BK) ? n : TQ_BK;
+    const block_tq_turbo_kv_2b* blk = (const block_tq_turbo_kv_2b*)src;
+
+    float norm = tkv_fp16_to_fp32(blk->norm);
+    if (norm < 1e-12f) {
+        memset(dst, 0, (size_t)dim * sizeof(float));
+        for (int i = dim; i < n; i++) dst[i] = 0.0f;
+        return;
+    }
+
+    /* Reconstruct from 1-bit MSE codebook (sign only) in rotated space.
+     * After RHT, coordinates are ~N(0, 1/sqrt(dim)).
+     * Expected |x| for half-normal = sqrt(2/pi) / sqrt(dim). */
+    float scale = sqrtf(2.0f / TQ_PI) / sqrtf((float)dim);
+    float rotated[TQ_BK];
+    memset(rotated, 0, sizeof(rotated));
+    for (int i = 0; i < dim; i++) {
+        int sign_bit = (blk->mse_indices[i / 8] >> (i % 8)) & 1;
+        rotated[i] = sign_bit ? scale : -scale;
+    }
+
+    /* Inverse RHT */
+    tq_rht_inverse(rotated, dim, blk->rht_seed);
+
+    /* Scale by original norm */
+    for (int i = 0; i < dim; i++) {
+        dst[i] = rotated[i] * norm;
+    }
+    for (int i = dim; i < n; i++) dst[i] = 0.0f;
+}
+
+void tq_turbo_kv_2b_attention_ref(const float* query, const void* kv,
+                                   float* scores, int seq_len, int head_dim) {
+    const int dim = (head_dim < TQ_BK) ? head_dim : TQ_BK;
+    const block_tq_turbo_kv_2b* blocks = (const block_tq_turbo_kv_2b*)kv;
+
+    /* Compute query norm */
+    float q_norm_sq = 0.0f;
+    for (int i = 0; i < dim; i++) q_norm_sq += query[i] * query[i];
+    float q_norm = sqrtf(q_norm_sq);
+    float scale_factor = 1.0f / (float)dim;
+
+    /* RHT(query) computed ONCE (all blocks use the same default seed) */
+    float q_rot[TQ_BK];
+    memset(q_rot, 0, sizeof(q_rot));
+    float q_inv_norm = (q_norm > 1e-12f) ? (1.0f / q_norm) : 0.0f;
+    for (int i = 0; i < dim; i++) q_rot[i] = query[i] * q_inv_norm;
+    tq_rht_transform(q_rot, dim, TKV_DEFAULT_SEED);
+
+    /* Extract query sign bits */
+    uint8_t q_signs[TQ_BK / 8];
+    int sign_bytes = dim / 8;
+    if (sign_bytes > 0) memset(q_signs, 0, (size_t)sign_bytes);
+    for (int i = 0; i < dim; i++) {
+        if (q_rot[i] > 0.0f) {
+            q_signs[i / 8] |= (uint8_t)(1 << (i % 8));
+        }
+    }
+
+    for (int seq = 0; seq < seq_len; seq++) {
+        const block_tq_turbo_kv_2b* blk = &blocks[seq];
+        float k_norm = tkv_fp16_to_fp32(blk->norm);
+
+        /* 1-bit MSE attention: sign agreement (same as 1b Hamming) */
+        int mse_hamming = 0;
+        for (int b = 0; b < sign_bytes; b++) {
+            uint8_t xor_byte = q_signs[b] ^ blk->mse_indices[b];
+            int c = 0;
+            uint8_t tmp = xor_byte;
+            while (tmp) { c++; tmp &= tmp - 1; }
+            mse_hamming += c;
+        }
+        int mse_agree = dim - mse_hamming;
+        float mse_score = q_norm * k_norm * scale_factor * (float)(2 * mse_agree - dim);
+
+        /* QJL residual correction */
+        float res_norm = tkv_fp16_to_fp32(blk->residual_norm);
+        int qjl_hamming = 0;
+        for (int b = 0; b < sign_bytes; b++) {
+            uint8_t xor_byte = q_signs[b] ^ blk->qjl_signs[b];
+            int c = 0;
+            uint8_t tmp = xor_byte;
+            while (tmp) { c++; tmp &= tmp - 1; }
+            qjl_hamming += c;
+        }
+        int qjl_agree = dim - qjl_hamming;
+        float qjl_correction = q_norm * res_norm * scale_factor * (float)(2 * qjl_agree - dim);
+
+        scores[seq] = mse_score + qjl_correction;
+    }
+}
