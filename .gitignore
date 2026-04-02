@@ -41,4 +41,4 @@ refs/.venv/
 *.tqm
 .venv/
 refs/
-models/
+models/.claude/worktrees/
