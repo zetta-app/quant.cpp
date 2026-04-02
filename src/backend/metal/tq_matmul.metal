@@ -516,3 +516,67 @@ kernel void matmul_q4_k(
         output[row] = total;
     }
 }
+
+
+/* ============================================================
+ * TurboQuant self Q4 matmul: block_size=32, 16 packed bytes + 1 float scale
+ * dequant: (nibble - 8) * scale
+ * Optimized: 4-byte unroll, SIMD reduce
+ * ============================================================ */
+kernel void matmul_tq_q4(
+    device const float*   input       [[buffer(0)]],
+    device float*         output      [[buffer(1)]],
+    device const uint8_t* weight_qs   [[buffer(2)]],
+    device const float*   weight_sc   [[buffer(3)]],
+    constant uint&        in_dim_u    [[buffer(4)]],
+    constant uint&        out_dim_u   [[buffer(5)]],
+    uint                  row         [[threadgroup_position_in_grid]],
+    uint                  tid         [[thread_index_in_threadgroup]],
+    uint                  tg_size     [[threads_per_threadgroup]])
+{
+    if (row >= out_dim_u) return;
+
+    const uint in_dim = in_dim_u;
+    const uint n_blocks = in_dim / 32;
+    const uint blocks_per_thread = (n_blocks + tg_size - 1) / tg_size;
+    const uint block_start = tid * blocks_per_thread;
+    const uint block_end = min(block_start + blocks_per_thread, n_blocks);
+
+    const uint qs_row = row * n_blocks * 16;
+    const uint sc_row = row * n_blocks;
+    float sum = 0.0f;
+
+    for (uint b = block_start; b < block_end; b++) {
+        const float sc = weight_sc[sc_row + b];
+        device const uint8_t* qs = weight_qs + qs_row + b * 16;
+        const uint base = b * 32;
+        for (uint k = 0; k < 16; k += 4) {
+            uint8_t p0 = qs[k], p1 = qs[k+1], p2 = qs[k+2], p3 = qs[k+3];
+            sum += (float(int(p0 & 0xF) - 8) * input[base + k]
+                 +  float(int(p0 >> 4)  - 8) * input[base + k + 16]
+                 +  float(int(p1 & 0xF) - 8) * input[base + k + 1]
+                 +  float(int(p1 >> 4)  - 8) * input[base + k + 17]
+                 +  float(int(p2 & 0xF) - 8) * input[base + k + 2]
+                 +  float(int(p2 >> 4)  - 8) * input[base + k + 18]
+                 +  float(int(p3 & 0xF) - 8) * input[base + k + 3]
+                 +  float(int(p3 >> 4)  - 8) * input[base + k + 19]) * sc;
+        }
+    }
+
+    sum += simd_shuffle_down(sum, 16);
+    sum += simd_shuffle_down(sum, 8);
+    sum += simd_shuffle_down(sum, 4);
+    sum += simd_shuffle_down(sum, 2);
+    sum += simd_shuffle_down(sum, 1);
+
+    threadgroup float simd_sums[8];
+    if (tid % 32 == 0) simd_sums[tid / 32] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint n_simd = (tg_size + 31) / 32;
+        float total = 0.0f;
+        for (uint s = 0; s < n_simd; s++) total += simd_sums[s];
+        output[row] = total;
+    }
+}

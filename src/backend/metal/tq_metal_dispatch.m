@@ -903,7 +903,20 @@ int tq_metal_moe_forward(
                                                               options:MTLResourceStorageModeShared];
         if (!params_buf) return -1;
 
-        /* --- Create command buffer and encoder --- */
+        /* --- Create output buffer for Phase 3 (allocated once with other buffers) --- */
+        size_t output_bytes = (size_t)hidden_dim * sizeof(float);
+        id<MTLBuffer> output_buf = [tq_mtl_device newBufferWithLength:output_bytes
+                                                              options:MTLResourceStorageModeShared];
+        if (!output_buf) {
+            /* Fallback to hybrid if buffer creation fails */
+            memcpy(hb_output, [gate_buf contents], inter_bytes);
+            return 1;
+        }
+
+        /* --- Single command buffer for all 3 phases (MLX pattern) ---
+         * Metal guarantees sequential execution of compute encoders within
+         * one command buffer. memoryBarrierWithScope ensures buffer writes
+         * from one encoder are visible to the next. */
         id<MTLCommandBuffer> cmdBuf = [tq_mtl_queue commandBuffer];
         if (!cmdBuf) return -1;
 
@@ -933,56 +946,13 @@ int tq_metal_moe_forward(
             MTLSize gridSize = MTLSizeMake(n_tgs, 1, 1);
             MTLSize tgSize   = MTLSizeMake(TQ_MATMUL_TG_SIZE, 1, 1);
             [enc dispatchThreadgroups:gridSize threadsPerThreadgroup:tgSize];
+
+            /* Memory barrier: ensure gate_buf/up_buf writes visible to Phase 2 */
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [enc endEncoding];
         }
 
-        /* --- Phase 1: commit and wait to isolate hang --- */
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-
-        if (cmdBuf.status == MTLCommandBufferStatusError) {
-            NSLog(@"TurboQuant MoE: Phase 1 (gate+up) FAILED: %@", cmdBuf.error);
-            return -1;
-        }
-        NSLog(@"TurboQuant MoE: Phase 1 (gate+up) completed OK");
-
-#ifdef TQ_MOE_DEBUG_VALIDATE
-        /* === Debug: compare GPU gate output for expert 0 vs CPU tq_matmul_gguf === */
-        {
-            /* tq_matmul_gguf declared in tq_gguf.h (already included) */
-            float* gpu_gate = (float*)[gate_buf contents];
-            float* cpu_gate = (float*)malloc((size_t)expert_dim * sizeof(float));
-            if (cpu_gate) {
-                /* CPU matmul for expert 0's gate weights */
-                const uint8_t* gate_w = (const uint8_t*)weight_base + gate_offsets[0];
-                tq_ggml_dtype gt0 = gate_types_in ? (tq_ggml_dtype)gate_types_in[0]
-                                                  : (tq_ggml_dtype)weight_type;
-                tq_matmul_gguf(cpu_gate, input, gate_w, gt0, expert_dim, hidden_dim);
-
-                /* Compare first 8 and last 8 values */
-                NSLog(@"TurboQuant MoE DEBUG: gate expert 0 comparison (first 8):");
-                float max_err = 0.0f;
-                for (int i = 0; i < expert_dim; i++) {
-                    float err = fabsf(gpu_gate[i] - cpu_gate[i]);
-                    if (err > max_err) max_err = err;
-                    if (i < 8 || i >= expert_dim - 4) {
-                        NSLog(@"  [%d] GPU=%.6f CPU=%.6f err=%.6f", i, gpu_gate[i], cpu_gate[i], err);
-                    }
-                }
-                NSLog(@"TurboQuant MoE DEBUG: gate max_err=%.6f across %d elements", max_err, expert_dim);
-                if (max_err > 0.01f) {
-                    NSLog(@"TurboQuant MoE DEBUG: *** MISMATCH DETECTED *** — weight offset or decoding bug");
-                }
-                free(cpu_gate);
-            }
-        }
-#endif /* TQ_MOE_DEBUG_VALIDATE */
-
-        /* --- New command buffer for Phase 2 --- */
-        cmdBuf = [tq_mtl_queue commandBuffer];
-        if (!cmdBuf) return -1;
-
-        /* ======== Phase 2: SwiGLU ======== */
+        /* ======== Phase 2: SwiGLU (reads gate_buf/up_buf from Phase 1) ======== */
         {
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
             if (!enc) return -1;
@@ -998,40 +968,15 @@ int tq_metal_moe_forward(
             MTLSize gridSize = MTLSizeMake(n_tgs, 1, 1);
             MTLSize tgSize   = MTLSizeMake(tg, 1, 1);
             [enc dispatchThreadgroups:gridSize threadsPerThreadgroup:tgSize];
+
+            /* Memory barrier: ensure gate_buf writes visible to Phase 3 */
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [enc endEncoding];
         }
 
-        /* --- Phase 2: commit and wait to isolate hang --- */
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-
-        if (cmdBuf.status == MTLCommandBufferStatusError) {
-            NSLog(@"TurboQuant MoE: Phase 2 (SwiGLU) FAILED: %@", cmdBuf.error);
-            return -1;
-        }
-        NSLog(@"TurboQuant MoE: Phase 2 (SwiGLU) completed OK");
-
         /* ======== Phase 3: down projection + weighted accumulate (GPU) ========
-         * Previously skipped due to IQ2_S shader hanging with constant array.
-         * Now fixed: IQ2_S codebook passed as device buffer (buffer 4). */
+         * IQ2_S codebook passed as device buffer (buffer 4). */
         {
-            /* Create output buffer for hidden_dim results */
-            size_t output_bytes = (size_t)hidden_dim * sizeof(float);
-            id<MTLBuffer> output_buf = [tq_mtl_device newBufferWithLength:output_bytes
-                                                                  options:MTLResourceStorageModeShared];
-            if (!output_buf) {
-                /* Fallback to hybrid if buffer creation fails */
-                memcpy(hb_output, [gate_buf contents], inter_bytes);
-                return 1;
-            }
-
-            /* New command buffer for Phase 3 */
-            cmdBuf = [tq_mtl_queue commandBuffer];
-            if (!cmdBuf) {
-                memcpy(hb_output, [gate_buf contents], inter_bytes);
-                return 1;
-            }
-
             id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
             if (!enc) {
                 memcpy(hb_output, [gate_buf contents], inter_bytes);
@@ -1057,26 +1002,26 @@ int tq_metal_moe_forward(
             MTLSize tgSize3   = MTLSizeMake(TQ_MATMUL_TG_SIZE, 1, 1);
             [enc dispatchThreadgroups:gridSize3 threadsPerThreadgroup:tgSize3];
             [enc endEncoding];
-
-            [cmdBuf commit];
-            [cmdBuf waitUntilCompleted];
-
-            if (cmdBuf.status == MTLCommandBufferStatusError) {
-                NSLog(@"TurboQuant MoE: Phase 3 (down+accum) FAILED: %@", cmdBuf.error);
-                /* Fallback to hybrid on failure */
-                memcpy(hb_output, [gate_buf contents], inter_bytes);
-                return 1;
-            }
-            NSLog(@"TurboQuant MoE: Phase 3 (down+accum) completed OK");
-
-            /* Copy result to output */
-            memcpy(output, [output_buf contents], output_bytes);
-
-            /* Also copy hb for potential caller use */
-            memcpy(hb_output, [gate_buf contents], inter_bytes);
-
-            return 0; /* Full GPU success */
         }
+
+        /* ONE commit + wait for all 3 phases */
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) {
+            NSLog(@"TurboQuant MoE: GPU dispatch FAILED: %@", cmdBuf.error);
+            /* Fallback to hybrid on failure */
+            memcpy(hb_output, [gate_buf contents], inter_bytes);
+            return 1;
+        }
+
+        /* Copy result to output */
+        memcpy(output, [output_buf contents], output_bytes);
+
+        /* Also copy hb for potential caller use */
+        memcpy(hb_output, [gate_buf contents], inter_bytes);
+
+        return 0; /* Full GPU success */
     }
 }
 

@@ -1576,12 +1576,12 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 tq_matmul_q2_preq(s->hb2, layer->w_up_q2, layer->w_up_q2s,
                                    s->xb_q8, s->xb_q8s, c->intermediate_dim, dim);
             } else if (layer->w_gate_q4) {
-                tq_quantize_row_q8(s->xb, s->xb_q8, s->xb_q8s, dim);
-
-                tq_matmul_q4_preq(s->hb, layer->w_gate_q4, layer->w_gate_q4s,
-                                   s->xb_q8, s->xb_q8s, c->intermediate_dim, dim);
-                tq_matmul_q4_preq(s->hb2, layer->w_up_q4, layer->w_up_q4s,
-                                   s->xb_q8, s->xb_q8s, c->intermediate_dim, dim);
+                /* FFN gate+up: batch 2 matmuls on GPU if Metal available,
+                 * otherwise use Q4×Q8 preq fast path on CPU */
+                tq_metal_batch_begin_if_available();
+                tq_matmul_q4(s->hb, s->xb, layer->w_gate_q4, layer->w_gate_q4s, c->intermediate_dim, dim);
+                tq_matmul_q4(s->hb2, s->xb, layer->w_up_q4, layer->w_up_q4s, c->intermediate_dim, dim);
+                tq_metal_batch_flush_if_available();
             } else if (layer->gguf_w_gate) {
                 /* Batch gate+up into one GPU command buffer (2 matmuls, 1 dispatch) */
                 tq_metal_batch_begin_if_available();
