@@ -2829,16 +2829,51 @@ tq_model_t* tq_load_gguf(const char* path) {
     c->rope_freq_base   = tq_gguf_get_f32(gguf, GGUF_KEY("rope.freq_base"), 1000000.0f);
     c->rms_norm_eps     = tq_gguf_get_f32(gguf, GGUF_KEY("attention.layer_norm_rms_epsilon"), 1e-6f);
 
+    /* Sliding window + local RoPE base */
+    c->sliding_window = (int)tq_gguf_get_u32(gguf, GGUF_KEY("attention.sliding_window"), 0);
+    c->rope_local_base_freq = tq_gguf_get_f32(gguf, GGUF_KEY("rope.local.freq_base"),
+                               tq_gguf_get_f32(gguf, GGUF_KEY("rope.freq_base"), 10000.0f));
+
     /* Cap context for memory safety on small machines.
      * GGUF models often claim 262K context but we cap at 4096 by default.
      * Users can override with --ctx flag in tq_run. */
     if (c->max_seq_len > 4096) c->max_seq_len = 4096;
 
-    /* Compute head_dim — prefer explicit key_length from metadata (Qwen3.5 has
-     * head_dim > hidden_dim/n_heads because attention expands the dimension) */
+    /* Compute head_dim — prefer explicit key_length from metadata.
+     * For Gemma 4: key_length=512 is for full attention layers,
+     * but sliding layers use 256. Detect from first layer's K tensor shape. */
     c->head_dim = tq_gguf_get_i32(gguf, GGUF_KEY("attention.key_length"), 0);
     if (c->head_dim == 0 && c->n_heads > 0) {
         c->head_dim = c->hidden_dim / c->n_heads;
+    }
+
+    /* For hybrid sliding/full attention (Gemma 4):
+     * Override head_dim from first layer's K tensor shape (sliding layer),
+     * since sliding layers are the majority and determine KV cache layout. */
+    {
+        const tq_gguf_tensor_t* k0 = tq_gguf_find_tensor(gguf, "blk.0.attn_k.weight");
+        if (k0 && k0->n_dims >= 2) {
+            int k_out = (int)k0->shape[1];
+            /* Try head_dim candidates: check if k_out / head_dim gives integer kv_heads */
+            /* Try from largest to smallest to prefer larger head_dim */
+            int sliding_head_dim = c->head_dim;
+            for (int hd = 512; hd >= 64; hd /= 2) {
+                if (k_out % hd == 0) {
+                    int kv = k_out / hd;
+                    if (kv >= 1 && kv <= c->n_heads && hd < c->head_dim) {
+                        sliding_head_dim = hd;
+                        break;
+                    }
+                }
+            }
+            if (sliding_head_dim != c->head_dim) {
+                fprintf(stderr, "tq_load_gguf: hybrid attention detected — "
+                        "sliding head_dim=%d (metadata: %d)\n", sliding_head_dim, c->head_dim);
+                c->head_dim = sliding_head_dim;
+            }
+            /* Infer kv_heads from K tensor shape */
+            c->n_kv_heads = k_out / c->head_dim;
+        }
     }
 
     /* MoE configuration */
@@ -2873,11 +2908,15 @@ tq_model_t* tq_load_gguf(const char* path) {
                 c->expert_intermediate_dim, c->has_shared_expert);
     }
 
-    /* Model type detection */
-    if (c->is_moe) {
-        c->model_type = 2; /* qwen2moe / qwen3.5 moe */
+    /* Model type detection — Gemma takes priority (Gemma 4 is both Gemma AND MoE) */
+    if (strstr(gguf->arch, "gemma") != NULL) {
+        c->model_type = 1; /* gemma family */
+        c->n_norms_per_block = 4;
+        fprintf(stderr, "tq_load_gguf: Gemma family detected (sliding_window=%d)\n", c->sliding_window);
+    } else if (c->is_moe) {
+        c->model_type = 2; /* qwen moe */
     } else {
-        c->model_type = 0; /* default qwen35 */
+        c->model_type = 0; /* qwen35 */
     }
 
     fprintf(stderr, "tq_load_gguf: config — layers=%d, dim=%d, heads=%d/%d, head_dim=%d, vocab=%d\n",
@@ -3204,6 +3243,39 @@ tq_model_t* tq_load_gguf(const char* path) {
         memcpy(model->attn_layer_indices, attn_indices, (size_t)n_attn_layers * sizeof(int));
         fprintf(stderr, "tq_load_gguf: hybrid architecture — %d attn layers out of %d total\n",
                 n_attn_layers, c->n_layers);
+    }
+
+    /* Set up layer_is_sliding for Gemma hybrid attention.
+     * Detect from Q tensor shape: sliding layers have smaller Q output dim. */
+    if (c->sliding_window > 0 && c->model_type == 1) {
+        model->layer_is_sliding = (int*)calloc((size_t)c->n_layers, sizeof(int));
+        if (model->layer_is_sliding) {
+            /* Find the smallest Q output dim (sliding) */
+            int min_q = 999999;
+            for (int l = 0; l < c->n_layers; l++) {
+                char tname[128];
+                snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
+                const tq_gguf_tensor_t* qt = tq_gguf_find_tensor(gguf, tname);
+                if (qt && (int)qt->shape[1] < min_q) min_q = (int)qt->shape[1];
+            }
+            int n_sliding = 0, n_full = 0;
+            for (int l = 0; l < c->n_layers; l++) {
+                char tname[128];
+                snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
+                const tq_gguf_tensor_t* qt = tq_gguf_find_tensor(gguf, tname);
+                if (qt && (int)qt->shape[1] == min_q) {
+                    model->layer_is_sliding[l] = 1;
+                    n_sliding++;
+                } else {
+                    model->layer_is_sliding[l] = 0;
+                    n_full++;
+                }
+            }
+            if (n_full > 0) {
+                fprintf(stderr, "tq_load_gguf: Gemma hybrid — %d sliding + %d full attention layers\n",
+                        n_sliding, n_full);
+            }
+        }
     }
 
     /* Load embedding + output weights */

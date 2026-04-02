@@ -860,9 +860,34 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     int head_dim = c->head_dim;
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
+
+    /* Gemma 4 hybrid: full attention layers have different head_dim and kv_heads.
+     * Detect from GGUF weight shapes: if Q output > n_heads * head_dim, it's a full layer. */
+    if (model->layer_is_sliding && !model->layer_is_sliding[l] && layer->gguf_wq) {
+        /* Full attention layer: infer head_dim from Q tensor.
+         * Q shape = [hidden_dim, n_heads * full_head_dim * (1 + gate)] */
+        int q_out = 0;
+        /* Get Q output dim from GGUF tensor — stored at load time in gguf_wq_type's neighbor.
+         * Simpler: compute from expected: global_head_dim = metadata key_length */
+        int global_head_dim = tq_gguf_get_i32((const tq_gguf_ctx_t*)model->gguf_ctx,
+            "gemma4.attention.key_length", head_dim);
+        if (global_head_dim > head_dim) {
+            head_dim = global_head_dim;
+            /* For full layers, kv_heads is typically smaller */
+            /* K shape for full: [dim, kv_heads_full * global_head_dim]
+             * We know K_out from sliding kv_dim * (global/sliding) ratio... or just compute:
+             * Total Q = n_heads * global_head_dim = 16 * 512 = 8192
+             * Total K = ? from tensor. For now, infer: */
+            n_kv_heads = c->n_kv_heads * c->head_dim / global_head_dim;
+            if (n_kv_heads < 1) n_kv_heads = 1;
+        }
+    }
+
     int kv_dim = n_kv_heads * head_dim;
     int kv_mul = n_heads / n_kv_heads;
-    size_t kv_layer_stride = (size_t)c->max_seq_len * kv_dim;
+    /* KV cache stride uses the global (sliding) config for uniform allocation */
+    int cache_kv_dim = c->n_kv_heads * c->head_dim;
+    size_t kv_layer_stride = (size_t)c->max_seq_len * cache_kv_dim;
 
     /* Pre-quantize activation to Q8 once for all Q2/Q4 projections in this layer.
      * This eliminates redundant tq_quantize_row_q8 + malloc/free in each matmul call. */

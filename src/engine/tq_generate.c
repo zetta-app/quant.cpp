@@ -262,7 +262,8 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     /* EOS token IDs — check common values.
      * Qwen3.5: eos = 248044 (<|endoftext|>), also 248046 (<|im_end|>)
      * LLaMA: eos = 2 */
-    int eos_token1 = 2;       /* LLaMA convention */
+    /* EOS tokens — Gemma=1, Qwen=248044/248046 */
+    int eos_token1 = 1;       /* Gemma <eos>, also common default */
     int eos_token2 = 248044;  /* Qwen <|endoftext|> */
     int eos_token3 = 248046;  /* Qwen <|im_end|> */
 
