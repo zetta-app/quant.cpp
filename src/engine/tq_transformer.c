@@ -1003,9 +1003,15 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         tq_rope(s->q, s->k, pos, head_dim, n_heads, n_kv_heads, rope_base);
     }
 
-    /* Store K,V in cache */
+    /* Store K,V in cache.
+     * When quantized KV is active, skip FP32 key storage — the quantized
+     * cache is the single source of truth.  This eliminates the duplicate
+     * FP32 copy and is the basis for real memory savings. */
+    int use_quant_kv = (s->kv_quant_type < TQ_TYPE_COUNT && s->quant_key_cache != NULL);
     float* key_cache_layer = s->key_cache + l * kv_layer_stride;
-    memcpy(key_cache_layer + (size_t)pos * kv_dim, s->k, kv_dim * sizeof(float));
+    if (!use_quant_kv) {
+        memcpy(key_cache_layer + (size_t)pos * kv_dim, s->k, kv_dim * sizeof(float));
+    }
 
     /* KV profiling: accumulate pre/post-RHT statistics for this layer's keys */
     if (s->profile_kv && s->profile_accum) {
@@ -1077,7 +1083,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
      * Note: 1-bit/2b/3b sign-based quantization now expands sketch_dim to
      * at least 128 bits for small head_dim (QJL paper: m/d >= 2), so no
      * fallback is needed. */
-    int use_int_attn = (s->kv_quant_type < TQ_TYPE_COUNT && s->quant_key_cache != NULL);
+    int use_int_attn = use_quant_kv;
     if (use_int_attn) {
         const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
         for (int kh = 0; kh < n_kv_heads; kh++) {
@@ -1161,8 +1167,48 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             for (int t = 0; t < attn_start; t++) {
                 atth[t] = -1e30f;
             }
+        } else if (use_quant_kv) {
+            /* Dequant attention: read from quantized key cache, dequantize
+             * each position's key on the fly, then compute FP32 dot product.
+             * This is the path that delivers REAL memory savings — no FP32
+             * key cache is stored for previous positions. */
+            const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
+            float inv_scale = 1.0f / sqrtf(attn_scale_dim);
+            float dequant_buf[256]; /* temp buffer for one head's dequantized key */
+
+            for (int t = 0; t < attn_start; t++) atth[t] = -1e30f;
+
+            for (int t = attn_start; t < seq_len; t++) {
+                const uint8_t* quant_src = (const uint8_t*)s->quant_key_cache
+                    + (size_t)l * s->quant_kv_stride
+                    + (size_t)t * n_kv_heads * s->quant_head_stride
+                    + (size_t)kv_h * s->quant_head_stride;
+
+                traits->dequantize(quant_src, dequant_buf, head_dim);
+
+                float score = 0.0f;
+#ifdef __ARM_NEON
+                /* NEON-optimized dot product */
+                float32x4_t vsum = vdupq_n_f32(0.0f);
+                int d = 0;
+                for (; d + 4 <= head_dim; d += 4) {
+                    float32x4_t vq = vld1q_f32(qh + d);
+                    float32x4_t vk = vld1q_f32(dequant_buf + d);
+                    vsum = vfmaq_f32(vsum, vq, vk);
+                }
+                score = vaddvq_f32(vsum);
+                for (; d < head_dim; d++) {
+                    score += qh[d] * dequant_buf[d];
+                }
+#else
+                for (int d = 0; d < head_dim; d++) {
+                    score += qh[d] * dequant_buf[d];
+                }
+#endif
+                atth[t] = score * inv_scale;
+            }
         } else {
-            /* FP32 attention scores (short sequences or no quantization) */
+            /* FP32 attention scores (no quantization) */
             float inv_scale = 1.0f / sqrtf(attn_scale_dim);
             /* Set positions outside sliding window to -inf */
             for (int t = 0; t < attn_start; t++) {
