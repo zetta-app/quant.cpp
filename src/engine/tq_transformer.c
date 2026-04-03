@@ -1117,7 +1117,65 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                 + (size_t)l * s->quant_kv_stride
                 + (size_t)pos * cache_n_kv_heads * s->quant_head_stride
                 + (size_t)kh * s->quant_head_stride;
-            traits->quantize(key_src, quant_dst, head_dim);
+
+            if (s->delta_kv_enabled && pos > 0) {
+                /* Delta compression with periodic I-frames.
+                 * I-frames store absolute keys to bound accumulated drift.
+                 * P-frames store delta = key[t] - reconstruct(key[t-1]). */
+                int iframe_int = s->delta_iframe_interval > 0 ? s->delta_iframe_interval : 16;
+                int is_iframe = (pos % iframe_int == 0);
+
+                if (is_iframe) {
+                    /* I-frame: quantize absolute key (drift reset) */
+                    traits->quantize(key_src, quant_dst, head_dim);
+                } else {
+                    /* P-frame: quantize delta from previous position's reconstruction */
+                    const uint8_t* prev_quant = (const uint8_t*)s->quant_key_cache
+                        + (size_t)l * s->quant_kv_stride
+                        + (size_t)(pos - 1) * cache_n_kv_heads * s->quant_head_stride
+                        + (size_t)kh * s->quant_head_stride;
+                    float prev_recon[512];
+                    traits->dequantize(prev_quant, prev_recon, head_dim);
+
+                    /* If previous was an I-frame, prev_recon is absolute.
+                     * If previous was a P-frame, prev_recon is the delta.
+                     * We need the full reconstruction of the previous key.
+                     * Since we can't easily track this here, we reconstruct
+                     * from the last I-frame. */
+                    int last_iframe = (pos / iframe_int) * iframe_int;
+                    if (pos - 1 > last_iframe) {
+                        /* Reconstruct key[pos-1] from last I-frame through deltas */
+                        const uint8_t* iframe_src = (const uint8_t*)s->quant_key_cache
+                            + (size_t)l * s->quant_kv_stride
+                            + (size_t)last_iframe * cache_n_kv_heads * s->quant_head_stride
+                            + (size_t)kh * s->quant_head_stride;
+                        float recon[512];
+                        traits->dequantize(iframe_src, recon, head_dim);
+                        float tmp[512];
+                        for (int ti = last_iframe + 1; ti <= pos - 1; ti++) {
+                            const uint8_t* delta_src = (const uint8_t*)s->quant_key_cache
+                                + (size_t)l * s->quant_kv_stride
+                                + (size_t)ti * cache_n_kv_heads * s->quant_head_stride
+                                + (size_t)kh * s->quant_head_stride;
+                            traits->dequantize(delta_src, tmp, head_dim);
+                            for (int d = 0; d < head_dim; d++) {
+                                recon[d] += tmp[d];
+                            }
+                        }
+                        memcpy(prev_recon, recon, (size_t)head_dim * sizeof(float));
+                    }
+                    /* else: pos-1 == last_iframe, prev_recon from dequant is correct */
+
+                    float delta_buf[512];
+                    for (int d = 0; d < head_dim; d++) {
+                        delta_buf[d] = key_src[d] - prev_recon[d];
+                    }
+                    traits->quantize(delta_buf, quant_dst, head_dim);
+                }
+            } else {
+                /* First position (I-frame) or non-delta mode: quantize absolute key */
+                traits->quantize(key_src, quant_dst, head_dim);
+            }
         }
     }
 
@@ -1194,6 +1252,81 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             /* Apply sliding window mask: set scores before attn_start to -inf */
             for (int t = 0; t < attn_start; t++) {
                 atth[t] = -1e30f;
+            }
+        } else if (use_quant_kv && s->delta_kv_enabled) {
+            /* Delta KV attention with periodic I-frames.
+             * I-frames (pos % iframe_int == 0) store absolute keys.
+             * P-frames store deltas. Reconstruct by accumulating from last I-frame.
+             * This bounds drift to at most iframe_int steps. */
+            const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
+            float inv_scale = 1.0f / sqrtf(attn_scale_dim);
+            int iframe_int = s->delta_iframe_interval > 0 ? s->delta_iframe_interval : 16;
+            float recon_key[512];
+            float dequant_buf[512];
+
+            for (int t = 0; t < attn_start; t++) atth[t] = -1e30f;
+
+            for (int t = attn_start; t < seq_len; t++) {
+                const uint8_t* quant_src = (const uint8_t*)s->quant_key_cache
+                    + (size_t)l * s->quant_kv_stride
+                    + (size_t)t * cache_n_kv_heads * s->quant_head_stride
+                    + (size_t)kv_h * s->quant_head_stride;
+
+                if (t % iframe_int == 0) {
+                    /* I-frame: dequantize directly */
+                    traits->dequantize(quant_src, recon_key, head_dim);
+                } else {
+                    /* P-frame: need reconstruction from last I-frame */
+                    int last_iframe = (t / iframe_int) * iframe_int;
+
+                    /* If we're processing sequentially from last I-frame, recon_key
+                     * already holds the previous position's reconstruction (if t-1
+                     * was processed in this loop). Otherwise, reconstruct from scratch. */
+                    if (t - 1 >= attn_start && t - 1 >= last_iframe) {
+                        /* recon_key holds recon[t-1], just add delta[t] */
+                        traits->dequantize(quant_src, dequant_buf, head_dim);
+                        for (int d = 0; d < head_dim; d++) {
+                            recon_key[d] += dequant_buf[d];
+                        }
+                    } else {
+                        /* Reconstruct from last I-frame */
+                        const uint8_t* iframe_src = (const uint8_t*)s->quant_key_cache
+                            + (size_t)l * s->quant_kv_stride
+                            + (size_t)last_iframe * cache_n_kv_heads * s->quant_head_stride
+                            + (size_t)kv_h * s->quant_head_stride;
+                        traits->dequantize(iframe_src, recon_key, head_dim);
+                        for (int ti = last_iframe + 1; ti <= t; ti++) {
+                            const uint8_t* delta_src = (const uint8_t*)s->quant_key_cache
+                                + (size_t)l * s->quant_kv_stride
+                                + (size_t)ti * cache_n_kv_heads * s->quant_head_stride
+                                + (size_t)kv_h * s->quant_head_stride;
+                            traits->dequantize(delta_src, dequant_buf, head_dim);
+                            for (int d = 0; d < head_dim; d++) {
+                                recon_key[d] += dequant_buf[d];
+                            }
+                        }
+                    }
+                }
+
+                float score = 0.0f;
+#ifdef __ARM_NEON
+                float32x4_t vsum = vdupq_n_f32(0.0f);
+                int d = 0;
+                for (; d + 4 <= head_dim; d += 4) {
+                    float32x4_t vq = vld1q_f32(qh + d);
+                    float32x4_t vk = vld1q_f32(recon_key + d);
+                    vsum = vfmaq_f32(vsum, vq, vk);
+                }
+                score = vaddvq_f32(vsum);
+                for (; d < head_dim; d++) {
+                    score += qh[d] * recon_key[d];
+                }
+#else
+                for (int d = 0; d < head_dim; d++) {
+                    score += qh[d] * recon_key[d];
+                }
+#endif
+                atth[t] = score * inv_scale;
             }
         } else if (use_quant_kv) {
             /* Dequant attention: read from quantized key cache, dequantize

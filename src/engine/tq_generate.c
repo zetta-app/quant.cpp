@@ -165,6 +165,7 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         fprintf(stderr, "tq_generate: failed to allocate state\n");
         return -1;
     }
+    state->delta_kv_enabled = config->delta_kv;
 
     /* Allocate MoE state if model uses MoE */
     if (model->config.is_moe && model->moe_config) {

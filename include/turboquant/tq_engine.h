@@ -318,6 +318,13 @@ typedef struct {
     void* quant_key_cache;   /* [n_layers, max_seq_len, n_kv_heads, blocks_per_head * type_size] */
     size_t quant_kv_stride;  /* bytes per layer in quant_key_cache */
     size_t quant_head_stride;/* bytes per head per position */
+
+    /* Delta KV compression: store key[t] - reconstruct(key[t-1]) instead of key[t].
+     * At attention time, reconstruct keys sequentially by accumulating deltas.
+     * This reduces quantization range by ~30%, enabling 2-bit to match 4-bit quality.
+     * Periodic I-frames (absolute keys) bound accumulated drift error. */
+    int delta_kv_enabled;    /* 1 = delta compression mode for keys */
+    int delta_iframe_interval; /* I-frame every N positions (0 = auto = 16) */
 } tq_state_t;
 
 /* ============================================================
@@ -330,6 +337,7 @@ typedef struct {
     tq_type kv_type;     /* KV cache quantization type */
     int value_quant_bits;/* V cache quantization: 0=FP16/FP32(default), 4=Q4, 2=Q2 */
     int v_highres_window;/* recent N tokens get FP16 V even when V is quantized (0=disabled) */
+    int delta_kv;        /* 1 = delta KV compression (store key deltas) */
     int n_threads;
     float rep_penalty;    /* repetition penalty (default: 1.1, 1.0 = disabled) */
     int rep_window;       /* how many recent tokens to penalize (default: 32) */

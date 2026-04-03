@@ -95,6 +95,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --bench-memory   Benchmark memory bandwidth at varying context lengths\n");
     fprintf(stderr, "  --bench-prefill  Benchmark prefill speed with/without KV quantization\n");
     fprintf(stderr, "  --ctx <N>        Override max context length (default: 4096)\n");
+    fprintf(stderr, "  --delta, -D      Enable delta KV compression (store key deltas)\n");
 }
 
 int main(int argc, char** argv) {
@@ -125,6 +126,7 @@ int main(int argc, char** argv) {
     int bench_memory = 0;
     int bench_prefill = 0;
     int override_ctx = 0;  /* 0 = use model default (capped at 4096) */
+    int delta_kv = 0;      /* 1 = delta KV compression (store key deltas) */
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -203,6 +205,8 @@ int main(int argc, char** argv) {
             bench_prefill = 1;
         } else if (strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
             override_ctx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--delta") == 0 || strcmp(argv[i], "-D") == 0) {
+            delta_kv = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -346,6 +350,10 @@ int main(int argc, char** argv) {
             tq_free_model(model);
             return 1;
         }
+        state->delta_kv_enabled = delta_kv;
+        if (delta_kv) {
+            fprintf(stderr, "Delta KV compression: ENABLED (storing key deltas)\n");
+        }
 
         /* Teacher-forced forward: accumulate negative log-likelihood */
         double total_nll = 0.0;
@@ -396,6 +404,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "File:         %s\n", ppl_file);
         fprintf(stderr, "Tokens:       %d (evaluated %d)\n", n_tokens, n_eval);
         fprintf(stderr, "KV type:      %s\n", kv_type < TQ_TYPE_COUNT ? tq_type_name(kv_type) : "fp32");
+        fprintf(stderr, "Delta KV:     %s\n", delta_kv ? "ON" : "OFF");
         fprintf(stderr, "V quant:      %s\n", value_quant_bits == 4 ? "Q4" : (value_quant_bits == 2 ? "Q2" : "FP16"));
         fprintf(stderr, "Avg NLL:      %.6f\n", avg_nll);
         fprintf(stderr, "Perplexity:   %.4f\n", perplexity);
@@ -983,6 +992,7 @@ int main(int argc, char** argv) {
     config.kv_type = kv_type;
     config.value_quant_bits = value_quant_bits;
     config.v_highres_window = v_highres_window;
+    config.delta_kv = delta_kv;
     config.on_token = print_token;
     config.user_data = NULL;
 
