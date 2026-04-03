@@ -29,7 +29,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TQ_RUN="$PROJECT_DIR/build/tq_run"
+TQ_RUN="$PROJECT_DIR/build/quant"
 PPL_TEXT="$SCRIPT_DIR/data/ppl_test_1k.txt"
 RESULTS_DIR="$SCRIPT_DIR/compare_results"
 

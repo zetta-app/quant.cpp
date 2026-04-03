@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy project source (see .dockerignore for exclusions)
-COPY . /turboquant
-WORKDIR /turboquant
+COPY . /quant
+WORKDIR /quant
 
 # Build the library, tools, and tests
 RUN cmake -B build \
@@ -26,6 +26,6 @@ RUN cmake -B build \
 # Run the test suite
 RUN ctest --test-dir build --output-on-failure
 
-# Default entrypoint: the tq_run inference CLI
-# Usage: docker run turboquant models/model.tqm -p "Hello" -k turbo_kv_1b
-ENTRYPOINT ["./build/tq_run"]
+# Default entrypoint: the quant inference CLI
+# Usage: docker run quant models/model.gguf -p "Hello"
+ENTRYPOINT ["./build/quant"]

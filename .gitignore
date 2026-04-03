@@ -46,7 +46,9 @@ models/.claude/worktrees/
 models/
 
 # Makefile build artifacts
-tq_run
+quant
 tq_convert
 libturboquant.a
 *.o
+tq_run
+tq_run.dSYM/

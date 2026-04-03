@@ -2884,7 +2884,7 @@ tq_model_t* tq_load_gguf(const char* path) {
 
     /* Cap context for memory safety on small machines.
      * GGUF models often claim 262K context but we cap at 4096 by default.
-     * Users can override with --ctx flag in tq_run. */
+     * Users can override with --ctx flag in quant. */
     if (c->max_seq_len > 4096) c->max_seq_len = 4096;
 
     /* Compute head_dim — prefer explicit key_length from metadata.

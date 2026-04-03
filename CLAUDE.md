@@ -1,9 +1,10 @@
-# TurboQuant.cpp — Agent Development Guide
+# quant.cpp — Agent Development Guide
 
 ## Project Overview
 
-TurboQuant.cpp is a cross-platform C/C++ library for extreme KV cache compression in LLM inference.
-It implements PolarQuant + QJL (TurboQuant) algorithms to achieve 5x KV cache memory reduction at 3-bit with zero quality loss.
+quant.cpp is a minimal C inference engine for local LLM with KV cache compression.
+33K LOC, pure C, zero dependencies. Supports 5 architectures via GGUF.
+Killer feature: delta KV compression — 3-bit keys with PPL -3.2% vs FP32.
 
 ## Architecture
 
@@ -196,5 +197,5 @@ When merging worker results back to main:
 ./harness/run.sh --parallel-only
 
 # Manual team spawn
-clawteam launch harness/team.toml --goal "Build TurboQuant.cpp" --workspace
+clawteam launch harness/team.toml --goal "Build quant.cpp" --workspace
 ```

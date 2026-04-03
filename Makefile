@@ -1,8 +1,8 @@
 # TurboQuant.cpp — Standalone Makefile (no CMake needed)
 #
 # Usage:
-#   make              # build tq_run + tq_convert
-#   make tq_run       # inference tool only
+#   make              # build quant + tq_convert
+#   make quant       # inference tool only
 #   make test         # build and run tests (requires Google Test)
 #   make clean        # remove build artifacts
 #
@@ -10,7 +10,7 @@
 #   Linux/gcc:     make CC=gcc
 #   macOS/clang:   make                    (auto-detects Apple Silicon)
 #   macOS+Metal:   make METAL=1            (enables Metal GPU backend)
-#   Windows/mingw: make CC=x86_64-w64-mingw32-gcc TARGET=tq_run.exe
+#   Windows/mingw: make CC=x86_64-w64-mingw32-gcc TARGET=quant.exe
 #
 # Options:
 #   DEBUG=1    — debug build (-g -O0 -fsanitize=address)
@@ -87,14 +87,14 @@ endif
 
 .PHONY: all clean test
 
-all: tq_run tq_convert
+all: quant tq_convert
 
 # Static library
 libturboquant.a: $(OBJ_LIB)
 	$(AR) rcs $@ $^
 
 # Main tools
-tq_run: tools/tq_run.c libturboquant.a
+quant: tools/quant.c libturboquant.a
 	$(CC) $(CFLAGS) -o $@ $< -L. -lturboquant $(LDFLAGS)
 
 tq_convert: tools/tq_convert.c libturboquant.a
@@ -115,12 +115,12 @@ tq_convert: tools/tq_convert.c libturboquant.a
 # Test (lightweight — no Google Test dependency)
 # ============================================================
 
-test: tq_run
+test: quant
 	@echo "=== Quick sanity test ==="
 	@echo "Building..."
-	@echo "Running tq_run --info on test..."
+	@echo "Running quant --info on test..."
 	@if [ -f model.tqm ]; then \
-		./tq_run model.tqm --info && echo "PASS: model loads" || echo "FAIL"; \
+		./quant model.tqm --info && echo "PASS: model loads" || echo "FAIL"; \
 	else \
 		echo "SKIP: no model.tqm found (download a model first)"; \
 	fi
@@ -131,7 +131,7 @@ test: tq_run
 # ============================================================
 
 clean:
-	rm -f $(OBJ_LIB) $(OBJ_METAL) libturboquant.a tq_run tq_convert
+	rm -f $(OBJ_LIB) $(OBJ_METAL) libturboquant.a quant tq_convert
 	rm -f src/**/*.o
 
 # ============================================================
@@ -142,8 +142,8 @@ help:
 	@echo "TurboQuant.cpp Makefile"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make              Build tq_run + tq_convert"
-	@echo "  make tq_run       Build inference tool only"
+	@echo "  make              Build quant + tq_convert"
+	@echo "  make quant       Build inference tool only"
 	@echo "  make clean        Remove build artifacts"
 	@echo "  make test         Quick sanity test"
 	@echo "  make help         Show this help"

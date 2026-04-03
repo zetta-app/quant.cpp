@@ -63,8 +63,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DTQ_BUILD_TESTS=ON
 cmake --build build -j$(nproc)
 ctest --test-dir build   # 33/33 통과
 
-./build/tq_run model.gguf -p "Hello" -k uniform_4b -v q4   # 3.8x 압축
-./build/tq_run model.gguf --ppl input.txt -k uniform_4b -v q4  # PPL 측정
+./build/quant model.gguf -p "Hello" -k uniform_4b -v q4   # 3.8x 압축
+./build/quant model.gguf --ppl input.txt -k uniform_4b -v q4  # PPL 측정
 ```
 
 ---

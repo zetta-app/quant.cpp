@@ -67,7 +67,7 @@ typedef struct {
 } tq_profile_t;
 
 static tq_profile_t g_profile = {0};
-int g_tq_profile_enabled = 0;  /* set from tq_run --profile */
+int g_tq_profile_enabled = 0;  /* set from quant --profile */
 
 static inline double tq_now_ns(void) {
     struct timespec ts;
@@ -1850,6 +1850,15 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     for (int l = 0; l < c->n_layers; l++) {
         tq_layer_weights_t* layer = &model->layers[l];
 
+        /* Save input residual for layer_output_scale (Gemma 4).
+         * layer_output_scale applies to the layer's contributions only,
+         * not the entire hidden state. We need x_old to compute:
+         *   x_new = x_old + scale * (x_current - x_old) */
+        float layer_residual_buf[4096]; /* max dim for Gemma 4 */
+        if (layer->layer_output_scale != 0.0f) {
+            memcpy(layer_residual_buf, s->x, dim * sizeof(float));
+        }
+
         /* Pre-attention/DeltaNet RMSNorm */
         tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
 
@@ -2067,12 +2076,13 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             tq_add(s->x, s->x, ple_proj_out, dim);
         }
 
-        /* Gemma 4: apply layer_output_scale ONCE at end of layer (after all residuals).
-         * This scales the accumulated hidden state relative to the residual stream. */
+        /* Gemma 4: layer_output_scale scales the layer's CONTRIBUTIONS (attn + ffn + ple),
+         * not the entire hidden state. Formula:
+         *   x_new = x_old + scale * (x_current - x_old) */
         if (layer->layer_output_scale != 0.0f) {
             float los = layer->layer_output_scale;
             for (int i = 0; i < dim; i++) {
-                s->x[i] *= los;
+                s->x[i] = layer_residual_buf[i] + los * (s->x[i] - layer_residual_buf[i]);
             }
         }
 
@@ -2108,6 +2118,15 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         tq_matmul(s->logits, s->x, model->output_weight, c->vocab_size, dim);
     }
     TQ_PROF_STOP(_tp, matmul_ns);
+
+    if (pos <= 1 && getenv("TQ_DEBUG")) {
+        /* Print top-5 logits for debugging */
+        fprintf(stderr, "[DEBUG] pos=%d logits[0:8] = ", pos);
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.2f ", s->logits[i]);
+        float max_l = s->logits[0]; int max_i = 0;
+        for (int i = 1; i < c->vocab_size; i++) { if (s->logits[i] > max_l) { max_l = s->logits[i]; max_i = i; } }
+        fprintf(stderr, "... max=%.2f @%d\n", max_l, max_i);
+    }
 
     /* Final logit soft-capping: logits = cap * tanh(logits / cap) */
     /* Note: logit soft-capping disabled for now — Gemma 4 GGUF models have

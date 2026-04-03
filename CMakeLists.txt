@@ -238,8 +238,8 @@ if(TQ_BUILD_BENCH)
 endif()
 
 # CLI inference tool
-add_executable(tq_run tools/tq_run.c)
-target_link_libraries(tq_run turboquant)
+add_executable(quant tools/quant.c)
+target_link_libraries(quant turboquant)
 
 # Debug comparison tool
 add_executable(debug_compare tools/debug_compare.c)

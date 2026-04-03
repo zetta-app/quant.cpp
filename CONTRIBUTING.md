@@ -1,12 +1,12 @@
-# Contributing to TurboQuant.cpp
+# Contributing to quant.cpp
 
 Thank you for your interest in contributing! Here's how to get started.
 
 ## Quick Setup
 
 ```bash
-git clone https://github.com/quantumaikr/TurboQuant.cpp
-cd TurboQuant.cpp
+git clone https://github.com/quantumaikr/quant.cpp
+cd quant.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTQ_BUILD_TESTS=ON
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ctest --test-dir build --output-on-failure
@@ -15,8 +15,8 @@ ctest --test-dir build --output-on-failure
 Or with Docker:
 
 ```bash
-docker build -t turboquant .
-docker run turboquant models/model.tqm -p "Hello" -k turbo_kv_1b
+docker build -t quant .
+docker run quant models/model.gguf -p "Hello"
 ```
 
 ## Running Tests
@@ -38,7 +38,7 @@ bash score.sh --quality    # Quantization quality metrics
 
 ## What to Work On
 
-Check [Issues](https://github.com/quantumaikr/TurboQuant.cpp/issues) for tasks labeled `good first issue` or `help wanted`.
+Check [Issues](https://github.com/quantumaikr/quant.cpp/issues) for tasks labeled `good first issue` or `help wanted`.
 
 **High-impact areas:**
 - New model architectures (Llama, Phi, Gemma)
@@ -50,7 +50,7 @@ Check [Issues](https://github.com/quantumaikr/TurboQuant.cpp/issues) for tasks l
 
 1. Add the model config struct to `include/turboquant/tq_engine.h`
 2. Implement the forward pass in `src/engine/` (one file per architecture)
-3. Register the architecture in `tq_load_model()` in `src/engine/tq_model_loader.c`
+3. Register the architecture in `tq_load_model()` in `src/engine/tq_model.c`
 4. Add a test in `tests/` and an example in `examples/`
 5. Verify with `bash score.sh --quick`
 
@@ -61,7 +61,7 @@ Check [Issues](https://github.com/quantumaikr/TurboQuant.cpp/issues) for tasks l
 3. Implement `quantize`/`dequantize`/`attention` in `src/core/tq_<name>.c`
 4. Register in the dispatch table in `src/core/tq_traits.c`
 5. Add unit tests in `tests/test_<name>.cpp`
-6. Update `tools/tq_run.c` to accept the new type name in `parse_kv_type()`
+6. Update `tools/quant.c` to accept the new type name in `parse_kv_type()`
 
 ## Code Standards
 

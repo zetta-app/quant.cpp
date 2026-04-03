@@ -103,8 +103,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Total K+V compression (1b K + Q4 V) | 4.9x | `tq_run -M` |
-| Total K+V compression (1b K + Q2 V) | 7.1x | `tq_run -M` |
+| Total K+V compression (1b K + Q4 V) | 4.9x | `quant -M` |
+| Total K+V compression (1b K + Q2 V) | 7.1x | `quant -M` |
 | 32K context savings (Q4 V) | 3.4 GB | calculated |
 | Attention cosine (uniform_4b) | 0.996 | `test_attention_distribution` |
 | Attention cosine (turbo_kv_3b) | 0.918 | `test_attention_distribution` |
@@ -188,7 +188,7 @@ PATCH: Bug fixes, performance improvements
    ```bash
    cmake --build build -j$(nproc) && ctest --test-dir build
    bash scripts/sanitize.sh
-   ./build/tq_run gemma3-4b.tqm -p "The capital of France is" -j 6 -n 20 -T 0.0 -k turbo_kv_1b -v q4
+   ./build/quant gemma3-4b.tqm -p "The capital of France is" -j 6 -n 20 -T 0.0 -k turbo_kv_1b -v q4
    ```
 5. Tag: `git tag -a v0.x.0 -m "Release v0.x.0"`
 6. Push: `git push origin v0.x.0`

@@ -1,8 +1,8 @@
 /**
- * tq_run — TurboQuant inference CLI
+ * quant — Minimal C inference engine. Zero dependencies.
  *
  * Usage:
- *   tq_run <model.safetensors> [options]
+ *   quant <model.safetensors> [options]
  *
  * Options:
  *   -t <tokenizer>   Path to tokenizer binary file
@@ -68,7 +68,7 @@ static tq_type parse_kv_type(const char* s) {
 }
 
 static void print_usage(const char* prog) {
-    fprintf(stderr, "TurboQuant Inference Engine\n");
+    fprintf(stderr, "quant — Minimal C inference engine. Zero dependencies.\n");
     fprintf(stderr, "Usage: %s <model.safetensors> [options]\n\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <tokenizer>   Tokenizer binary file\n");

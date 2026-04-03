@@ -1,9 +1,9 @@
 """
-TurboQuant.cpp Python bindings (subprocess wrapper for tq_run CLI)
+TurboQuant.cpp Python bindings (subprocess wrapper for quant CLI)
 
 Provides a simple, pip-install-friendly interface to the TurboQuant inference
 engine without requiring C FFI or shared library loading. Communicates with
-the compiled tq_run binary via subprocess.
+the compiled quant binary via subprocess.
 
 For the lower-level ctypes bindings (NumPy arrays, direct quantize/dequantize),
 see turboquant/_core.py instead.
@@ -17,12 +17,12 @@ from pathlib import Path
 from typing import Dict, Optional
 
 
-def _find_tq_run() -> Optional[str]:
-    """Locate the tq_run binary.
+def _find_quant() -> Optional[str]:
+    """Locate the quant binary.
 
     Search order:
       1. TURBOQUANT_BIN environment variable
-      2. ./build/tq_run  (relative to this file's project root)
+      2. ./build/quant  (relative to this file's project root)
       3. PATH lookup via shutil.which
     """
     # 1. Explicit env var
@@ -33,23 +33,23 @@ def _find_tq_run() -> Optional[str]:
     # 2. Relative to project root (bindings/python/ -> ../../build/)
     project_root = Path(__file__).resolve().parent.parent.parent
     candidates = [
-        project_root / "build" / "tq_run",
-        project_root / "build" / "Release" / "tq_run",
-        project_root / "build" / "Debug" / "tq_run",
+        project_root / "build" / "quant",
+        project_root / "build" / "Release" / "quant",
+        project_root / "build" / "Debug" / "quant",
     ]
     for c in candidates:
         if c.is_file():
             return str(c)
 
     # 3. PATH
-    found = shutil.which("tq_run")
+    found = shutil.which("quant")
     return found
 
 
 class TurboQuant:
-    """High-level Python wrapper around the tq_run CLI.
+    """High-level Python wrapper around the quant CLI.
 
-    Uses subprocess to call the compiled tq_run binary, parsing its
+    Uses subprocess to call the compiled quant binary, parsing its
     stdout/stderr output. No C FFI, no shared library, no NumPy required.
 
     Args:
@@ -59,7 +59,7 @@ class TurboQuant:
                     turbo_3b, turbo_4b, turbo_kv_1b, turbo_kv_3b, turbo_kv_4b.
         v_quant:    Value cache quantization: "fp16", "q4", or "q2".
         threads:    Number of threads for matrix multiplication.
-        tq_run_path: Explicit path to tq_run binary (auto-detected if None).
+        quant_path: Explicit path to quant binary (auto-detected if None).
 
     Example:
         tq = TurboQuant("models/qwen3.5-0.8b.tqm", kv_type="turbo_kv_1b")
@@ -84,7 +84,7 @@ class TurboQuant:
         kv_type: str = "turbo_kv_1b",
         v_quant: str = "fp16",
         threads: int = 4,
-        tq_run_path: Optional[str] = None,
+        quant_path: Optional[str] = None,
     ):
         self._model_path = str(model_path)
         if not os.path.isfile(self._model_path):
@@ -105,19 +105,19 @@ class TurboQuant:
         self._v_quant = v_quant
         self._threads = int(threads)
 
-        self._tq_run = tq_run_path or _find_tq_run()
-        if self._tq_run is None:
+        self._quant = quant_path or _find_quant()
+        if self._quant is None:
             raise FileNotFoundError(
-                "Could not find tq_run binary. Build with:\n"
+                "Could not find quant binary. Build with:\n"
                 "  cmake -B build -DCMAKE_BUILD_TYPE=Release\n"
                 "  cmake --build build -j$(nproc)\n"
-                "Or set TURBOQUANT_BIN=/path/to/tq_run"
+                "Or set TURBOQUANT_BIN=/path/to/quant"
             )
 
     def _base_cmd(self) -> list:
         """Return the base command with common flags."""
         cmd = [
-            self._tq_run,
+            self._quant,
             self._model_path,
             "-k", self._kv_type,
             "-v", self._v_quant,
@@ -126,7 +126,7 @@ class TurboQuant:
         return cmd
 
     def _run(self, extra_args: list, timeout: int = 300) -> subprocess.CompletedProcess:
-        """Run tq_run with extra arguments and return the result."""
+        """Run quant with extra arguments and return the result."""
         cmd = self._base_cmd() + extra_args
         try:
             result = subprocess.run(
@@ -137,12 +137,12 @@ class TurboQuant:
             )
         except subprocess.TimeoutExpired as e:
             raise TimeoutError(
-                f"tq_run timed out after {timeout}s. "
+                f"quant timed out after {timeout}s. "
                 f"Command: {' '.join(cmd)}"
             ) from e
         except FileNotFoundError as e:
             raise FileNotFoundError(
-                f"tq_run binary not found at: {self._tq_run}"
+                f"quant binary not found at: {self._quant}"
             ) from e
         return result
 
@@ -166,7 +166,7 @@ class TurboQuant:
             timeout:     Maximum seconds to wait.
 
         Returns:
-            Generated text (stdout from tq_run).
+            Generated text (stdout from quant).
         """
         result = self._run(
             [
@@ -180,7 +180,7 @@ class TurboQuant:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"tq_run failed (exit {result.returncode}):\n{result.stderr}"
+                f"quant failed (exit {result.returncode}):\n{result.stderr}"
             )
         return result.stdout
 
@@ -194,7 +194,7 @@ class TurboQuant:
         Returns:
             Perplexity value (float).
 
-        The tq_run binary outputs a machine-parseable line:
+        The quant binary outputs a machine-parseable line:
             PPL_CSV:<n_eval>,<avg_nll>,<perplexity>
         """
         if not os.path.isfile(text_file):
@@ -203,7 +203,7 @@ class TurboQuant:
         result = self._run(["--ppl", text_file], timeout=timeout)
         if result.returncode != 0:
             raise RuntimeError(
-                f"tq_run --ppl failed (exit {result.returncode}):\n{result.stderr}"
+                f"quant --ppl failed (exit {result.returncode}):\n{result.stderr}"
             )
 
         # Parse PPL_CSV line from stderr
@@ -213,7 +213,7 @@ class TurboQuant:
             return float(match.group(3))
 
         raise RuntimeError(
-            "Could not parse perplexity from tq_run output.\n"
+            "Could not parse perplexity from quant output.\n"
             f"stderr: {result.stderr[-500:]}"
         )
 
@@ -236,7 +236,7 @@ class TurboQuant:
               - fp16_mb:         FP16 size in MB
               - saved_mb:        Memory saved in MB
 
-        The tq_run binary outputs a machine-parseable line:
+        The quant binary outputs a machine-parseable line:
             MEMORY_CSV:<tokens>,<compressed>,<fp16>,<ratio>
         """
         result = self._run(
@@ -245,7 +245,7 @@ class TurboQuant:
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"tq_run -M failed (exit {result.returncode}):\n{result.stderr}"
+                f"quant -M failed (exit {result.returncode}):\n{result.stderr}"
             )
 
         combined = result.stdout + "\n" + result.stderr
@@ -268,7 +268,7 @@ class TurboQuant:
             }
 
         raise RuntimeError(
-            "Could not parse memory stats from tq_run output.\n"
+            "Could not parse memory stats from quant output.\n"
             f"stderr: {result.stderr[-500:]}"
         )
 
@@ -276,7 +276,7 @@ class TurboQuant:
         """Print model info and return as string.
 
         Returns:
-            Model info text from tq_run --info.
+            Model info text from quant --info.
         """
         result = self._run(["--info"], timeout=timeout)
         return (result.stdout + result.stderr).strip()

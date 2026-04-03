@@ -2,8 +2,8 @@
 """
 TurboQuant.cpp -- CLI Wrapper Example
 
-Demonstrates the subprocess-based Python bindings that call the tq_run binary.
-No C FFI, no NumPy, no shared library -- just a model file and the tq_run binary.
+Demonstrates the subprocess-based Python bindings that call the quant binary.
+No C FFI, no NumPy, no shared library -- just a model file and the quant binary.
 
 Prerequisites:
     cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -11,7 +11,7 @@ Prerequisites:
 
 Usage:
     python3 bindings/python/example.py models/qwen3.5-0.8b.tqm
-    TURBOQUANT_BIN=./build/tq_run python3 bindings/python/example.py model.gguf
+    TURBOQUANT_BIN=./build/quant python3 bindings/python/example.py model.gguf
 """
 
 import sys

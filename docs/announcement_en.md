@@ -18,7 +18,7 @@ KV cache: **7.5x compressed** with 99.4% attention accuracy.
 One binary. Zero Python. Load a model, generate text:
 
 ```bash
-./tq_run model.safetensors -t tokenizer.json -p "What is AI?" -j 4 -q
+./quant model.safetensors -t tokenizer.json -p "What is AI?" -j 4 -q
 ```
 
 Output:

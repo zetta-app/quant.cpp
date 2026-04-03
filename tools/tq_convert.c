@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "\nDone! Total: %.2f s (load=%.2f, quant=%.2f, write=%.2f)\n",
             load_time + quant_time + write_time,
             load_time, quant_time, write_time);
-    fprintf(stderr, "\nTo use: tq_run %s -t tokenizer.json -p \"Hello\"\n", output_path);
+    fprintf(stderr, "\nTo use: quant %s -t tokenizer.json -p \"Hello\"\n", output_path);
     fprintf(stderr, "  (tokenizer is embedded — -t flag is optional with TQM)\n");
 
     tq_free_model(model);

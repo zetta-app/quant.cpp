@@ -18,7 +18,7 @@ KV 캐시: **7.5배 압축**, 99.4% attention 정확도.
 하나의 바이너리. Python 없음. 모델 로드, 텍스트 생성:
 
 ```bash
-./tq_run model.safetensors -t tokenizer.json -p "What is AI?" -j 4 -q
+./quant model.safetensors -t tokenizer.json -p "What is AI?" -j 4 -q
 ```
 
 출력:
