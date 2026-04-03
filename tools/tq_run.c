@@ -355,11 +355,8 @@ int main(int argc, char** argv) {
         }
         state->delta_kv_enabled = delta_kv;
         state->delta_iframe_interval = delta_iframe_int;
-        /* Disable delta for hybrid DeltaNet models (causes NaN) */
-        if (state->delta_kv_enabled && c->delta_n_heads > 0) {
-            fprintf(stderr, "Warning: delta KV disabled for hybrid DeltaNet model\n");
-            state->delta_kv_enabled = 0;
-        }
+        /* Hybrid DeltaNet models: delta KV applies only to self_attn layers.
+         * DeltaNet layers don't use key_cache, so delta compression is safe. */
         if (state->delta_kv_enabled) {
             int ifi = delta_iframe_int > 0 ? delta_iframe_int : 64;
             fprintf(stderr, "Delta KV compression: ENABLED (mixed-precision, I-frame=%d)\n", ifi);
@@ -419,7 +416,7 @@ int main(int argc, char** argv) {
         if (delta_kv) {
             int ifi = delta_iframe_int > 0 ? delta_iframe_int : 64;
             fprintf(stderr, "I-frame int:  %d (FP32 I-frames, %d-bit P-frames)\n",
-                    ifi, kv_type == TQ_UNIFORM_2B ? 2 : 4);
+                    ifi, kv_type == TQ_TYPE_UNIFORM_2B ? 2 : 4);
         }
         fprintf(stderr, "V quant:      %s\n", value_quant_bits == 4 ? "Q4" : (value_quant_bits == 2 ? "Q2" : "FP16"));
         fprintf(stderr, "Avg NLL:      %.6f\n", avg_nll);
@@ -1009,6 +1006,7 @@ int main(int argc, char** argv) {
     config.value_quant_bits = value_quant_bits;
     config.v_highres_window = v_highres_window;
     config.delta_kv = delta_kv;
+    config.delta_iframe_interval = delta_iframe_int;
     config.on_token = print_token;
     config.user_data = NULL;
 
