@@ -4,7 +4,7 @@
 
 Embeddable LLM inference in pure C.
 
-33K LOC. Zero dependencies. Read it in an afternoon.
+33K LOC. No external libraries. Read it in an afternoon.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![CI](https://img.shields.io/github/actions/workflow/status/quantumaikr/quant.cpp/ci.yml?label=CI)]()
@@ -14,13 +14,15 @@ Embeddable LLM inference in pure C.
 
 ## What quant.cpp does
 
-**4x longer context on the same hardware.** Delta KV compression fits more tokens into your available memory with no quality loss.
+**~4x longer context on the same hardware.** KV cache compression reduces per-token memory by 3.8x, extending context proportionally.
 
-| Hardware | Model | Without | With quant.cpp | Gain |
+| Hardware | Model | FP16 KV | 4-bit K + Q4 V | Gain |
 |----------|-------|---------|----------------|------|
-| 8GB Laptop | Llama 8B (Q4) | 16K tokens | 61K tokens | 3.8x |
-| 16GB Mac Air | SmolLM2 1.7B | 78K tokens | 298K tokens | 3.8x |
-| 24GB RTX 3090 | Llama 8B (Q4) | 147K tokens | 559K tokens | 3.8x |
+| 8GB Laptop | Llama 8B (Q4) | ~16K tokens | ~61K tokens | 3.8x |
+| 16GB Mac Air | SmolLM2 1.7B | ~78K tokens | ~298K tokens | 3.8x |
+| 24GB RTX 3090 | Llama 8B (Q4) | ~147K tokens | ~559K tokens | 3.8x |
+
+*Estimates based on KV memory reduction. Actual context depends on available memory after model weights.*
 
 ```bash
 ./quant model.gguf -p "hello"
@@ -34,7 +36,7 @@ Embeddable LLM inference in pure C.
 |--|-----------|-----------|
 | Code | **33K LOC**, pure C | 250K+ LOC, C++ |
 | Design | Read, modify, embed | Feature-complete |
-| Dependencies | **Zero** (libc only) | ggml framework |
+| Dependencies | libc + pthreads only | ggml framework |
 | KV compression | PPL **-3.2%** (better than FP32) | PPL +10.6% |
 
 quant.cpp is not a fork. It's a standalone engine built from scratch for one goal: **LLM inference you can understand, customize, and ship inside your own product.**
@@ -111,7 +113,7 @@ Cross-model: SmolLM2 1.7B (-1.6%), Qwen3.5 0.8B (+0.9%), Qwen3.5 4B (+0.6%).
 | Gemma 3 270M | Gemma 3 | 270M | Working |
 | Gemma 4 E2B | Gemma 4 | 2B | WIP |
 
-5 architectures: Llama, Gemma 3/4, Qwen3.5 (DeltaNet hybrid), Qwen2-MoE.
+Architectures: Llama/Qwen3.5 (shared path), Gemma 3/4 (sliding + full attention), Qwen2-MoE.
 
 GGUF format. Load any llama.cpp-compatible model file.
 

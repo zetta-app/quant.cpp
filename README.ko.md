@@ -2,7 +2,7 @@
 
 ![quant.cpp Hero](docs/assets/hero.png)
 
-로컬 LLM을 위한 미니멀 C 추론 엔진. 33K LOC. 외부 의존성 없음.
+로컬 LLM을 위한 미니멀 C 추론 엔진. 33K LOC. 외부 라이브러리 없음.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 [![CI](https://img.shields.io/github/actions/workflow/status/quantumaikr/quant.cpp/ci.yml?label=CI)]()
@@ -111,7 +111,7 @@ cmake --build build -j$(nproc)
 | Gemma 3 270M | Gemma 3 | 270M | 4-bit K verified |
 | Gemma 4 E2B | Gemma 4 | 2B | WIP |
 
-5개 아키텍처: Llama, Gemma 3, Gemma 4, Qwen3.5 (DeltaNet), Qwen2-MoE.
+아키텍처: Llama/Qwen3.5 (공유 경로), Gemma 3/4 (sliding + full attention), Qwen2-MoE.
 
 ---
 
