@@ -1,5 +1,7 @@
 # quant.cpp
 
+![quant.cpp Hero](docs/assets/hero.png)
+
 Embeddable LLM inference in pure C.
 
 33K LOC. Zero dependencies. Read it in an afternoon.

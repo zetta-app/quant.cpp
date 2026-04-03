@@ -1,5 +1,7 @@
 # quant.cpp
 
+![quant.cpp Hero](docs/assets/hero.png)
+
 로컬 LLM을 위한 미니멀 C 추론 엔진. 33K LOC. 외부 의존성 없음.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)]()
