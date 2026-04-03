@@ -32,3 +32,30 @@ Keys stored ONLY in quantized cache. Attention dequantizes per-query.
 4. **Below Q4 V: noticeable degradation.** Q2 V adds +36% PPL.
 5. **RHT-based types (turbo_kv_*) underperform uniform at head_dim=64.**
    turbo_kv_4b PPL is worse than uniform_4b despite same bit count.
+
+## 2-bit Research: All Approaches Tested (SmolLM2 1.7B)
+
+### Per-delta cosine (individual, dim=256, 199 deltas)
+| Method | Cosine | Notes |
+|--------|--------|-------|
+| 2-bit uniform delta | 0.9975 | baseline |
+| 2-bit + error feedback | 0.9963 | slightly worse |
+| 2-bit NF2 (non-uniform) | 0.9959 | worse |
+| 3-bit uniform delta | 0.9993 | reference |
+
+### Accumulated cosine (200 steps, drift)
+| Method | Avg cosine | Notes |
+|--------|-----------|-------|
+| Standard delta+2-bit | 0.885 | drift accumulation |
+| Norm-corrected delta+2-bit | 0.877 | worse (distorts direction) |
+
+### Second-order delta
+| Metric | d1 | d2 | d2/d1 |
+|--------|----|----|-------|
+| Range | 9.58 | 9.16 | 95.7% |
+| RMS | 0.351 | 0.289 | 82.4% |
+
+### Conclusion
+2-bit drift over 200 tokens (cos 0.997 → 0.885) is the fundamental barrier.
+No tested approach (error feedback, NF2, norm correction, 2nd-order) overcomes it.
+3-bit + delta (+1.1% PPL) is the practical minimum.
