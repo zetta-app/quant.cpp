@@ -96,6 +96,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --bench-prefill  Benchmark prefill speed with/without KV quantization\n");
     fprintf(stderr, "  --ctx <N>        Override max context length (default: 4096)\n");
     fprintf(stderr, "  --delta, -D      Enable delta KV compression (store key deltas)\n");
+    fprintf(stderr, "  --k-window <N>   Age-based K: recent N tokens FP32, rest quantized\n");
 }
 
 int main(int argc, char** argv) {
@@ -128,6 +129,7 @@ int main(int argc, char** argv) {
     int override_ctx = 0;  /* 0 = use model default (capped at 4096) */
     int delta_kv = 0;      /* 1 = delta KV compression (store key deltas) */
     int delta_iframe_int = 0; /* I-frame interval for delta KV (0 = auto = 64) */
+    int k_highres_window = 0; /* age-based: recent N keys at FP32, rest at 2-bit */
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -210,6 +212,8 @@ int main(int argc, char** argv) {
             delta_kv = 1;
         } else if (strcmp(argv[i], "--iframe") == 0 && i + 1 < argc) {
             delta_iframe_int = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--k-window") == 0 && i + 1 < argc) {
+            k_highres_window = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -360,6 +364,16 @@ int main(int argc, char** argv) {
         if (state->delta_kv_enabled) {
             int ifi = delta_iframe_int > 0 ? delta_iframe_int : 64;
             fprintf(stderr, "Delta KV compression: ENABLED (mixed-precision, I-frame=%d)\n", ifi);
+        }
+
+        /* Set up K highres window (age-based progressive K compression) */
+        if (k_highres_window > 0 && state->kv_quant_type < TQ_TYPE_COUNT && state->quant_key_cache) {
+            int kv_dim_e = model->config.n_kv_heads * model->config.head_dim;
+            int cache_kv_dim_e = model->config.n_kv_heads * model->config.head_dim;
+            state->k_highres_window = k_highres_window;
+            state->key_highres_fp32 = (float*)calloc(
+                (size_t)model->config.n_layers * k_highres_window * cache_kv_dim_e, sizeof(float));
+            fprintf(stderr, "K highres window: %d tokens at FP32 (age-based progressive)\n", k_highres_window);
         }
 
         /* Teacher-forced forward: accumulate negative log-likelihood */
@@ -1007,6 +1021,7 @@ int main(int argc, char** argv) {
     config.v_highres_window = v_highres_window;
     config.delta_kv = delta_kv;
     config.delta_iframe_interval = delta_iframe_int;
+    config.k_highres_window = k_highres_window;
     config.on_token = print_token;
     config.user_data = NULL;
 

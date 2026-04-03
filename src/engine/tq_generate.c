@@ -193,6 +193,17 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
             (size_t)n_layers * window * kv_dim, sizeof(uint16_t));
     }
 
+    /* Set up K highres window (age-based progressive compression) */
+    if (config->k_highres_window > 0 &&
+        state->kv_quant_type < TQ_TYPE_COUNT && state->quant_key_cache != NULL) {
+        int n_layers = model->config.n_layers;
+        int kv_dim = model->config.n_kv_heads * model->config.head_dim;
+        int window = config->k_highres_window;
+        state->k_highres_window = window;
+        state->key_highres_fp32 = (float*)calloc(
+            (size_t)n_layers * window * kv_dim, sizeof(float));
+    }
+
     /* Encode prompt */
     int prompt_tokens[4096];
     int n_prompt = 0;

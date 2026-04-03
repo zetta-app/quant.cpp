@@ -350,6 +350,7 @@ void tq_free_state(tq_state_t* state) {
     free(state->profile_stats);
     free(state->profile_accum);
     free(state->ple_buf);
+    free(state->key_highres_fp32);
     if (state->moe_state) {
         tq_moe_free_state((tq_moe_state_t*)state->moe_state);
     }
@@ -1041,6 +1042,14 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         /* Use cache_kv_dim for position stride (cache allocated with sliding dims).
          * Full layers write fewer floats (kv_dim < cache_kv_dim) but at correct stride. */
         memcpy(key_cache_layer + (size_t)pos * cache_kv_dim, s->k, kv_dim * sizeof(float));
+    } else if (s->k_highres_window > 0 && s->key_highres_fp32) {
+        /* Age-based progressive: store FP32 copy in circular highres buffer.
+         * Old keys live only in the quant cache (2-bit). Recent keys use FP32. */
+        int win_idx = pos % s->k_highres_window;
+        size_t hr_layer_stride = (size_t)s->k_highres_window * cache_kv_dim;
+        float* hr_dst = s->key_highres_fp32
+            + (size_t)l * hr_layer_stride + (size_t)win_idx * cache_kv_dim;
+        memcpy(hr_dst, s->k, kv_dim * sizeof(float));
     } else if (s->delta_kv_enabled) {
         /* Mixed-precision delta: I-frames stored in FP32 key_cache for high-precision
          * reference points. P-frames stored as 2-bit deltas in quant_key_cache.
@@ -1353,38 +1362,62 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             /* Dequant attention: read from quantized key cache, dequantize
              * each position's key on the fly, then compute FP32 dot product.
              * This is the path that delivers REAL memory savings — no FP32
-             * key cache is stored for previous positions. */
+             * key cache is stored for previous positions.
+             *
+             * When k_highres_window is active (age-based progressive), recent
+             * tokens within the window use FP32 from the circular buffer.
+             * Old tokens use the quant cache (typically 2-bit). */
             const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
             float inv_scale = 1.0f / sqrtf(attn_scale_dim);
-            float dequant_buf[512]; /* temp buffer for one head's dequantized key (up to 512 for Gemma 4 full layers) */
+            float dequant_buf[512];
+
+            int k_hr_win = s->k_highres_window;
+            int k_hr_active = (k_hr_win > 0 && s->key_highres_fp32 != NULL);
+            /* Window boundary: positions >= window_start are in the FP32 window */
+            int k_window_start = k_hr_active ? (pos - k_hr_win + 1) : seq_len;
+            if (k_window_start < 0) k_window_start = 0;
+
+            size_t hr_layer_stride = k_hr_active ?
+                (size_t)k_hr_win * cache_kv_dim : 0;
 
             for (int t = 0; t < attn_start; t++) atth[t] = -1e30f;
 
             for (int t = attn_start; t < seq_len; t++) {
-                const uint8_t* quant_src = (const uint8_t*)s->quant_key_cache
-                    + (size_t)l * s->quant_kv_stride
-                    + (size_t)t * cache_n_kv_heads * s->quant_head_stride
-                    + (size_t)kv_h * s->quant_head_stride;
+                const float* key_ptr;
 
-                traits->dequantize(quant_src, dequant_buf, head_dim);
+                if (k_hr_active && t >= k_window_start) {
+                    /* Recent token: read from FP32 highres circular buffer */
+                    int win_idx = t % k_hr_win;
+                    key_ptr = s->key_highres_fp32
+                        + (size_t)l * hr_layer_stride
+                        + (size_t)win_idx * cache_kv_dim
+                        + kv_h * head_dim;
+                } else {
+                    /* Old token: dequantize from quant cache */
+                    const uint8_t* quant_src = (const uint8_t*)s->quant_key_cache
+                        + (size_t)l * s->quant_kv_stride
+                        + (size_t)t * cache_n_kv_heads * s->quant_head_stride
+                        + (size_t)kv_h * s->quant_head_stride;
+                    traits->dequantize(quant_src, dequant_buf, head_dim);
+                    key_ptr = dequant_buf;
+                }
 
                 float score = 0.0f;
 #ifdef __ARM_NEON
-                /* NEON-optimized dot product */
                 float32x4_t vsum = vdupq_n_f32(0.0f);
                 int d = 0;
                 for (; d + 4 <= head_dim; d += 4) {
                     float32x4_t vq = vld1q_f32(qh + d);
-                    float32x4_t vk = vld1q_f32(dequant_buf + d);
+                    float32x4_t vk = vld1q_f32(key_ptr + d);
                     vsum = vfmaq_f32(vsum, vq, vk);
                 }
                 score = vaddvq_f32(vsum);
                 for (; d < head_dim; d++) {
-                    score += qh[d] * dequant_buf[d];
+                    score += qh[d] * key_ptr[d];
                 }
 #else
                 for (int d = 0; d < head_dim; d++) {
-                    score += qh[d] * dequant_buf[d];
+                    score += qh[d] * key_ptr[d];
                 }
 #endif
                 atth[t] = score * inv_scale;

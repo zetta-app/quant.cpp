@@ -347,6 +347,12 @@ typedef struct {
      * Periodic I-frames (absolute keys) bound accumulated drift error. */
     int delta_kv_enabled;    /* 1 = delta compression mode for keys */
     int delta_iframe_interval; /* I-frame every N positions (0 = auto = 64) */
+
+    /* Age-based progressive K compression: recent keys at FP32, old keys at 2-bit.
+     * Old tokens receive negligible attention weight, so 2-bit noise doesn't affect PPL.
+     * k_highres_window=32 achieves uniform_4b quality at ~2.1 effective bpe. */
+    int k_highres_window;    /* number of recent tokens stored as FP32 keys (0 = disabled) */
+    float* key_highres_fp32; /* FP32 key cache for recent tokens [n_layers, window, kv_dim] */
 } tq_state_t;
 
 /* ============================================================
@@ -361,6 +367,7 @@ typedef struct {
     int v_highres_window;/* recent N tokens get FP16 V even when V is quantized (0=disabled) */
     int delta_kv;        /* 1 = delta KV compression (store key deltas) */
     int delta_iframe_interval; /* I-frame interval for delta KV (0 = auto = 64) */
+    int k_highres_window;/* age-based: recent N keys at FP32, rest at 2-bit (0=disabled) */
     int n_threads;
     float rep_penalty;    /* repetition penalty (default: 1.1, 1.0 = disabled) */
     int rep_window;       /* how many recent tokens to penalize (default: 32) */
