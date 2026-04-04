@@ -10,6 +10,7 @@ option(TQ_BUILD_CUDA "Build CUDA backend" OFF)
 option(TQ_BUILD_METAL "Build Metal backend" OFF)
 option(TQ_BUILD_VULKAN "Build Vulkan backend" OFF)
 option(TQ_BUILD_ROCM "Build ROCm/HIP backend" OFF)
+option(TQ_BUILD_SERVER "Build OpenAI-compatible HTTP server" OFF)
 
 # Threads (pthread)
 find_package(Threads REQUIRED)
@@ -276,3 +277,19 @@ foreach(ex_src ${EXAMPLE_C_SOURCES} ${EXAMPLE_CXX_SOURCES})
     add_executable(${ex_name} ${ex_src})
     target_link_libraries(${ex_name} turboquant)
 endforeach()
+
+# OpenAI-compatible HTTP server
+if(TQ_BUILD_SERVER)
+    add_executable(quant-server src/server/tq_server.c)
+    target_include_directories(quant-server PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/server
+        ${CMAKE_SOURCE_DIR}/include)
+    target_compile_definitions(quant-server PRIVATE TQ_SERVER_MAIN)
+    target_link_libraries(quant-server turboquant Threads::Threads)
+    if(NOT MSVC)
+        target_link_libraries(quant-server m)
+    endif()
+    target_compile_options(quant-server PRIVATE
+        -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    message(STATUS "quant.cpp: HTTP server target enabled (quant-server)")
+endif()
