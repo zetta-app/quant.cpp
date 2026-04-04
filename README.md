@@ -14,13 +14,14 @@ Embeddable LLM inference in pure C. Also ships as [**quant.h**](#single-header-m
 
 ## What quant.cpp does
 
-**~4x longer context on the same hardware.** KV cache compression reduces per-token memory by 3.8x, extending context proportionally.
+**~7x longer context on the same hardware.** KV cache compression reduces per-token memory by up to 6.9x, extending context proportionally.
 
 | Hardware | Model | FP16 KV | Compressed KV | Gain |
 |----------|-------|---------|---------------|------|
+| 16GB Mac | Llama 3.2 3B (Q8) | ~50K tokens | **~350K tokens** | **6.9x** |
+| 16GB Mac | Gemma 4 26B MoE | ~4K tokens | **~30K tokens** | **6.9x** |
 | 8GB Laptop | Llama 8B (Q4) | ~16K tokens | ~61K tokens | 3.8x |
 | 16GB Mac Air | SmolLM2 1.7B | ~78K tokens | ~298K tokens | 3.8x |
-| **16GB Mac** | **Gemma 4 26B-A4B** | **~8K tokens** | **~20K tokens** | **3.5x** |
 | 24GB RTX 3090 | Llama 8B (Q4) | ~147K tokens | ~559K tokens | 3.8x |
 
 *Estimates based on KV memory reduction. Actual context depends on available memory after model weights.*
