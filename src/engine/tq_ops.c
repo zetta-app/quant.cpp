@@ -17,6 +17,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+
 /* ============================================================
  * Thread pool — condition variable based, minimal overhead
  * Workers sleep between dispatches, wake via cond_broadcast.
@@ -231,8 +235,22 @@ static void* matmul_worker(void* arg) {
  *
  * This is THE dominant cost in LLM inference (~90% of compute).
  * w is [n, d] row-major, x is [d], out is [n].
+ *
+ * On Apple Silicon: uses Accelerate cblas_sgemv which automatically
+ * dispatches to AMX coprocessor (2-5x faster than NEON).
  * ============================================================ */
 void tq_matmul(float* out, const float* x, const float* w, int n, int d) {
+#ifdef __APPLE__
+    /* Apple Accelerate → AMX coprocessor for large FP32 matmuls.
+     * cblas_sgemv is faster than NEON for large dimensions.
+     * For small n (< 64), NEON is faster due to lower overhead. */
+    if (n >= 64 && d >= 256) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, n, d,
+                    1.0f, w, d, x, 1, 0.0f, out, 1);
+        return;
+    }
+#endif
+
     int n_threads = g_n_threads;
 
     /* For small matrices or single-thread config, skip thread overhead */
