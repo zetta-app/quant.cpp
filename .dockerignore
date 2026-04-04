@@ -1,12 +1,35 @@
+# Build artifacts
 build/
-build-*/
-.git/
-.claude/
+cmake-build-*/
+
+# Reference implementations (large, not needed in image)
 refs/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docs and non-essential files
+docs/
+*.md
+LICENSE
+
+# Harness and CI
+harness/
+.claude/
+.github/
+
+# Models (mounted at runtime, not baked into image)
 models/
 *.gguf
-*.tqm
 *.safetensors
-__pycache__/
-*.pyc
-.venv/
+*.bin
+
+# WASM build
+wasm/

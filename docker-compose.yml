@@ -1,15 +1,25 @@
 services:
-  quant:
+  inference:
     build: .
+    image: quant.cpp:latest
     volumes:
-      - ./models:/quant/models
-    command: ["models/model.tqm", "-p", "Hello", "-k", "turbo_kv_1b"]
-
-  # Run with a custom prompt and KV type:
-  #   docker compose run quant models/model.tqm -p "Once upon a time" -k turbo_kv_3b -n 128
-  #
-  # Run perplexity evaluation:
-  #   docker compose run quant models/model.tqm --ppl models/test.txt -k turbo_kv_1b
-  #
-  # Show memory stats:
-  #   docker compose run quant models/model.tqm -p "Hello" -k turbo_kv_1b -M
+      - ./models:/models
+    environment:
+      # KV cache compression settings (passed as CLI args below)
+      - TQ_KV_TYPE=uniform_4b
+      - TQ_VALUE_QUANT=q4
+      - TQ_THREADS=4
+    ports:
+      - "8080:8080"
+    # Default: run model with KV compression
+    # Override command to change model path, prompt, or options
+    command:
+      - /models/model.gguf
+      - -k
+      - uniform_4b
+      - -v
+      - q4
+      - -j
+      - "4"
+      - -p
+      - "Hello, world"
