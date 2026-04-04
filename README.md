@@ -2,7 +2,7 @@
 
 ![quant.cpp Hero](docs/assets/hero.png)
 
-Embeddable LLM inference in pure C.
+Embeddable LLM inference in pure C. Also ships as [**quant.h**](#single-header-mode) — a single-header library.
 
 33K LOC. No external libraries. Read it in an afternoon.
 
@@ -54,11 +54,18 @@ Copy one file. Add LLM to any C project.
 ```c
 #define QUANT_IMPLEMENTATION
 #include "quant.h"
+#include <stdio.h>
+
+static void on_token(const char* text, void* ud) {
+    (void)ud;
+    printf("%s", text);
+    fflush(stdout);
+}
 
 int main() {
     quant_model* m = quant_load("model.gguf");
     quant_ctx*   c = quant_new(m, NULL);
-    quant_generate(c, "Hello!", print_token, NULL);
+    quant_generate(c, "Hello!", on_token, NULL);
     quant_free_ctx(c);
     quant_free_model(m);
 }
@@ -68,7 +75,31 @@ int main() {
 cc app.c -o app -lm -lpthread    # that's it
 ```
 
-15K lines, 628KB. No cmake, no build system, no dependencies.
+15K lines, 628KB. No cmake, no build system, no framework.
+
+**Full API** (6 functions):
+
+| Function | Description |
+|----------|-------------|
+| `quant_load(path)` | Load a GGUF model file |
+| `quant_new(model, config)` | Create inference context (config=NULL for defaults) |
+| `quant_generate(ctx, prompt, callback, userdata)` | Stream tokens via callback |
+| `quant_ask(ctx, prompt)` | Generate and return full string (caller frees) |
+| `quant_free_ctx(ctx)` | Free context |
+| `quant_free_model(model)` | Free model |
+
+**Config options:**
+
+```c
+quant_config cfg = {
+    .temperature = 0.7f,    // sampling temperature
+    .top_p       = 0.9f,    // nucleus sampling
+    .max_tokens  = 256,     // generation limit
+    .n_threads   = 4,       // matmul threads
+    .kv_compress = 1,       // 0=off, 1=4-bit K+V, 2=delta+3-bit
+};
+quant_ctx* c = quant_new(model, &cfg);
+```
 
 ---
 
@@ -164,7 +195,15 @@ llama.cpp is a full-featured inference framework (250K+ LOC). quant.cpp is a min
 
 **Can I embed this in my app?**
 
-Yes. Pure C11, zero dependencies. Copy the source files, link against libc/libm, and call `tq_load_model()` / `tq_generate()`. Works on Linux, macOS, Windows, iOS, Android, and WASM. Thread pool is global but mutex-protected.
+Yes. Two options:
+1. **Single-header** (easiest): Copy `quant.h` into your project. `#define QUANT_IMPLEMENTATION` in one .c file. Done.
+2. **Full library**: Link against `libturboquant.a` and call `tq_load_model()` / `tq_generate()`.
+
+Works on Linux, macOS, Windows, iOS, Android, and WASM. Thread pool is global but mutex-protected.
+
+**What's the difference between quant.h and the full build?**
+
+`quant.h` is the core inference engine (15K LOC) in a single file. The full build (33K LOC) adds GPU backends (Metal, CUDA, Vulkan), MoE routing, advanced quantization types, CLI tools, and benchmarks. Use quant.h for embedding; use the full build for research and development.
 
 **What about sub-3-bit quantization?**
 
