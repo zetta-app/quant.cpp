@@ -550,16 +550,19 @@ kernel void matmul_tq_q4(
         const float sc = weight_sc[sc_row + b];
         device const uint8_t* qs = weight_qs + qs_row + b * 16;
         const uint base = b * 32;
+        /* Packing: byte j = (q[2j+1] << 4) | q[2j]
+         * Low nibble  (& 0xF) = element at index 2*j
+         * High nibble (>> 4)  = element at index 2*j+1 */
         for (uint k = 0; k < 16; k += 4) {
             uint8_t p0 = qs[k], p1 = qs[k+1], p2 = qs[k+2], p3 = qs[k+3];
-            sum += (float(int(p0 & 0xF) - 8) * input[base + k]
-                 +  float(int(p0 >> 4)  - 8) * input[base + k + 16]
-                 +  float(int(p1 & 0xF) - 8) * input[base + k + 1]
-                 +  float(int(p1 >> 4)  - 8) * input[base + k + 17]
-                 +  float(int(p2 & 0xF) - 8) * input[base + k + 2]
-                 +  float(int(p2 >> 4)  - 8) * input[base + k + 18]
-                 +  float(int(p3 & 0xF) - 8) * input[base + k + 3]
-                 +  float(int(p3 >> 4)  - 8) * input[base + k + 19]) * sc;
+            sum += (float(int(p0 & 0xF) - 8) * input[base + 2*k]
+                 +  float(int(p0 >> 4)  - 8) * input[base + 2*k + 1]
+                 +  float(int(p1 & 0xF) - 8) * input[base + 2*(k+1)]
+                 +  float(int(p1 >> 4)  - 8) * input[base + 2*(k+1) + 1]
+                 +  float(int(p2 & 0xF) - 8) * input[base + 2*(k+2)]
+                 +  float(int(p2 >> 4)  - 8) * input[base + 2*(k+2) + 1]
+                 +  float(int(p3 & 0xF) - 8) * input[base + 2*(k+3)]
+                 +  float(int(p3 >> 4)  - 8) * input[base + 2*(k+3) + 1]) * sc;
         }
     }
 

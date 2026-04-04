@@ -52,6 +52,13 @@ static id<MTLComputePipelineState> tq_pipe_matmul_iq2_xxs  = nil;
 static id<MTLComputePipelineState> tq_pipe_matmul_iq2_s    = nil;
 static id<MTLComputePipelineState> tq_pipe_matmul_q8_0     = nil;
 static id<MTLComputePipelineState> tq_pipe_matmul_q4_k     = nil;
+static id<MTLComputePipelineState> tq_pipe_matmul_tq_q4   = nil;
+
+/* Cached pipelines — element-wise kernels */
+static id<MTLComputePipelineState> tq_pipe_rmsnorm         = nil;
+static id<MTLComputePipelineState> tq_pipe_silu            = nil;
+static id<MTLComputePipelineState> tq_pipe_mul_elementwise = nil;
+static id<MTLComputePipelineState> tq_pipe_add_vectors     = nil;
 
 /* Cached pipelines — fused MoE kernels */
 static id<MTLComputePipelineState> tq_pipe_moe_gate_up     = nil;
@@ -326,6 +333,13 @@ int tq_init_metal_backend(void) {
         tq_pipe_matmul_iq2_s   = makePipe(@"matmul_iq2_s");
         tq_pipe_matmul_q8_0 = makePipe(@"matmul_q8_0");
         tq_pipe_matmul_q4_k = makePipe(@"matmul_q4_k");
+        tq_pipe_matmul_tq_q4 = makePipe(@"matmul_tq_q4");
+
+        /* Create compute pipelines — element-wise ops */
+        tq_pipe_rmsnorm         = makePipe(@"rmsnorm");
+        tq_pipe_silu            = makePipe(@"silu");
+        tq_pipe_mul_elementwise = makePipe(@"mul_elementwise");
+        tq_pipe_add_vectors     = makePipe(@"add_vectors");
 
         /* Create IQ2_S codebook buffer (shared by matmul and MoE kernels) */
         {
@@ -437,6 +451,13 @@ void tq_free_metal_backend(void) {
     tq_pipe_matmul_iq2_s   = nil;
     tq_pipe_matmul_q8_0 = nil;
     tq_pipe_matmul_q4_k = nil;
+    tq_pipe_matmul_tq_q4 = nil;
+
+    /* Element-wise pipelines */
+    tq_pipe_rmsnorm = nil;
+    tq_pipe_silu = nil;
+    tq_pipe_mul_elementwise = nil;
+    tq_pipe_add_vectors = nil;
 
     /* MoE pipelines */
     tq_pipe_moe_gate_up = nil;
@@ -774,13 +795,157 @@ int tq_metal_matmul_gguf(float* out, const float* x, const void* weight,
 }
 
 /**
- * Q4_K matmul dispatch stub — not yet implemented.
- * Returns -1 to signal caller to fall back to CPU path.
+ * TQ internal Q4 matmul dispatch.
+ *
+ * Format: block_size=32, 16 packed bytes (4-bit nibbles) + 1 float scale.
+ * Dequant: (nibble - 8) * scale.  Layout matches matmul_tq_q4 shader.
+ *
+ * Supports both batch mode (encode only, defer commit) and immediate mode
+ * (encode, commit, wait, copy).
+ *
+ * @param out      Output vector [n] (CPU pointer)
+ * @param x        Input vector [d] (CPU pointer)
+ * @param w_qs     Packed Q4 weights [n * (d/32) * 16] bytes
+ * @param w_scales Weight scales [n * (d/32)] floats
+ * @param n        Output dimension (number of rows)
+ * @param d        Input dimension (must be multiple of 32)
+ * @return 0 on success, -1 on failure (caller falls back to CPU)
  */
 int tq_metal_matmul_q4(float* out, const float* x, const uint8_t* w_qs,
                         const float* w_scales, int n, int d) {
-    (void)out; (void)x; (void)w_qs; (void)w_scales; (void)n; (void)d;
-    return -1; /* Not yet implemented — CPU fallback */
+    if (!tq_metal_available()) return -1;
+    if (!tq_pipe_matmul_tq_q4) return -1;
+
+    @autoreleasepool {
+        int n_blocks = d / 32;
+        size_t qs_size  = (size_t)n * n_blocks * 16;
+        size_t sc_size  = (size_t)n * n_blocks * sizeof(float);
+        size_t input_size  = ((size_t)d * sizeof(float) + 15) & ~15UL;
+        size_t output_size = ((size_t)n * sizeof(float) + 15) & ~15UL;
+
+        /* Weight buffers: zero-copy via cache */
+        id<MTLBuffer> qs_buf = tq_get_weight_buffer(w_qs, qs_size);
+        if (!qs_buf) return -1;
+        id<MTLBuffer> sc_buf = tq_get_weight_buffer(w_scales, sc_size);
+        if (!sc_buf) return -1;
+
+        /* Input buffer: reuse shared input buf */
+        if (tq_shared_input_dim != (uint32_t)d || !tq_shared_input_buf) {
+            tq_shared_input_buf = [tq_mtl_device
+                newBufferWithLength:input_size
+                            options:MTLResourceStorageModeShared];
+            if (!tq_shared_input_buf) return -1;
+            tq_shared_input_dim = (uint32_t)d;
+        }
+        memcpy([tq_shared_input_buf contents], x, (size_t)d * sizeof(float));
+
+        /* Output buffer */
+        id<MTLBuffer> output_buf = nil;
+        if (tq_batch.active) {
+            if (tq_batch.n_copies >= TQ_BATCH_MAX_OPS) {
+                tq_metal_batch_flush();
+            }
+            output_buf = [tq_mtl_device
+                newBufferWithLength:output_size
+                            options:MTLResourceStorageModeShared];
+            if (!output_buf) return -1;
+        } else {
+            static id<MTLBuffer> imm_q4_output_buf = nil;
+            static uint32_t imm_q4_output_dim = 0;
+            if (imm_q4_output_dim != (uint32_t)n || !imm_q4_output_buf) {
+                imm_q4_output_buf = [tq_mtl_device
+                    newBufferWithLength:output_size
+                                options:MTLResourceStorageModeShared];
+                if (!imm_q4_output_buf) return -1;
+                imm_q4_output_dim = (uint32_t)n;
+            }
+            output_buf = imm_q4_output_buf;
+        }
+
+        /* Dimension uniform buffers */
+        id<MTLBuffer> indim_buf = nil;
+        id<MTLBuffer> outdim_buf = nil;
+        if (tq_batch.active) {
+            indim_buf = [tq_mtl_device
+                newBufferWithLength:sizeof(uint32_t)
+                            options:MTLResourceStorageModeShared];
+            outdim_buf = [tq_mtl_device
+                newBufferWithLength:sizeof(uint32_t)
+                            options:MTLResourceStorageModeShared];
+            if (!indim_buf || !outdim_buf) return -1;
+        } else {
+            indim_buf = tq_shared_indim_buf;
+            outdim_buf = tq_shared_outdim_buf;
+        }
+        *(uint32_t*)[indim_buf contents]  = (uint32_t)d;
+        *(uint32_t*)[outdim_buf contents] = (uint32_t)n;
+
+        /* Encode compute command.
+         * Shader signature: input(0), output(1), weight_qs(2),
+         *                   weight_sc(3), in_dim(4), out_dim(5) */
+        if (tq_batch.active) {
+            /* Batch mode: lazily create command buffer and encoder */
+            if (!tq_batch.cmd_buf) {
+                tq_batch.cmd_buf = [tq_mtl_queue commandBuffer];
+                if (!tq_batch.cmd_buf) return -1;
+            }
+            if (!tq_batch.encoder) {
+                tq_batch.encoder = [tq_batch.cmd_buf computeCommandEncoder];
+                if (!tq_batch.encoder) return -1;
+            }
+            id<MTLComputeCommandEncoder> enc = tq_batch.encoder;
+
+            [enc setComputePipelineState:tq_pipe_matmul_tq_q4];
+            [enc setBuffer:tq_shared_input_buf offset:0 atIndex:0];
+            [enc setBuffer:output_buf          offset:0 atIndex:1];
+            [enc setBuffer:qs_buf              offset:0 atIndex:2];
+            [enc setBuffer:sc_buf              offset:0 atIndex:3];
+            [enc setBuffer:indim_buf           offset:0 atIndex:4];
+            [enc setBuffer:outdim_buf          offset:0 atIndex:5];
+
+            MTLSize gridSize      = MTLSizeMake((NSUInteger)n, 1, 1);
+            MTLSize threadgroupSz = MTLSizeMake(TQ_MATMUL_TG_SIZE, 1, 1);
+            [enc dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSz];
+
+            /* Record pending copy */
+            tq_batch_pending_copy_t* pc = &tq_batch.copies[tq_batch.n_copies++];
+            pc->cpu_dst = out;
+            pc->gpu_buf = output_buf;
+            pc->size    = (size_t)n * sizeof(float);
+
+            return 0;
+        } else {
+            /* Immediate mode */
+            id<MTLCommandBuffer> cmdBuf = [tq_mtl_queue commandBuffer];
+            if (!cmdBuf) return -1;
+            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+            if (!enc) return -1;
+
+            [enc setComputePipelineState:tq_pipe_matmul_tq_q4];
+            [enc setBuffer:tq_shared_input_buf offset:0 atIndex:0];
+            [enc setBuffer:output_buf          offset:0 atIndex:1];
+            [enc setBuffer:qs_buf              offset:0 atIndex:2];
+            [enc setBuffer:sc_buf              offset:0 atIndex:3];
+            [enc setBuffer:indim_buf           offset:0 atIndex:4];
+            [enc setBuffer:outdim_buf          offset:0 atIndex:5];
+
+            MTLSize gridSize      = MTLSizeMake((NSUInteger)n, 1, 1);
+            MTLSize threadgroupSz = MTLSizeMake(TQ_MATMUL_TG_SIZE, 1, 1);
+            [enc dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSz];
+            [enc endEncoding];
+
+            [cmdBuf commit];
+            [cmdBuf waitUntilCompleted];
+
+            if (cmdBuf.status == MTLCommandBufferStatusError) {
+                NSLog(@"TurboQuant: Metal TQ Q4 matmul error: %@", cmdBuf.error);
+                return -1;
+            }
+
+            memcpy(out, [output_buf contents], (size_t)n * sizeof(float));
+            return 0;
+        }
+    }
 }
 
 /* ============================================================
@@ -1104,6 +1269,225 @@ int tq_metal_moe_forward(
         memcpy(hb_output, [gate_buf contents], inter_bytes);
 
         return 0; /* Full GPU success */
+    }
+}
+
+/* ============================================================
+ * Element-wise dispatch functions
+ *
+ * These run RMSNorm, SiLU, mul, and add on the GPU to avoid
+ * GPU->CPU->GPU round-trips between matmul dispatches.
+ *
+ * NOT connected to tq_ops.c yet -- standalone dispatch ready
+ * for integration when the full forward pass orchestrator is built.
+ * ============================================================ */
+
+/**
+ * RMSNorm on Metal GPU.
+ * out[i] = (x[i] / rms(x)) * weight[i], rms = sqrt(mean(x^2) + eps)
+ * Returns 0 on success, -1 on failure.
+ */
+int tq_metal_rmsnorm(float* out, const float* x, const float* w, int n, float eps) {
+    @autoreleasepool {
+        if (!tq_mtl_device || !tq_pipe_rmsnorm || n <= 0) return -1;
+
+        size_t buf_bytes = (size_t)n * sizeof(float);
+        id<MTLBuffer> x_buf = [tq_mtl_device newBufferWithBytes:x
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> w_buf = [tq_mtl_device newBufferWithBytes:w
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> o_buf = [tq_mtl_device newBufferWithLength:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        uint32_t n_val = (uint32_t)n;
+        id<MTLBuffer> n_buf = [tq_mtl_device newBufferWithBytes:&n_val
+                                                          length:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> eps_buf = [tq_mtl_device newBufferWithBytes:&eps
+                                                            length:sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        if (!x_buf || !w_buf || !o_buf || !n_buf || !eps_buf) return -1;
+
+        id<MTLCommandBuffer> cmdBuf = [tq_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+
+        [enc setComputePipelineState:tq_pipe_rmsnorm];
+        [enc setBuffer:x_buf   offset:0 atIndex:0];
+        [enc setBuffer:w_buf   offset:0 atIndex:1];
+        [enc setBuffer:o_buf   offset:0 atIndex:2];
+        [enc setBuffer:n_buf   offset:0 atIndex:3];
+        [enc setBuffer:eps_buf offset:0 atIndex:4];
+
+        /* One threadgroup of 256 threads for the reduction */
+        NSUInteger tg_size = 256;
+        if (tg_size > tq_pipe_rmsnorm.maxTotalThreadsPerThreadgroup) {
+            tg_size = tq_pipe_rmsnorm.maxTotalThreadsPerThreadgroup;
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) return -1;
+
+        memcpy(out, [o_buf contents], buf_bytes);
+        return 0;
+    }
+}
+
+/**
+ * SiLU activation on Metal GPU.
+ * out[i] = x[i] / (1 + exp(-x[i]))
+ * Returns 0 on success, -1 on failure.
+ */
+int tq_metal_silu(float* out, const float* x, int n) {
+    @autoreleasepool {
+        if (!tq_mtl_device || !tq_pipe_silu || n <= 0) return -1;
+
+        size_t buf_bytes = (size_t)n * sizeof(float);
+        id<MTLBuffer> x_buf = [tq_mtl_device newBufferWithBytes:x
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> o_buf = [tq_mtl_device newBufferWithLength:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        uint32_t n_val = (uint32_t)n;
+        id<MTLBuffer> n_buf = [tq_mtl_device newBufferWithBytes:&n_val
+                                                          length:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+        if (!x_buf || !o_buf || !n_buf) return -1;
+
+        id<MTLCommandBuffer> cmdBuf = [tq_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+
+        [enc setComputePipelineState:tq_pipe_silu];
+        [enc setBuffer:x_buf offset:0 atIndex:0];
+        [enc setBuffer:o_buf offset:0 atIndex:1];
+        [enc setBuffer:n_buf offset:0 atIndex:2];
+
+        /* One thread per element, threadgroups of 256 */
+        NSUInteger tg = 256;
+        if (tg > tq_pipe_silu.maxTotalThreadsPerThreadgroup) {
+            tg = tq_pipe_silu.maxTotalThreadsPerThreadgroup;
+        }
+        NSUInteger num_tg = ((NSUInteger)n + tg - 1) / tg;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) return -1;
+
+        memcpy(out, [o_buf contents], buf_bytes);
+        return 0;
+    }
+}
+
+/**
+ * Element-wise multiply on Metal GPU.
+ * out[i] = a[i] * b[i]
+ * Returns 0 on success, -1 on failure.
+ */
+int tq_metal_mul(float* out, const float* a, const float* b, int n) {
+    @autoreleasepool {
+        if (!tq_mtl_device || !tq_pipe_mul_elementwise || n <= 0) return -1;
+
+        size_t buf_bytes = (size_t)n * sizeof(float);
+        id<MTLBuffer> a_buf = [tq_mtl_device newBufferWithBytes:a
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [tq_mtl_device newBufferWithBytes:b
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> o_buf = [tq_mtl_device newBufferWithLength:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        uint32_t n_val = (uint32_t)n;
+        id<MTLBuffer> n_buf = [tq_mtl_device newBufferWithBytes:&n_val
+                                                          length:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+        if (!a_buf || !b_buf || !o_buf || !n_buf) return -1;
+
+        id<MTLCommandBuffer> cmdBuf = [tq_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+
+        [enc setComputePipelineState:tq_pipe_mul_elementwise];
+        [enc setBuffer:a_buf offset:0 atIndex:0];
+        [enc setBuffer:b_buf offset:0 atIndex:1];
+        [enc setBuffer:o_buf offset:0 atIndex:2];
+        [enc setBuffer:n_buf offset:0 atIndex:3];
+
+        NSUInteger tg = 256;
+        if (tg > tq_pipe_mul_elementwise.maxTotalThreadsPerThreadgroup) {
+            tg = tq_pipe_mul_elementwise.maxTotalThreadsPerThreadgroup;
+        }
+        NSUInteger num_tg = ((NSUInteger)n + tg - 1) / tg;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) return -1;
+
+        memcpy(out, [o_buf contents], buf_bytes);
+        return 0;
+    }
+}
+
+/**
+ * Vector add on Metal GPU.
+ * out[i] = a[i] + b[i]
+ * Returns 0 on success, -1 on failure.
+ */
+int tq_metal_add(float* out, const float* a, const float* b, int n) {
+    @autoreleasepool {
+        if (!tq_mtl_device || !tq_pipe_add_vectors || n <= 0) return -1;
+
+        size_t buf_bytes = (size_t)n * sizeof(float);
+        id<MTLBuffer> a_buf = [tq_mtl_device newBufferWithBytes:a
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [tq_mtl_device newBufferWithBytes:b
+                                                          length:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> o_buf = [tq_mtl_device newBufferWithLength:buf_bytes
+                                                         options:MTLResourceStorageModeShared];
+        uint32_t n_val = (uint32_t)n;
+        id<MTLBuffer> n_buf = [tq_mtl_device newBufferWithBytes:&n_val
+                                                          length:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+        if (!a_buf || !b_buf || !o_buf || !n_buf) return -1;
+
+        id<MTLCommandBuffer> cmdBuf = [tq_mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+
+        [enc setComputePipelineState:tq_pipe_add_vectors];
+        [enc setBuffer:a_buf offset:0 atIndex:0];
+        [enc setBuffer:b_buf offset:0 atIndex:1];
+        [enc setBuffer:o_buf offset:0 atIndex:2];
+        [enc setBuffer:n_buf offset:0 atIndex:3];
+
+        NSUInteger tg = 256;
+        if (tg > tq_pipe_add_vectors.maxTotalThreadsPerThreadgroup) {
+            tg = tq_pipe_add_vectors.maxTotalThreadsPerThreadgroup;
+        }
+        NSUInteger num_tg = ((NSUInteger)n + tg - 1) / tg;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+        [enc endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status == MTLCommandBufferStatusError) return -1;
+
+        memcpy(out, [o_buf contents], buf_bytes);
+        return 0;
     }
 }
 

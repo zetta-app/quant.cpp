@@ -18,6 +18,7 @@
 #endif
 
 #ifdef __APPLE__
+#define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
 #endif
 
@@ -864,8 +865,12 @@ void tq_matmul_q4(float* out, const float* x, const uint8_t* w_qs, const float* 
     {
         extern int tq_metal_batch_active(void);
         extern int tq_metal_matmul_q4(float*, const float*, const uint8_t*, const float*, int, int);
-        /* GPU: only in batch mode (batched independent matmuls) */
-        if (tq_metal_batch_active()) {
+        /* GPU: batch mode (batched independent matmuls), or immediate for
+         * very large matmuls where GPU throughput overcomes per-dispatch
+         * overhead (~0.1ms). For batch-1 inference on Apple Silicon unified
+         * memory, matmul is bandwidth-bound — Metal helps most for large
+         * output dimensions (classifier/logits) or when CPU is busy. */
+        if (tq_metal_batch_active() || n >= 512) {
             int rc = tq_metal_matmul_q4(out, x, w_qs, w_scales, n, d);
             if (rc == 0) return;
         }

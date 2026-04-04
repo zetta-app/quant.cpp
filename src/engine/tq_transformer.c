@@ -911,9 +911,8 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     /* When attn_output_gate is enabled, wq has shape [2*n_heads*head_dim, dim]
      * and outputs [Q, gate_q] concatenated. We project into xb2 as temp.
      *
-     * Batch Q+K+V GPU dispatches into one command buffer when using GGUF path.
-     * This reduces Metal dispatch overhead from 3 commits to 1. */
-    if (has_gguf) tq_metal_batch_begin_if_available();
+     * Q+K+V GPU dispatches are batched into one command buffer by the
+     * layer-level batch scope in tq_forward(). */
 
     float* gate_q = NULL;
     if (c->attn_output_gate) {
@@ -983,7 +982,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
     }
 
-    /* Flush batched Q+K+V GPU dispatches before using results */
+    /* Flush batched Q+K+V GPU dispatches before CPU-side RoPE/attention */
     if (has_gguf) tq_metal_batch_flush_if_available();
     TQ_PROF_STOP(_tp, matmul_ns);
 
@@ -1822,6 +1821,8 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         tq_matmul_gguf(s->xb2, s->xb, layer->gguf_wo, layer->gguf_wo_type, dim, n_heads * head_dim);
     else
         tq_matmul(s->xb2, s->xb, layer->wo, dim, n_heads * head_dim);
+    /* Flush wo GPU dispatch before CPU reads xb2 for residual add */
+    if (has_gguf) tq_metal_batch_flush_if_available();
     TQ_PROF_STOP(_tp, matmul_ns);
 
     /* Debug: print attention output before residual add */
@@ -1974,6 +1975,14 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         /* Pre-attention/DeltaNet RMSNorm */
         tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
 
+        /* Begin layer-level GPU batch scope: all GGUF matmuls in this layer
+         * (QKV, wo, gate, up, down) encode into shared command buffers.
+         * Intermediate flushes synchronize where CPU needs GPU results.
+         * This keeps batch mode active throughout the layer so even single
+         * matmuls (wo, down) benefit from batch-mode GPU dispatch. */
+        int layer_has_gguf = (layer->gguf_wq != NULL);
+        if (layer_has_gguf) tq_metal_batch_begin_if_available();
+
         if (layer->delta_a_log) {
             /* DeltaNet layer */
             deltanet_forward(model, s, l);
@@ -2088,7 +2097,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 tq_matmul_q4_preq(s->hb2, layer->w_up_q4, layer->w_up_q4s,
                                    s->xb_q8, s->xb_q8s, inter, dim);
             } else if (layer->gguf_w_gate) {
-                tq_metal_batch_begin_if_available();
+                /* Gate+up GPU dispatches batched by layer-level batch scope */
                 tq_matmul_gguf(s->hb, s->xb, layer->gguf_w_gate, layer->gguf_w_gate_type, inter, dim);
                 tq_matmul_gguf(s->hb2, s->xb, layer->gguf_w_up, layer->gguf_w_up_type, inter, dim);
                 tq_metal_batch_flush_if_available();
@@ -2130,6 +2139,8 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             } else {
                 tq_matmul(s->xb2, s->hb, layer->w_down, dim, inter);
             }
+            /* Flush w_down GPU dispatch before CPU reads xb2 for post-FFN norm / residual */
+            tq_metal_batch_flush_if_available();
             TQ_PROF_STOP(_tp, matmul_ns);
 
             /* Gemma: apply post-FFN norm if present. */
@@ -2190,6 +2201,9 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             /* hidden_state += normed */
             tq_add(s->x, s->x, ple_proj_out, dim);
         }
+
+        /* End layer-level GPU batch scope */
+        if (layer_has_gguf) tq_metal_batch_end_if_available();
 
         /* Gemma 4: layer_output_scale scales the layer's CONTRIBUTIONS (attn + ffn).
          * Essential for controlling gradient flow — model was trained with these scales. */

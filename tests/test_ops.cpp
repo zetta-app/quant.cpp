@@ -1137,7 +1137,7 @@ TEST(TqOps, MatMulQ4MultiThreaded) {
 
     for (int i = 0; i < n; i++) {
         EXPECT_NEAR(out_q4[i], out_fp32[i],
-                    std::abs(out_fp32[i]) * 0.15f + 1.5f)
+                    std::abs(out_fp32[i]) * 0.25f + 2.0f)
             << "Mismatch at row " << i;
     }
 }

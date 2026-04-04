@@ -961,8 +961,7 @@ moe_shared_expert:
                          hidden_dim, shared_dim);
         } else {
             /* Fallback: on-the-fly GGUF dequant */
-            tq_metal_batch_begin_if_available();
-
+            /* Gate+up batched by layer-level batch scope in tq_forward() */
             tq_matmul_gguf(state->expert_hb, input,
                            layer->shared_expert.w_gate, layer->shared_expert.gate_type,
                            shared_dim, hidden_dim);
@@ -978,6 +977,8 @@ moe_shared_expert:
             tq_matmul_gguf(state->expert_out, state->expert_hb,
                            layer->shared_expert.w_down, layer->shared_expert.down_type,
                            hidden_dim, shared_dim);
+            /* Flush w_down before CPU reads expert_out */
+            tq_metal_batch_flush_if_available();
         }
 
         for (int i = 0; i < hidden_dim; i++)

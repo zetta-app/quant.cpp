@@ -32,6 +32,10 @@ typedef enum {
     TQ_METAL_PIPE_VALUE_QUANTIZE_4B,
     TQ_METAL_PIPE_VALUE_QUANTIZE_2B,
     TQ_METAL_PIPE_VALUE_DEQUANT_MATMUL,
+    TQ_METAL_PIPE_RMSNORM,
+    TQ_METAL_PIPE_SILU,
+    TQ_METAL_PIPE_MUL_ELEMENTWISE,
+    TQ_METAL_PIPE_ADD_VECTORS,
     TQ_METAL_PIPE_COUNT
 } tq_metal_pipeline_id;
 
@@ -123,6 +127,34 @@ void tq_qjl_attention_metal(const float* query, const void* kv_cache,
 void tq_turbo_quantize_metal(const float* src, void* dst, int n);
 void tq_turbo_attention_metal(const float* query, const void* kv_cache,
                                float* scores, int seq_len, int head_dim);
+
+/* ============================================================
+ * Element-wise operations (between matmuls)
+ * ============================================================ */
+
+/**
+ * RMSNorm on Metal GPU.
+ * out[i] = (x[i] / rms(x)) * weight[i], rms = sqrt(mean(x^2) + eps)
+ */
+int tq_metal_rmsnorm(float* out, const float* x, const float* w, int n, float eps);
+
+/**
+ * SiLU activation on Metal GPU.
+ * out[i] = x[i] / (1 + exp(-x[i]))
+ */
+int tq_metal_silu(float* out, const float* x, int n);
+
+/**
+ * Element-wise multiply on Metal GPU.
+ * out[i] = a[i] * b[i]
+ */
+int tq_metal_mul(float* out, const float* a, const float* b, int n);
+
+/**
+ * Vector add on Metal GPU.
+ * out[i] = a[i] + b[i]
+ */
+int tq_metal_add(float* out, const float* a, const float* b, int n);
 
 #ifdef __cplusplus
 }
