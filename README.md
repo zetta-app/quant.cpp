@@ -2,11 +2,11 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">Embeddable LLM inference in pure C</h3>
+<h3 align="center">LLM inference with 7x longer context — pure C, zero dependencies</h3>
 
 <p align="center">
-  Also ships as <a href="#-single-header-mode"><b>quant.h</b></a> — a single-header library.<br>
-  67K LOC. No external libraries. Read it in an afternoon.
+  Lossless KV cache compression. Also ships as <a href="#-single-header-mode"><b>quant.h</b></a> — a single-header library.<br>
+  67K LOC. Embeddable. Read it in an afternoon.
 </p>
 
 <p align="center">

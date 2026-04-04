@@ -2,11 +2,11 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">순수 C로 만든 임베더블 LLM 추론 엔진</h3>
+<h3 align="center">7배 긴 컨텍스트를 만드는 LLM 추론 엔진 — 순수 C, 의존성 제로</h3>
 
 <p align="center">
-  <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리로도 제공됩니다.<br>
-  67K LOC. 외부 라이브러리 없음. 오후 한나절이면 전체 코드를 읽을 수 있습니다.
+  무손실 KV 캐시 압축. <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리로도 제공됩니다.<br>
+  67K LOC. 임베딩 가능. 오후 한나절이면 전체 코드를 읽을 수 있습니다.
 </p>
 
 <p align="center">
