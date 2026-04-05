@@ -1,18 +1,29 @@
-// quant.h -- Single-header LLM inference engine
-// https://github.com/quantumaikr/quant.cpp
+// quant.h — Single-header LLM inference engine
+// Version 0.5.0 | https://github.com/quantumaikr/quant.cpp
 //
-// Usage:
-//   #define QUANT_IMPLEMENTATION in exactly one C file before including this header.
-//   Compile with: cc -O2 your_app.c -o your_app -lm -lpthread
+// The simplest way to add LLM inference to any C project.
+// 15.7K LOC, 643KB, zero dependencies.
 //
-// Quick start:
-//   quant_model* m = quant_load("model.gguf");
-//   quant_ctx*   c = quant_new(m, NULL);
-//   quant_generate(c, "Hello!", print_token, NULL);
-//   quant_free_ctx(c);
-//   quant_free_model(m);
+// #define QUANT_IMPLEMENTATION in exactly one .c file, then:
+//   cc -O2 app.c -o app -lm -lpthread
 //
-// License: MIT
+// API (7 functions):
+//   quant_load(path)                → Load GGUF model
+//   quant_new(model, config)        → Create context (NULL = defaults)
+//   quant_generate(ctx, prompt, cb) → Stream tokens via callback
+//   quant_ask(ctx, prompt)          → Return full string (caller frees)
+//   quant_free_ctx(ctx)             → Free context
+//   quant_free_model(model)         → Free model
+//   quant_version()                 → "0.5.0"
+//
+// KV compression (up to 6.9x, PPL +0.0%):
+//   quant_config cfg = { .kv_compress = 1 };
+//   quant_ctx* c = quant_new(model, &cfg);
+//
+// Models: Llama 3, Qwen 3.5, Gemma 3/4, MoE. Format: GGUF.
+// Platforms: macOS, Linux, Windows, WASM, iOS, Android.
+//
+// License: Apache 2.0
 
 #ifndef QUANT_H
 #define QUANT_H
