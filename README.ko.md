@@ -6,7 +6,7 @@
 
 <p align="center">
   무손실 KV 캐시 압축. <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리로도 제공됩니다.<br>
-  67K LOC. 임베딩 가능. 오후 한나절이면 전체 코드를 읽을 수 있습니다.
+  72K LOC. 임베딩 가능. 오후 한나절이면 전체 코드를 읽을 수 있습니다.
 </p>
 
 <p align="center">
@@ -77,7 +77,7 @@ LLM 메모리의 병목은 모델 가중치가 아니라 **KV 캐시**입니다.
 |  | quant.cpp | llama.cpp | vLLM | MLX | ONNX RT |
 |:--|:---------:|:---------:|:----:|:---:|:-------:|
 | KV 압축 | **7x, +0% PPL** | +10.6% PPL | -- | -- | -- |
-| 코드 크기 | **67K LOC** | 250K+ | 100K+ | 50K+ | 500K+ |
+| 코드 크기 | **72K LOC** | 250K+ | 100K+ | 50K+ | 500K+ |
 | 의존성 | **제로** | ggml | PyTorch | Apple fw | 런타임 |
 | 임베더블 | **단일 헤더** | -- | -- | -- | 복잡 |
 | WASM | **192KB** | -- | -- | -- | -- |
@@ -90,14 +90,14 @@ LLM 메모리의 병목은 모델 가중치가 아니라 **KV 캐시**입니다.
 
 ## 지원 모델
 
-| 모델 | 파라미터 | 아키텍처 | 속도 | KV 압축 |
-|:------|-------:|:-------------|------:|:---------:|
-| Llama 3.2 3B Instruct | 3B | Llama 3 (GQA) | **11.6 tok/s** | 6.9x |
-| Gemma 4 26B-A4B-it | 26B (4B active) | MoE 128 experts | 3.9 tok/s | 3.5x |
+| 모델 | 파라미터 | 아키텍처 | 속도 (M1 Pro, 8T) | KV 압축 |
+|:------|-------:|:-------------|-------------------:|:---------:|
+| SmolLM2 135M | 135M | Llama | **103 tok/s** | 2.4x |
+| Llama 3.2 3B Instruct | 3B | Llama 3 (GQA) | **10 tok/s** | 6.9x |
+| Gemma 4 26B-A4B-it | 26B (4B active) | MoE 128 experts | **3.9 tok/s** | 3.5x |
 | Qwen3.5 0.8B | 752M | DeltaNet 하이브리드 | 80 tok/s | 3.8x |
 | Qwen3.5 4B | 4B | DeltaNet 하이브리드 | 20 tok/s | 3.8x |
 | SmolLM2 1.7B | 1.7B | Llama | 25 tok/s | 3.8x |
-| Qwen3.5 35B-A3B | 35B (3B active) | MoE 256 experts | 1 tok/s | 3.8x |
 | Gemma 3 270M | 270M | Gemma 3 | 176 tok/s | 3.8x |
 
 GGUF 포맷. llama.cpp 호환 모델을 그대로 사용합니다.
@@ -220,7 +220,7 @@ int main() {
 cc app.c -o app -lm -lpthread    # 끝 — cmake 없음, 프레임워크 없음
 ```
 
-**15K LOC, 628KB, 컴파일 1.7초.** 전체 API:
+**15.7K LOC, 643KB, 컴파일 ~2초.** 전체 API:
 
 | 함수 | 설명 |
 |:-----|:-----|
@@ -301,7 +301,7 @@ curl http://localhost:8080/v1/chat/completions \
 <details>
 <summary><b>llama.cpp와 뭐가 다른가요?</b></summary>
 
-llama.cpp는 전체 기능을 갖춘 추론 프레임워크 (250K+ LOC). quant.cpp는 읽고, 수정하고, 임베딩할 수 있는 미니멀 엔진 (67K LOC). 다른 문제를 위한 다른 도구입니다: llama.cpp는 속도를, quant.cpp는 메모리(KV 압축)와 임베더빌리티(단일 헤더)를 최적화합니다.
+llama.cpp는 전체 기능을 갖춘 추론 프레임워크 (250K+ LOC). quant.cpp는 읽고, 수정하고, 임베딩할 수 있는 미니멀 엔진 (72K LOC). 다른 문제를 위한 다른 도구입니다: llama.cpp는 속도를, quant.cpp는 메모리(KV 압축)와 임베더빌리티(단일 헤더)를 최적화합니다.
 
 </details>
 

@@ -1040,7 +1040,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     }
 
     /* Flush batched Q+K+V GPU dispatches before CPU-side RoPE/attention */
-    tq_metal_batch_flush_if_available();
+    if (has_gguf) tq_metal_batch_flush_if_available();
     /* (int8 preq cleared — path disabled on Apple Silicon, see note above) */
     TQ_PROF_STOP(_tp, matmul_ns);
 
@@ -2007,7 +2007,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     else
         tq_matmul(s->xb2, s->xb, layer->wo, dim, n_heads * head_dim);
     /* Flush wo GPU dispatch before CPU reads xb2 for residual add */
-    tq_metal_batch_flush_if_available();
+    if (has_gguf) tq_metal_batch_flush_if_available();
     TQ_PROF_STOP(_tp, matmul_ns);
 
     /* Debug: print attention output before residual add */

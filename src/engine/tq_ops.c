@@ -901,7 +901,9 @@ void tq_matmul_q4(float* out, const float* x, const uint8_t* w_qs, const float* 
          * memory, matmul is bandwidth-bound — Metal helps most when the
          * output dimension is very large (e.g., classifier/logits). Smaller
          * matmuls (attention, FFN) are faster on CPU via NEON Q4xQ8 path. */
-        if (tq_metal_batch_active() || n >= 8192) {
+        /* Only check Metal for very large output dims (vocab projection).
+         * Batch mode is only active for GGUF layers, not Q4-converted. */
+        if (n >= 8192 && tq_metal_batch_active()) {
             int rc = tq_metal_matmul_q4(out, x, w_qs, w_scales, n, d);
             if (rc == 0) return;
         }

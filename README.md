@@ -6,7 +6,7 @@
 
 <p align="center">
   Lossless KV cache compression. Also ships as <a href="#-single-header-mode"><b>quant.h</b></a> — a single-header library.<br>
-  67K LOC. Embeddable. Read it in an afternoon.
+  72K LOC. Embeddable. Read it in an afternoon.
 </p>
 
 <p align="center">
@@ -77,7 +77,7 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 |  | quant.cpp | llama.cpp | vLLM | MLX | ONNX RT |
 |:--|:---------:|:---------:|:----:|:---:|:-------:|
 | KV compression | **7x, +0% PPL** | +10.6% PPL | -- | -- | -- |
-| Code size | **67K LOC** | 250K+ | 100K+ | 50K+ | 500K+ |
+| Code size | **72K LOC** | 250K+ | 100K+ | 50K+ | 500K+ |
 | Dependencies | **zero** | ggml | PyTorch | Apple fw | runtime |
 | Embeddable | **single header** | -- | -- | -- | complex |
 | WASM | **192KB** | -- | -- | -- | -- |
@@ -90,14 +90,14 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 ## Supported Models
 
-| Model | Params | Architecture | Speed | KV Compression |
-|:------|-------:|:-------------|------:|:--------------:|
-| Llama 3.2 3B Instruct | 3B | Llama 3 (GQA) | **11.6 tok/s** | 6.9x |
-| Gemma 4 26B-A4B-it | 26B (4B active) | MoE 128 experts | 3.9 tok/s | 3.5x |
+| Model | Params | Architecture | Speed (M1 Pro, 8T) | KV Compression |
+|:------|-------:|:-------------|-------------------:|:--------------:|
+| SmolLM2 135M | 135M | Llama | **103 tok/s** | 2.4x |
+| Llama 3.2 3B Instruct | 3B | Llama 3 (GQA) | **10 tok/s** | 6.9x |
+| Gemma 4 26B-A4B-it | 26B (4B active) | MoE 128 experts | **3.9 tok/s** | 3.5x |
 | Qwen3.5 0.8B | 752M | DeltaNet hybrid | 80 tok/s | 3.8x |
 | Qwen3.5 4B | 4B | DeltaNet hybrid | 20 tok/s | 3.8x |
 | SmolLM2 1.7B | 1.7B | Llama | 25 tok/s | 3.8x |
-| Qwen3.5 35B-A3B | 35B (3B active) | MoE 256 experts | 1 tok/s | 3.8x |
 | Gemma 3 270M | 270M | Gemma 3 | 176 tok/s | 3.8x |
 
 GGUF format. Load any llama.cpp-compatible model.
@@ -220,7 +220,7 @@ int main() {
 cc app.c -o app -lm -lpthread    # that's it — no cmake, no framework
 ```
 
-**15K LOC, 628KB, 1.7s compile time.** Full API:
+**15.7K LOC, 643KB, ~2s compile time.** Full API:
 
 | Function | Description |
 |:---------|:------------|
@@ -301,7 +301,7 @@ Build with `-DTQ_BUILD_SERVER=ON`. Streaming SSE supported. KV compression confi
 <details>
 <summary><b>How is this different from llama.cpp?</b></summary>
 
-llama.cpp is a full-featured inference framework (250K+ LOC). quant.cpp is a minimal engine (67K LOC) you can read, modify, and embed. Different tools for different problems: llama.cpp optimizes speed, quant.cpp optimizes memory (KV compression) and embeddability (single header).
+llama.cpp is a full-featured inference framework (250K+ LOC). quant.cpp is a minimal engine (72K LOC) you can read, modify, and embed. Different tools for different problems: llama.cpp optimizes speed, quant.cpp optimizes memory (KV compression) and embeddability (single header).
 
 </details>
 

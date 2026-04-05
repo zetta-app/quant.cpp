@@ -2135,8 +2135,13 @@ void tq_matmul_gguf(float* out, const float* x,
 
         if (tq_metal_available()) {
             /* In batch mode, always dispatch to GPU (overhead is amortized).
-             * In immediate mode, only for large matrices where GPU wins. */
-            int use_gpu = tq_metal_batch_active() || (out_dim >= 512);
+             * In immediate mode, only for types that have Metal pipelines
+             * AND large matrices where GPU wins. */
+            int has_metal_pipeline = (weight_type == TQ_GGML_TYPE_IQ2_XXS ||
+                                      weight_type == TQ_GGML_TYPE_IQ2_S ||
+                                      weight_type == TQ_GGML_TYPE_Q8_0 ||
+                                      weight_type == TQ_GGML_TYPE_Q4_K);
+            int use_gpu = has_metal_pipeline && (tq_metal_batch_active() || (out_dim >= 512));
             if (use_gpu) {
                 int rc = tq_metal_matmul_gguf(out, x, weight, weight_type,
                                               out_dim, in_dim);
