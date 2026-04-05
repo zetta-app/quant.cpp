@@ -118,11 +118,6 @@ constant uchar ksigns_iq2xs[128] = {
  * in threadgroup shared memory to avoid redundant global reads.
  * ============================================================ */
 
-/* Threadgroup size for matmul kernels */
-constant uint TG_SIZE = 256;
-
-/* Maximum input dimension cacheable in shared memory (32KB / 4 = 8192 floats) */
-constant uint MAX_SHARED_DIM = 8192;
 
 kernel void matmul_iq2_xxs(
     device const uchar*  weight    [[buffer(0)]],  /* [out_dim * row_bytes] */

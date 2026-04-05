@@ -1725,7 +1725,7 @@ void tq_metal_repack_q4(const uint8_t* src_qs, const float* src_scales,
 #define TQ_REPACK_CACHE_SIZE 128
 static struct { const void* key; id<MTLBuffer> qs; id<MTLBuffer> sc; int out_dim; int in_dim; }
     g_repack_cache[TQ_REPACK_CACHE_SIZE];
-static int g_repack_count = 0;
+static int g_repack_count __attribute__((unused)) = 0;
 
 static void encode_q4_matmul(id<MTLComputeCommandEncoder> enc,
                               id<MTLBuffer> input_buf,
@@ -1736,8 +1736,6 @@ static void encode_q4_matmul(id<MTLComputeCommandEncoder> enc,
     if (!tq_pipe_matmul_tq_q4) return;
 
     int n_blocks = in_dim / 32;
-    const int TILE = 32;
-    int n_tiles = (out_dim + TILE - 1) / TILE;
 
     /* Fast Q4 kernel: llama.cpp-inspired uint16 mask trick + SIMD-group.
      * No repacking needed — reads original row-major Q4 layout.
@@ -2173,15 +2171,21 @@ int tq_metal_forward_layer(
             [enc setBuffer:g_gpu_k  offset:0 atIndex:1];
             [enc setBuffer:pos_buf  offset:0 atIndex:2];
             [enc setBuffer:kvd_buf  offset:0 atIndex:3];
-            [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(MIN(kv_dim, 256), 1, 1)];
+            {
+                NSUInteger tg_w = (NSUInteger)(kv_dim < 256 ? kv_dim : 256);
+                [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tg_w, 1, 1)];
+            }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             /* Write V to cache */
             [enc setBuffer:vc_buf   offset:0 atIndex:0];
             [enc setBuffer:g_gpu_v  offset:0 atIndex:1];
-            [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(MIN(kv_dim, 256), 1, 1)];
+            {
+                NSUInteger tg_w = (NSUInteger)(kv_dim < 256 ? kv_dim : 256);
+                [enc dispatchThreads:MTLSizeMake(kv_dim, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tg_w, 1, 1)];
+            }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
 

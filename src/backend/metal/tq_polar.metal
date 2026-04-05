@@ -15,7 +15,7 @@ using namespace metal;
 
 constant int TQ_BK           = 128;
 constant int TQ_PAIRS        = 64;   /* TQ_BK / 2 */
-constant int TQ_INDICES_SIZE = 32;   /* TQ_BK / 4  (pairs/2 bytes) */
+/* TQ_INDICES_SIZE = TQ_BK / 4 = 32 (pairs/2 bytes), used only in C host code */
 
 /* ============================================================
  * Block structures (matching C layout)

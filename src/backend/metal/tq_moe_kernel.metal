@@ -146,11 +146,6 @@ constant uchar ksigns_iq2xs[128] = {
  * Each thread processes a subset of blocks; caller must reduce.
  * ============================================================ */
 
-/* Threadgroup size */
-constant uint TG_SIZE = 256;
-
-/* Maximum input cacheable in shared memory (32KB / 4 = 8192 floats) */
-constant uint MAX_SHARED_DIM = 8192;
 
 /**
  * Partial IQ2_XXS dot for blocks assigned to this thread.

@@ -8,7 +8,7 @@
 #ifdef __cplusplus
 #define TQ_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
 #else
-#define TQ_STATIC_ASSERT(cond, msg) TQ_STATIC_ASSERT(cond, msg)
+#define TQ_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
 #endif
 
 /* Cross-platform math constants (some platforms lack M_PI) */

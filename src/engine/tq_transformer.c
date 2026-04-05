@@ -1313,7 +1313,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         const tq_type_traits_t* dbg_traits = &TQ_TRAITS[s->kv_quant_type];
         float mse = 0, cos_num = 0, cos_d1 = 0, cos_d2 = 0;
         uint8_t tmp_buf[1024];
-        float recon[256];
+        float recon[512]; /* max head_dim is 512 (Gemma 4 full layers) */
         for (int kh = 0; kh < 1; kh++) { /* first head only */
             const float* key_src = s->k + kh * head_dim;
             dbg_traits->quantize(key_src, tmp_buf, head_dim);
@@ -1890,7 +1890,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         } else if (s->value_quant_bits == 2) {
             /* Q2 value path: dequantize and accumulate.
              * Q2 has a more complex codebook, so we keep the dequant path. */
-            float v_tmp[512]; /* max head_dim is 256, safe with margin */
+            float v_tmp[512]; /* max head_dim is 512 (Gemma 4 full layers) */
             size_t layer_off_qs = (size_t)l * max_seq * s->value_stride_qs;
             size_t layer_off_sc = (size_t)l * max_seq * s->value_stride_scales;
             int n_blocks_per_head = (head_dim + 31) / 32;
