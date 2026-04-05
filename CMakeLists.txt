@@ -203,13 +203,13 @@ if(TQ_BUILD_ROCM)
     endif()
 endif()
 
-# Compiler warnings
-target_compile_options(turboquant PRIVATE
-    -Wall -Wextra -Wpedantic -Wno-unused-parameter
-)
-target_compile_options(turboquant_shared PRIVATE
-    -Wall -Wextra -Wpedantic -Wno-unused-parameter
-)
+# Compiler warnings (skip on MSVC — handled separately above)
+if(NOT MSVC)
+    target_compile_options(turboquant PRIVATE
+        -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    target_compile_options(turboquant_shared PRIVATE
+        -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
 
 # Tests
 if(TQ_BUILD_TESTS)
@@ -289,7 +289,9 @@ if(TQ_BUILD_SERVER)
     if(NOT MSVC)
         target_link_libraries(quant-server m)
     endif()
-    target_compile_options(quant-server PRIVATE
-        -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    if(NOT MSVC)
+        target_compile_options(quant-server PRIVATE
+            -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    endif()
     message(STATUS "quant.cpp: HTTP server target enabled (quant-server)")
 endif()

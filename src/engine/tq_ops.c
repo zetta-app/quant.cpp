@@ -28,6 +28,19 @@ typedef CONDITION_VARIABLE pthread_cond_t;
 #define pthread_cond_destroy(c)  ((void)0)
 /* __thread → __declspec(thread) */
 #define __thread __declspec(thread)
+/* PTHREAD_MUTEX_INITIALIZER: SRWLOCK can be zero-initialized */
+typedef SRWLOCK pthread_mutex_srw_t;
+#undef pthread_mutex_t
+#define pthread_mutex_t SRWLOCK
+#undef pthread_mutex_init
+#define pthread_mutex_init(m, a) InitializeSRWLock(m)
+#undef pthread_mutex_lock
+#define pthread_mutex_lock(m)    AcquireSRWLockExclusive(m)
+#undef pthread_mutex_unlock
+#define pthread_mutex_unlock(m)  ReleaseSRWLockExclusive(m)
+#undef pthread_mutex_destroy
+#define pthread_mutex_destroy(m) ((void)0)
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
 #else
 #include <pthread.h>
 #endif

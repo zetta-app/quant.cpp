@@ -30,6 +30,9 @@
 #ifdef __APPLE__
 #include <unistd.h> /* getpagesize, posix_memalign */
 #endif
+#ifdef _WIN32
+#include <windows.h> /* QueryPerformanceCounter, LARGE_INTEGER */
+#endif
 
 /* Unified Q2/1-bit matmul dispatch.
  * When model->use_1bit_weights, Q2 fields contain sign bits + norms,

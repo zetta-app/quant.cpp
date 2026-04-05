@@ -31,6 +31,26 @@
 #define R_OK 4
 #endif
 #define access _access
+/* Minimal dirent.h for MSVC (FindFirstFile-based) */
+#ifndef _DIRENT_H_WIN32
+#define _DIRENT_H_WIN32
+struct dirent { char d_name[260]; };
+typedef struct { HANDLE h; WIN32_FIND_DATAA fd; int first; } DIR;
+static DIR* opendir(const char* p) {
+    char buf[270]; snprintf(buf, sizeof(buf), "%s\\*", p);
+    DIR* d = (DIR*)malloc(sizeof(DIR));
+    d->h = FindFirstFileA(buf, &d->fd); d->first = 1;
+    if (d->h == INVALID_HANDLE_VALUE) { free(d); return NULL; }
+    return d;
+}
+static struct dirent* readdir(DIR* d) {
+    static struct dirent e;
+    if (d->first) { d->first = 0; } else if (!FindNextFileA(d->h, &d->fd)) return NULL;
+    strncpy(e.d_name, d->fd.cFileName, 259); e.d_name[259] = 0;
+    return &e;
+}
+static void closedir(DIR* d) { FindClose(d->h); free(d); }
+#endif
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>

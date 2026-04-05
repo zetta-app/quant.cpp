@@ -13,7 +13,15 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <windows.h>
+#define pthread_mutex_t SRWLOCK
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+#define pthread_mutex_lock(m) AcquireSRWLockExclusive(m)
+#define pthread_mutex_unlock(m) ReleaseSRWLockExclusive(m)
+#else
 #include <pthread.h>
+#endif
 
 /* ============================================================
  * Argmax sampling: return token with highest logit
