@@ -39,6 +39,8 @@
 #define MAX_TOKENS_DEFAULT 256
 #define RESPONSE_BUF_SIZE  (512 * 1024)  /* 512 KB response buffer    */
 #define SSE_CHUNK_SIZE     4096
+#define SOCKET_TIMEOUT_SEC 30            /* read timeout per socket    */
+#define MAX_ACTIVE_CONNS   32            /* hard limit on threads      */
 
 /* ============================================================
  * Server state
@@ -48,7 +50,8 @@ struct tq_server {
     tq_server_config_t config;
     int                listen_fd;
     atomic_int         running;
-    pthread_mutex_t    inference_mutex;  /* serialize inference (single model state) */
+    atomic_int         active_connections;  /* track concurrent threads */
+    pthread_mutex_t    inference_mutex;     /* serialize inference (single model state) */
 };
 
 /* Global server pointer for signal handler */
@@ -281,12 +284,14 @@ static char* build_prompt(const chat_request_t* req) {
     if (!prompt) return NULL;
 
     char* w = prompt;
+    size_t remaining = total;
     for (int i = 0; i < req->n_messages; i++) {
-        w += sprintf(w, "<|im_start|>%s\n%s<|im_end|>\n",
-                     req->messages[i].role,
-                     req->messages[i].content ? req->messages[i].content : "");
+        int n = snprintf(w, remaining, "<|im_start|>%s\n%s<|im_end|>\n",
+                         req->messages[i].role,
+                         req->messages[i].content ? req->messages[i].content : "");
+        if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
     }
-    w += sprintf(w, "<|im_start|>assistant\n");
+    snprintf(w, remaining, "<|im_start|>assistant\n");
 
     return prompt;
 }
@@ -841,9 +846,10 @@ static int read_http_request(int fd, char* buf, int buf_size, http_request_t* re
         const char* next = strstr(hp, "\r\n");
         if (!next) break;
 
-        /* Content-Length */
+        /* Content-Length — use strtol to avoid UB on overflow */
         if (strncasecmp(hp, "Content-Length:", 15) == 0) {
-            req->content_length = atoi(hp + 15);
+            long cl = strtol(hp + 15, NULL, 10);
+            req->content_length = (cl > 0 && cl <= MAX_BODY_SIZE) ? (int)cl : 0;
         }
         /* Content-Type */
         if (strncasecmp(hp, "Content-Type:", 13) == 0) {
@@ -902,6 +908,11 @@ static void* handle_connection(void* arg) {
     tq_server_t* server = ctx->server;
     free(ctx);
 
+    /* Set socket read/write timeout to prevent slow-loris attacks */
+    struct timeval sock_tv = { .tv_sec = SOCKET_TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &sock_tv, sizeof(sock_tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sock_tv, sizeof(sock_tv));
+
     char* buf = (char*)malloc(HTTP_BUF_SIZE + MAX_BODY_SIZE);
     if (!buf) {
         close(fd);
@@ -946,6 +957,7 @@ static void* handle_connection(void* arg) {
 
     close(fd);
     free(buf);
+    atomic_fetch_sub(&server->active_connections, 1);
     return NULL;
 }
 
@@ -991,6 +1003,7 @@ int tq_server_start(tq_server_t** out, const tq_server_config_t* config) {
 
     server->config = *config;
     atomic_store(&server->running, 1);
+    atomic_store(&server->active_connections, 0);
     pthread_mutex_init(&server->inference_mutex, NULL);
 
     /* Install signal handlers */
@@ -1070,10 +1083,19 @@ int tq_server_start(tq_server_t** out, const tq_server_config_t* config) {
             continue;
         }
 
+        /* Enforce connection limit to prevent resource exhaustion */
+        if (atomic_load(&server->active_connections) >= MAX_ACTIVE_CONNS) {
+            LOG_ERROR("Connection limit reached (%d), rejecting", MAX_ACTIVE_CONNS);
+            close(client_fd);
+            continue;
+        }
+        atomic_fetch_add(&server->active_connections, 1);
+
         /* Spawn a thread for this connection */
         conn_ctx_t* conn = (conn_ctx_t*)malloc(sizeof(conn_ctx_t));
         if (!conn) {
             close(client_fd);
+            atomic_fetch_sub(&server->active_connections, 1);
             continue;
         }
         conn->server = server;
@@ -1087,6 +1109,7 @@ int tq_server_start(tq_server_t** out, const tq_server_config_t* config) {
             LOG_ERROR("Failed to create thread: %s", strerror(errno));
             close(client_fd);
             free(conn);
+            atomic_fetch_sub(&server->active_connections, 1);
         }
         pthread_attr_destroy(&attr);
     }
