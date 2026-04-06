@@ -66,7 +66,23 @@ hf download bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q8_0.gguf
 ./build/quant models/SmolLM2-135M-Instruct-Q8_0.gguf --chat -p "Hello!" -k uniform_4b -v q4
 ```
 
-> **[Full API docs](docs/api.md)** · **[WASM demo](https://quantumaikr.github.io/quant.cpp/)** · **[Add your own KV type](docs/custom-quantization.md)**
+> **[Full API docs](docs/api.md)** · **[WASM demo](https://quantumaikr.github.io/quant.cpp/)** · **[Add your own KV type](docs/custom-quantization.md)** · **[Python: `pip install quantcpp`](#python)**
+
+---
+
+## See It In Action: Book-in-a-Chat
+
+Load an entire novel into context and ask questions about it. llama.cpp runs out of memory. quant.cpp remembers the whole book.
+
+```bash
+# Load Alice in Wonderland (~27K tokens) with KV compression
+bash bench/demo/book_chat.sh models/Llama-3.2-3B-Instruct-Q8_0.gguf
+
+# Q: "What riddle did the Mad Hatter ask Alice?"
+# A: "Why is a raven like a writing-desk?" — from Chapter 7, A Mad Tea-Party...
+```
+
+On a 16GB Mac with Llama 3.2 3B: llama.cpp maxes out at ~50K tokens (FP16 KV). quant.cpp compresses KV 6.9x → **350K tokens** — enough for 12 novels.
 
 ---
 
@@ -285,6 +301,27 @@ Build with `-DTQ_BUILD_SERVER=ON`. Streaming SSE supported. KV compression confi
 
 ---
 
+## Python
+
+```bash
+cd bindings/python && pip install .
+```
+
+```python
+from quantcpp import Model
+
+with Model("model.gguf", kv_compress=1) as m:
+    print(m.ask("What is the capital of France?"))
+
+    # Streaming
+    for token in m.generate("Once upon a time"):
+        print(token, end="", flush=True)
+```
+
+Zero build dependencies beyond a C compiler. Compiles `quant.h` at install time.
+
+---
+
 ## Backends & Performance
 
 | Backend | Platform | Status | Notes |
@@ -347,6 +384,13 @@ Works on Linux, macOS, Windows (MSVC/MinGW), iOS, Android, and WASM.
 </details>
 
 <details>
+<summary><b>Why is it slower than llama.cpp?</b></summary>
+
+Three reasons: (1) llama.cpp has years of hand-tuned NEON/AVX2 assembly for every quant format, (2) llama.cpp offloads the full forward pass to Metal/CUDA GPU, (3) 250K+ LOC vs 72K LOC means more micro-optimizations. quant.cpp optimized for memory and embeddability first. Speed improvements (full Metal GPU offload, more SIMD kernels) are actively in progress — see [v1.3 plan](docs/plan/prd/prd_v1.3.md).
+
+</details>
+
+<details>
 <summary><b>No GPU — is this useless?</b></summary>
 
 If you need 100+ tok/s, use llama.cpp with Metal/CUDA. If you need to embed inference in an iOS app, WASM module, game engine, or IoT device — quant.cpp works. CPU on Apple Silicon: 25 tok/s (1.7B), 11.6 tok/s (3B), 3.9 tok/s (26B MoE).
@@ -375,6 +419,8 @@ Tested extensively (2-bit delta, NF2, online SVD, multi-hash). None reached acce
 |:---------|:------------|
 | **[API Reference](docs/api.md)** | Full C API for quant.h and libturboquant (730 lines) |
 | **[Custom Quantization](docs/custom-quantization.md)** | Add your own KV type in 3 functions |
+| **[H2H Benchmark](bench/head_to_head/)** | Reproducible quant.cpp vs llama.cpp comparison |
+| **[KV Compression Landscape](docs/blog/kv-cache-landscape.md)** | Eviction vs Architecture vs Compression guide |
 | **[ROADMAP](ROADMAP.md)** | Project direction and planned features |
 | **[CHANGELOG](CHANGELOG.md)** | Version history and release notes |
 | **[Tech Report](docs/papers/quant_cpp_tech_report.md)** | Architecture and benchmarks (Arxiv draft) |

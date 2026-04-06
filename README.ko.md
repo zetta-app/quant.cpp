@@ -66,7 +66,23 @@ hf download bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q8_0.gguf
 ./build/quant models/SmolLM2-135M-Instruct-Q8_0.gguf --chat -p "안녕!" -k uniform_4b -v q4
 ```
 
-> **[API 레퍼런스](docs/api.md)** · **[WASM 데모](https://quantumaikr.github.io/quant.cpp/)** · **[커스텀 양자화 가이드](docs/custom-quantization.md)**
+> **[API 레퍼런스](docs/api.md)** · **[WASM 데모](https://quantumaikr.github.io/quant.cpp/)** · **[커스텀 양자화 가이드](docs/custom-quantization.md)** · **[Python: `pip install quantcpp`](#python)**
+
+---
+
+## 실제 동작: Book-in-a-Chat
+
+소설 한 권을 컨텍스트에 넣고 질문합니다. llama.cpp는 메모리 부족, quant.cpp는 전체를 기억합니다.
+
+```bash
+# 이상한 나라의 앨리스 (~27K 토큰) KV 압축으로 로드
+bash bench/demo/book_chat.sh models/Llama-3.2-3B-Instruct-Q8_0.gguf
+
+# Q: "모자 장수가 앨리스에게 낸 수수께끼는?"
+# A: "왜 까마귀가 책상과 같을까?" — 7장, 미친 다과회에서...
+```
+
+16GB Mac + Llama 3.2 3B: llama.cpp는 ~50K 토큰에서 OOM. quant.cpp는 KV 6.9x 압축 → **350K 토큰** — 소설 12권 분량.
 
 ---
 
@@ -285,6 +301,27 @@ curl http://localhost:8080/v1/chat/completions \
 
 ---
 
+## Python
+
+```bash
+cd bindings/python && pip install .
+```
+
+```python
+from quantcpp import Model
+
+with Model("model.gguf", kv_compress=1) as m:
+    print(m.ask("프랑스의 수도는?"))
+
+    # 스트리밍
+    for token in m.generate("옛날 옛적에"):
+        print(token, end="", flush=True)
+```
+
+C 컴파일러 외 빌드 의존성 없음. 설치 시 `quant.h`를 자동 컴파일.
+
+---
+
 ## 백엔드 & 성능
 
 | 백엔드 | 플랫폼 | 상태 | 비고 |
@@ -332,6 +369,13 @@ llama.cpp도 KV 캐시 양자화를 지원합니다 (Q8_0 K + Q5_0 V 추천, ~1.
 <summary><b>Karpathy의 llm.c와 비교하면?</b></summary>
 
 비슷한 철학: 미니멀 C, 교육적. 핵심 차이: quant.cpp는 양자화 가중치(Q4_K_M, Q8_0, IQ2), 다중 아키텍처(Llama, Qwen, Gemma, MoE), GGUF 로딩, KV 캐시 압축을 지원합니다. llm.c가 교과서라면 quant.cpp는 프로덕션 버전.
+
+</details>
+
+<details>
+<summary><b>왜 llama.cpp보다 느린가요?</b></summary>
+
+세 가지 이유: (1) llama.cpp는 모든 양자화 포맷에 수년간 최적화한 NEON/AVX2 어셈블리가 있고, (2) Metal/CUDA GPU로 전체 forward pass를 오프로드하며, (3) 250K+ LOC vs 72K LOC로 더 많은 마이크로 최적화가 있습니다. quant.cpp는 메모리와 임베더빌리티를 먼저 최적화했습니다. 속도 개선(Metal GPU 전체 오프로드, SIMD 커널 추가)이 진행 중입니다 — [v1.3 계획](docs/plan/prd/prd_v1.3.md) 참고.
 
 </details>
 
