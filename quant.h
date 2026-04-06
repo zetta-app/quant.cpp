@@ -111,6 +111,7 @@ static inline int pthread_create(pthread_t* t, const void* a, void*(*fn)(void*),
 static inline int pthread_join(pthread_t t, void** r) {
     (void)r; WaitForSingleObject(t, INFINITE); CloseHandle(t); return 0;
 }
+#define __thread __declspec(thread)
 #else
 #include <pthread.h>
 #endif
