@@ -2,11 +2,12 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">7배 긴 컨텍스트를 만드는 LLM 추론 엔진 — 순수 C, 의존성 제로</h3>
+<h3 align="center">KV 캐시 양자화 연구를 위한 단일 헤더 C 레퍼런스 엔진</h3>
 
 <p align="center">
-  무손실 KV 캐시 압축. <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리로도 제공됩니다.<br>
-  72K LOC. 임베딩 가능. 오후 한나절이면 전체 코드를 읽을 수 있습니다.
+  <a href="https://arxiv.org/abs/2504.19874"><b>TurboQuant</b></a> (ICLR 2026), <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a> 등 7개 KV 양자화 기법을 구현합니다.<br>
+  72K LOC 순수 C, 의존성 제로. <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리 — 한 파일을 어디든 드롭.<br>
+  C 컴파일러가 있는 모든 곳에서 동작: <b>iOS · Android · WASM · MSVC · 마이크로컨트롤러</b>.
 </p>
 
 <p align="center">
@@ -39,14 +40,30 @@ LLM 메모리의 병목은 모델 가중치가 아니라 **KV 캐시**입니다.
 
 ## 결과
 
-> **같은 하드웨어. 7배 긴 컨텍스트. 품질 손실 제로.**
+> **같은 하드웨어. 4–7배 긴 컨텍스트. Perplexity 검증 완료.**
 
-| 하드웨어 | 모델 | FP16 KV | quant.cpp KV | 배율 |
-|:---------|:------|--------:|-------------:|-----:|
-| 16GB Mac | Llama 3.2 3B | 50K 토큰 | **350K 토큰** | **6.9x** |
-| 16GB Mac | Gemma 4 26B MoE | 4K 토큰 | **30K 토큰** | **6.9x** |
-| 8GB 노트북 | Llama 8B (Q4) | 16K 토큰 | **61K 토큰** | **3.8x** |
-| 24GB RTX 3090 | Llama 8B (Q4) | 147K 토큰 | **559K 토큰** | **3.8x** |
+| 하드웨어 | 모델 | FP16 KV | quant.cpp KV | 배율 | PPL Δ |
+|:---------|:------|--------:|-------------:|-----:|------:|
+| 16GB Mac | Llama 3.2 3B | 50K 토큰 | **350K 토큰** | **6.9x** | +0.0% |
+| 16GB Mac | Gemma 4 26B MoE | 4K 토큰 | **30K 토큰** | **6.9x** | +0.0% |
+| 8GB 노트북 | Llama 8B (Q4) | 16K 토큰 | **61K 토큰** | **3.8x** | +0.0% |
+| 24GB RTX 3090 | Llama 8B (Q4) | 147K 토큰 | **559K 토큰** | **3.8x** | +0.0% |
+
+PPL 측정: WikiText-2, SmolLM2 1.7B 베이스라인, `uniform_4b K + Q4 V` 설정. [재현 가능한 벤치마크](bench/head_to_head/) 참고.
+
+## 왜 quant.cpp인가?
+
+2026년 4월, **Google이 TurboQuant를 발표했습니다** ([Zandieh et al., ICLR 2026](https://arxiv.org/abs/2504.19874)). 3비트에서 거의 무손실 KV 캐시 압축을 달성한 훌륭한 논문입니다. 하지만 오픈소스 생태계는 파편화되어 있습니다:
+
+- 🦀 [Rust 구현](https://github.com/RecursiveIntell/turbo-quant) — Cargo 필요, 모바일 배포 불가
+- 🐍 [PyTorch 구현](https://github.com/tonbistudio/turboquant-pytorch) — Python + Torch 런타임 필요
+- 🔥 [llama.cpp 다수 포크](https://github.com/ggml-org/llama.cpp/discussions/20969) — 머지된 구현 없음, 합의 부재
+- 📝 [Reference Python](https://github.com/scos-lab/turboquant) — 연구용
+
+**quant.cpp는 유일한 단일 헤더 C 구현입니다.** 한 파일. 의존성 제로. 휴대폰, 브라우저, 게임 엔진, 마이크로컨트롤러에서 동작 — 다른 구현체들이 갈 수 없는 곳들.
+
+> **데이터센터에서 TurboQuant? Google의 레퍼런스를 사용하세요.**
+> **그 외 모든 곳에서 TurboQuant? quant.cpp를 사용하세요.**
 
 ## 60초 시작 가이드
 
@@ -107,19 +124,32 @@ bash bench/demo/book_chat.sh models/Llama-3.2-3B-Instruct-Q8_0.gguf
 
 둘 다 per-block 방식입니다. 품질 차이는 블록 크기(128 vs 32), min-max 범위 인코딩, 독립적 K/V 처리, delta 압축에서 옵니다. ~1.6x 압축이면 llama.cpp Q8+Q5가 우수합니다. quant.cpp는 차이가 큰 **4-7x 범위**를 타겟합니다.
 
-### vs 다른 엔진들
+### vs 다른 TurboQuant 구현들
 
-|  | quant.cpp | llama.cpp | vLLM | MLX | ONNX RT |
-|:--|:---------:|:---------:|:----:|:---:|:-------:|
-| KV 압축 | **3.8-6.9x, +0% PPL** | 1.6x ~+1% PPL | -- | -- | -- |
-| 코드 크기 | **72K LOC** | 250K+ | 100K+ | 50K+ | 500K+ |
-| 의존성 | **제로** | ggml | PyTorch | Apple fw | 런타임 |
-| 임베더블 | **단일 헤더** | -- | -- | -- | 복잡 |
-| WASM | **192KB** | -- | -- | -- | -- |
-| GPU 서빙 | 기본 | 풀 | **최고** | Metal | 다양 |
+|  | quant.cpp | turbo-quant (Rust) | turboquant-pytorch | scos-lab/turboquant |
+|:--|:---------:|:------------------:|:------------------:|:-------------------:|
+| 언어 | **순수 C11** | Rust | Python | Python |
+| 단일 헤더 | **✅ quant.h (628KB)** | ❌ Cargo crate | ❌ pip install | ❌ |
+| 의존성 | **libc + libm** | Rust 툴체인 | PyTorch + CUDA | PyTorch |
+| iOS / Android | **✅** | ❌ | ❌ | ❌ |
+| WASM (브라우저) | **✅ 192KB** | ❌ | ❌ | ❌ |
+| MCU / 임베디드 | **✅** | ❌ | ❌ | ❌ |
+| Windows MSVC | **✅** | ✅ | (Python) | (Python) |
+| GGUF 모델 로딩 | **✅ 7개 아키텍처** | ❌ | ❌ | research only |
+| End-to-end 추론 | **✅** | 커널만 | 커널만 | 커널만 |
 
-> **속도**가 필요하면 llama.cpp. **처리량**이 필요하면 vLLM.
-> **같은 메모리에서 더 긴 컨텍스트**가 필요하거나, **앱에 LLM을 임베딩**하려면 quant.cpp.
+### vs 프로덕션 추론 엔진
+
+|  | quant.cpp | llama.cpp | vLLM | MLX |
+|:--|:---------:|:---------:|:----:|:---:|
+| KV 양자화 | **TurboQuant + 6개 기법** | Q8_0/Q5_0 (2x) | -- | -- |
+| 코드 크기 | **72K LOC** | 250K+ | 100K+ | 50K+ |
+| 임베더블 | **단일 헤더** | 라이브러리 | 라이브러리 | 프레임워크 |
+| 오후 한나절에 읽기 | **✅** | ❌ | ❌ | ❌ |
+| GPU 처리량 | 기본 | 풀 | **최고** | Metal |
+
+> 워크스테이션 **속도**가 필요하면 llama.cpp. **배치 서빙**이 필요하면 vLLM.
+> **무언가에 LLM 추론을 넣어 배포**해야 한다면 — 앱, 게임, 웹사이트, 디바이스 — quant.cpp.
 
 ---
 
@@ -428,11 +458,16 @@ Linux, macOS, Windows (MSVC/MinGW), iOS, Android, WASM에서 동작합니다.
 
 ---
 
-## 참고 논문
+## 참고 논문 및 인용
 
-- [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) — KV 캐시 압축 이론
-- [QJL](https://arxiv.org/abs/2406.03482) (AAAI 2025) — 양자화 JL 변환
-- [PolarQuant](https://arxiv.org/abs/2502.02617) (AISTATS 2026) — 극좌표 양자화
+quant.cpp는 발표된 연구의 독립 구현체입니다. 학술적 사용 시 원본 논문을 인용해주세요:
+
+- **TurboQuant** — Zandieh, Daliri, Hadian, Mirrokni. *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
+- **PolarQuant** — *Quantizing KV Caches with Polar Transformation*. AISTATS 2026. [arXiv:2502.02617](https://arxiv.org/abs/2502.02617)
+- **QJL** — *Quantized Johnson-Lindenstrauss Transform for KV Cache Compression*. AAAI 2025. [arXiv:2406.03482](https://arxiv.org/abs/2406.03482)
+- [TurboQuant — Google Research 블로그](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+
+학술 작업에서 quant.cpp를 사용하는 경우, 원 논문과 본 저장소를 함께 인용해주세요.
 
 ---
 

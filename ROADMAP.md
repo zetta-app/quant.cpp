@@ -2,19 +2,23 @@
 
 ## Vision
 
-**quant.cpp is the SQLite of LLM inference.**
+**quant.cpp is the single-header C reference implementation of TurboQuant and related KV cache quantization research.**
 
-Not the fastest. Not the most feature-complete.
-The most embeddable, the most readable, and the only engine
-that compresses KV cache 7x without quality loss.
+Not competing with Google. Not competing with llama.cpp.
+Filling the gap nobody else fills: TurboQuant-class compression *anywhere* a C compiler runs.
+
+See [docs/positioning.md](docs/positioning.md) for the full strategy.
 
 ## Positioning
 
 ```
-Need speed?        → llama.cpp
-Need throughput?   → vLLM
-Need to embed LLM in your app with one file? → quant.cpp
-Need 7x longer context on the same hardware? → quant.cpp
+Data-center TurboQuant?       → Google reference (arxiv:2504.19874)
+Workstation speed?            → llama.cpp
+Batch serving?                → vLLM
+TurboQuant on iPhone?         → quant.cpp
+TurboQuant in a browser?      → quant.cpp
+TurboQuant in a game engine?  → quant.cpp
+TurboQuant on a microcontroller? → quant.cpp
 ```
 
 ## Direction 1: Embedding Engine ("LLM의 SQLite")

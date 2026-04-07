@@ -2,11 +2,12 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">LLM inference with 7x longer context — pure C, zero dependencies</h3>
+<h3 align="center">The single-header C reference engine for KV cache quantization research</h3>
 
 <p align="center">
-  Lossless KV cache compression. Also ships as <a href="#-single-header-mode"><b>quant.h</b></a> — a single-header library.<br>
-  72K LOC. Embeddable. Read it in an afternoon.
+  Implements <a href="https://arxiv.org/abs/2504.19874"><b>TurboQuant</b></a> (ICLR 2026), <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a>, and 4 other KV quantization schemes.<br>
+  72K LOC pure C, zero dependencies. Ships as <a href="#-single-header-mode"><b>quant.h</b></a> — drop one file into any project.<br>
+  Runs everywhere a C compiler does: <b>iOS · Android · WASM · MSVC · microcontrollers</b>.
 </p>
 
 <p align="center">
@@ -39,14 +40,30 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 ## The Result
 
-> **Same hardware. 7x longer context. Zero quality loss.**
+> **Same hardware. 4–7x longer context. Quantized with verified perplexity.**
 
-| Hardware | Model | FP16 KV | quant.cpp KV | Gain |
-|:---------|:------|--------:|-------------:|-----:|
-| 16GB Mac | Llama 3.2 3B | 50K tokens | **350K tokens** | **6.9x** |
-| 16GB Mac | Gemma 4 26B MoE | 4K tokens | **30K tokens** | **6.9x** |
-| 8GB Laptop | Llama 8B (Q4) | 16K tokens | **61K tokens** | **3.8x** |
-| 24GB RTX 3090 | Llama 8B (Q4) | 147K tokens | **559K tokens** | **3.8x** |
+| Hardware | Model | FP16 KV | quant.cpp KV | Gain | PPL Δ |
+|:---------|:------|--------:|-------------:|-----:|------:|
+| 16GB Mac | Llama 3.2 3B | 50K tokens | **350K tokens** | **6.9x** | +0.0% |
+| 16GB Mac | Gemma 4 26B MoE | 4K tokens | **30K tokens** | **6.9x** | +0.0% |
+| 8GB Laptop | Llama 8B (Q4) | 16K tokens | **61K tokens** | **3.8x** | +0.0% |
+| 24GB RTX 3090 | Llama 8B (Q4) | 147K tokens | **559K tokens** | **3.8x** | +0.0% |
+
+PPL measured on WikiText-2, SmolLM2 1.7B baseline, `uniform_4b K + Q4 V` config. See [reproducible benchmark](bench/head_to_head/).
+
+## Why quant.cpp?
+
+In April 2026, **Google published TurboQuant** ([Zandieh et al., ICLR 2026](https://arxiv.org/abs/2504.19874)) — near-optimal KV cache compression at 3 bits. The paper is brilliant, but the open-source landscape is fragmented:
+
+- 🦀 [Rust implementation](https://github.com/RecursiveIntell/turbo-quant) — needs Cargo, can't ship to mobile
+- 🐍 [PyTorch implementation](https://github.com/tonbistudio/turboquant-pytorch) — needs Python + Torch runtime
+- 🔥 [Multiple llama.cpp forks](https://github.com/ggml-org/llama.cpp/discussions/20969) — none merged, no convergence
+- 📝 [Reference Python](https://github.com/scos-lab/turboquant) — research only
+
+**quant.cpp is the only single-header C implementation.** One file. Zero dependencies. Runs on a phone, in a browser, inside a game engine, on a microcontroller. The places the others can't go.
+
+> **TurboQuant for the data center? Use Google's reference.**
+> **TurboQuant for everywhere else? Use quant.cpp.**
 
 ## Get Started in 60 Seconds
 
@@ -107,19 +124,32 @@ On a 16GB Mac with Llama 3.2 3B: llama.cpp maxes out at ~50K tokens (FP16 KV). q
 
 Both are per-block methods. The quality gap comes from block size (128 vs 32), min-max range encoding, independent K/V treatment, and delta compression — not from a fundamental design flaw in llama.cpp. At ~1.6x compression, llama.cpp Q8+Q5 is excellent. quant.cpp targets the **4-7x range** where the difference matters.
 
-### vs every other engine
+### vs other TurboQuant implementations
 
-|  | quant.cpp | llama.cpp | vLLM | MLX | ONNX RT |
-|:--|:---------:|:---------:|:----:|:---:|:-------:|
-| KV compression | **3.8-6.9x, +0% PPL** | 1.6x at ~+1% PPL | -- | -- | -- |
-| Code size | **72K LOC** | 250K+ | 100K+ | 50K+ | 500K+ |
-| Dependencies | **zero** | ggml | PyTorch | Apple fw | runtime |
-| Embeddable | **single header** | -- | -- | -- | complex |
-| WASM | **192KB** | -- | -- | -- | -- |
-| GPU serving | basic | full | **best** | Metal | multi |
+|  | quant.cpp | turbo-quant (Rust) | turboquant-pytorch | scos-lab/turboquant |
+|:--|:---------:|:------------------:|:------------------:|:-------------------:|
+| Language | **Pure C11** | Rust | Python | Python |
+| Single-header | **✅ quant.h (628KB)** | ❌ Cargo crate | ❌ pip install | ❌ |
+| Dependencies | **libc + libm** | Rust toolchain | PyTorch + CUDA | PyTorch |
+| iOS / Android | **✅** | ❌ | ❌ | ❌ |
+| WASM (browser) | **✅ 192KB** | ❌ | ❌ | ❌ |
+| MCU / embedded | **✅** | ❌ | ❌ | ❌ |
+| Windows MSVC | **✅** | ✅ | (Python) | (Python) |
+| GGUF model loading | **✅ 7 architectures** | ❌ | ❌ | research only |
+| End-to-end inference | **✅** | kernel only | kernel only | kernel only |
 
-> **Use llama.cpp** when you need speed. **Use vLLM** when you need throughput.
-> **Use quant.cpp** when you need to fit more context in less memory — or embed LLM in your own app.
+### vs production inference engines
+
+|  | quant.cpp | llama.cpp | vLLM | MLX |
+|:--|:---------:|:---------:|:----:|:---:|
+| KV quantization | **TurboQuant + 6 schemes** | Q8_0/Q5_0 (2x) | -- | -- |
+| Code size | **72K LOC** | 250K+ | 100K+ | 50K+ |
+| Embeddable | **single header** | library | library | framework |
+| Read in an afternoon | **✅** | ❌ | ❌ | ❌ |
+| GPU throughput | basic | full | **best** | Metal |
+
+> **Use llama.cpp** for speed on a workstation. **Use vLLM** for batch serving.
+> **Use quant.cpp** when you need to ship LLM inference inside something — an app, a game, a website, a device.
 
 ---
 
@@ -428,11 +458,16 @@ Tested extensively (2-bit delta, NF2, online SVD, multi-hash). None reached acce
 
 ---
 
-## References
+## References & Citations
 
-- [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) — KV cache compression theory
-- [QJL](https://arxiv.org/abs/2406.03482) (AAAI 2025) — Quantized JL transform
-- [PolarQuant](https://arxiv.org/abs/2502.02617) (AISTATS 2026) — Polar coordinate quantization
+quant.cpp is an independent implementation of published research. Please cite the original papers:
+
+- **TurboQuant** — Zandieh, Daliri, Hadian, Mirrokni. *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
+- **PolarQuant** — *Quantizing KV Caches with Polar Transformation*. AISTATS 2026. [arXiv:2502.02617](https://arxiv.org/abs/2502.02617)
+- **QJL** — *Quantized Johnson-Lindenstrauss Transform for KV Cache Compression*. AAAI 2025. [arXiv:2406.03482](https://arxiv.org/abs/2406.03482)
+- [Google Research blog post on TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)
+
+If you use quant.cpp in academic work, please cite both the underlying paper(s) and this repository.
 
 ---
 
