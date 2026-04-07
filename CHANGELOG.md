@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.1] — 2026-04-08
+
+### Highlights
+
+- **🆕 `turbo_kv_5b` — near-lossless KV** at +0.34% PPL on Llama 3.2 3B. Uses a 32-level Lloyd-Max-Gaussian codebook (Max 1960 Table I) on RHT-rotated values. 88-byte block (vs 72 for 4b). The new quality-maximizing option for users who can spare 22% more KV memory than 4b.
+- **Regression tests** — three deterministic synthetic-data tests pin the attention cosine quality of `turbo_kv_4b` (≥0.99) and `turbo_kv_5b` (≥0.999), and assert 5b ≥ 4b on the same data. Future Karpathy-loop iterations cannot regress past these thresholds without failing CI.
+
+### KV quantization quality (Llama 3.2 3B, FP32 = 13.56 PPL)
+
+| Type | Bytes/block | Compression | PPL | Δ vs FP32 |
+|---|---:|---:|---:|---:|
+| `turbo_kv_3b` | 56 | 9.1× | 15.39 | +13.5% |
+| `turbo_kv_4b` ⭐ default | 72 | 7.1× | 14.28 | +5.3% |
+| **`turbo_kv_5b`** 🏆 | 88 | 5.8× | **13.60** | **+0.34%** |
+
+### Tests
+
+- `TurboKVRegression.KV_4B_AttentionCosine` — pins ≥ 0.99
+- `TurboKVRegression.KV_5B_AttentionCosine` — pins ≥ 0.999
+- `TurboKVRegression.KV_5B_BeatsKV_4B` — invariant: more bits ⇒ ≥ accuracy
+
+35/35 tests pass on macOS / Linux / Windows.
+
 ## [0.6.0] — 2026-04-08
 
 ### Highlights

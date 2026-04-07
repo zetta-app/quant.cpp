@@ -471,3 +471,158 @@ TEST(TurboKV, ZeroInput) {
         EXPECT_NEAR(output_4b[i], 0.0f, 1e-4f);
     }
 }
+
+/* ============================================================
+ * Regression tests: Variant F quality must not regress.
+ *
+ * These tests synthesize attention scores from realistic key/query
+ * vectors and assert that quantized scores are highly correlated with
+ * FP32 reference scores. The thresholds are calibrated to the
+ * Variant F implementation that achieves Llama 3.2 3B PPL 14.28 (4b)
+ * and 13.60 (5b). Any regression that drops below these thresholds
+ * will fail CI before it reaches users.
+ *
+ * Update history:
+ *   2026-04-08  Initial calibration after Variant F shipped.
+ * ============================================================ */
+
+extern "C" {
+void tq_turbo_kv_5b_quantize_ref(const float* src, void* dst, int n);
+void tq_turbo_kv_5b_attention_ref(const float* query, const void* kv,
+                                    float* scores, int seq_len, int head_dim);
+}
+
+namespace {
+
+/* Generate realistic key/query vectors: per-coordinate Gaussian + a few
+ * scaled outliers, mimicking real transformer KV statistics. */
+static void synth_keys(std::vector<std::vector<float>>& keys, int n_keys,
+                       int dim, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    keys.resize(n_keys);
+    for (int k = 0; k < n_keys; k++) {
+        keys[k].resize(dim);
+        for (int i = 0; i < dim; i++) keys[k][i] = nd(rng) * 0.1f;
+        /* Inject a few outliers (~3% of dims, ±5x scale) */
+        for (int o = 0; o < dim / 32; o++) {
+            int idx = rng() % dim;
+            keys[k][idx] *= ((rng() & 1) ? 5.0f : -5.0f);
+        }
+    }
+}
+
+static void synth_query(std::vector<float>& q, int dim, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    q.resize(dim);
+    for (int i = 0; i < dim; i++) q[i] = nd(rng) * 0.1f;
+}
+
+/* Compute FP32 reference attention scores: scores[s] = <q, keys[s]> */
+static void fp32_attention(const std::vector<float>& q,
+                            const std::vector<std::vector<float>>& keys,
+                            std::vector<float>& scores) {
+    int n = (int)keys.size();
+    int dim = (int)q.size();
+    scores.resize(n);
+    for (int s = 0; s < n; s++) {
+        float dot = 0.0f;
+        for (int d = 0; d < dim; d++) dot += q[d] * keys[s][d];
+        scores[s] = dot;
+    }
+}
+
+} // namespace
+
+TEST(TurboKVRegression, KV_4B_AttentionCosine) {
+    const int dim = TQ_BK;       // 128
+    const int n_keys = 256;       // realistic context length
+
+    std::vector<std::vector<float>> keys;
+    synth_keys(keys, n_keys, dim, /*seed=*/0xC0FFEE);
+    std::vector<float> q;
+    synth_query(q, dim, /*seed=*/0xBADC0DE);
+
+    /* FP32 reference */
+    std::vector<float> ref_scores;
+    fp32_attention(q, keys, ref_scores);
+
+    /* Quantize keys with turbo_kv_4b */
+    std::vector<block_tq_turbo_kv_4b> blocks(n_keys);
+    for (int s = 0; s < n_keys; s++) {
+        memset(&blocks[s], 0, sizeof(blocks[s]));
+        tq_turbo_kv_4b_quantize_ref(keys[s].data(), &blocks[s], dim);
+    }
+
+    /* Compute estimated attention scores */
+    std::vector<float> est_scores(n_keys);
+    tq_turbo_kv_4b_attention_ref(q.data(), blocks.data(), est_scores.data(),
+                                  n_keys, dim);
+
+    double cos = compute_cosine(ref_scores.data(), est_scores.data(), n_keys);
+    /* Variant F achieves cos > 0.999 on this synthetic distribution.
+     * Calibrated threshold: 0.99 to allow noise but catch any major regression. */
+    EXPECT_GT(cos, 0.99) << "turbo_kv_4b attention cosine regressed below 0.99";
+}
+
+TEST(TurboKVRegression, KV_5B_AttentionCosine) {
+    const int dim = TQ_BK;
+    const int n_keys = 256;
+
+    std::vector<std::vector<float>> keys;
+    synth_keys(keys, n_keys, dim, /*seed=*/0xC0FFEE);
+    std::vector<float> q;
+    synth_query(q, dim, /*seed=*/0xBADC0DE);
+
+    std::vector<float> ref_scores;
+    fp32_attention(q, keys, ref_scores);
+
+    std::vector<block_tq_turbo_kv_5b> blocks(n_keys);
+    for (int s = 0; s < n_keys; s++) {
+        memset(&blocks[s], 0, sizeof(blocks[s]));
+        tq_turbo_kv_5b_quantize_ref(keys[s].data(), &blocks[s], dim);
+    }
+
+    std::vector<float> est_scores(n_keys);
+    tq_turbo_kv_5b_attention_ref(q.data(), blocks.data(), est_scores.data(),
+                                  n_keys, dim);
+
+    double cos = compute_cosine(ref_scores.data(), est_scores.data(), n_keys);
+    /* 5-bit is near-lossless: must beat 4-bit threshold by a wide margin. */
+    EXPECT_GT(cos, 0.999) << "turbo_kv_5b attention cosine regressed below 0.999";
+}
+
+TEST(TurboKVRegression, KV_5B_BeatsKV_4B) {
+    /* Strict invariant: 5-bit must always be at least as accurate as 4-bit
+     * on the same data, otherwise something is structurally wrong. */
+    const int dim = TQ_BK;
+    const int n_keys = 256;
+
+    std::vector<std::vector<float>> keys;
+    synth_keys(keys, n_keys, dim, /*seed=*/42);
+    std::vector<float> q;
+    synth_query(q, dim, /*seed=*/137);
+
+    std::vector<float> ref;
+    fp32_attention(q, keys, ref);
+
+    std::vector<block_tq_turbo_kv_4b> b4b(n_keys);
+    std::vector<block_tq_turbo_kv_5b> b5b(n_keys);
+    for (int s = 0; s < n_keys; s++) {
+        memset(&b4b[s], 0, sizeof(b4b[s]));
+        memset(&b5b[s], 0, sizeof(b5b[s]));
+        tq_turbo_kv_4b_quantize_ref(keys[s].data(), &b4b[s], dim);
+        tq_turbo_kv_5b_quantize_ref(keys[s].data(), &b5b[s], dim);
+    }
+    std::vector<float> sc4b(n_keys), sc5b(n_keys);
+    tq_turbo_kv_4b_attention_ref(q.data(), b4b.data(), sc4b.data(), n_keys, dim);
+    tq_turbo_kv_5b_attention_ref(q.data(), b5b.data(), sc5b.data(), n_keys, dim);
+
+    double cos4 = compute_cosine(ref.data(), sc4b.data(), n_keys);
+    double cos5 = compute_cosine(ref.data(), sc5b.data(), n_keys);
+
+    EXPECT_GE(cos5, cos4)
+        << "5-bit must be at least as accurate as 4-bit (5b=" << cos5
+        << ", 4b=" << cos4 << ")";
+}

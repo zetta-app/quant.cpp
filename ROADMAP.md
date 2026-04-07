@@ -49,14 +49,16 @@ The world's simplest way to add LLM to a C/C++ project.
 A C reference engine for KV cache quantization research.
 
 ### Production-ready
-- [x] **`turbo_kv_4b` ⭐** — RHT + 4-bit Lloyd-Max codebook, beats `uniform_4b` and llama.cpp `q4_0` KV at the same bit budget (Llama 3.2 3B PPL 14.28, +5.3% vs FP32)
+- [x] **`turbo_kv_5b` 🏆** — RHT + 5-bit (32-level) Lloyd-Max codebook, near-lossless (Llama 3.2 3B PPL 13.60, +0.34% vs FP32). Quality-maximizing option.
+- [x] **`turbo_kv_4b` ⭐ default** — RHT + 4-bit Lloyd-Max codebook, beats `uniform_4b` and llama.cpp `q4_0` KV at the same bit budget (Llama 3.2 3B PPL 14.28, +5.3% vs FP32)
 - [x] **`turbo_kv_3b`** — RHT + 3-bit Lloyd-Max codebook (PPL 15.39, +13.5%)
 - [x] `uniform_4b` KV quantization (4–7x compression, +6.3% PPL on Llama 3.2 3B)
 - [x] `uniform_4b` + Q4 V combo (6.9x KV memory reduction)
 - [x] Delta compression (P-frame encoding)
 - [x] QK-norm aware compression (Gemma 4 / hybrid attention models)
 - [x] Plugin architecture (3 functions to add new type)
-- [x] 35 unit tests
+- [x] Regression tests pinning `turbo_kv_4b/5b` quality
+- [x] 35 unit tests across macOS / Linux / Windows
 
 ### Building blocks
 - [x] Random Hadamard Transform (`tq_rht.c`)
@@ -67,9 +69,10 @@ A C reference engine for KV cache quantization research.
 ### TurboQuant paper reproduction (issue #14, partially resolved)
 - [x] Identify the gap in literal port (commit 4da6915 — QJL contributes byte-identical zero)
 - [x] Variant F: drop QJL stage, double codebook size (commit ac3c46a — beats baseline)
-- [ ] Per-channel outlier handling (Google paper's 32-channel split)
-- [ ] Paper-faithful Llama 3.1 8B + LongBench-E reproduction
-- [ ] 5-bit codebook variant for ~5 bpc quality budget
+- [x] 5-bit codebook variant for ~5 bpc quality budget (commit 87e14cb)
+- [x] Regression tests pinning quality (commit on this release)
+- [ ] Per-channel outlier handling (Google paper's 32-channel split) — issue #15
+- [ ] Paper-faithful Llama 3.1 8B + LongBench-E reproduction — issue #15
 
 ### Planned (after Direction 2 reproduction)
 - [ ] "Add Your Own Type" tutorial polish (docs/custom-quantization.md)
