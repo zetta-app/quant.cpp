@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.6.2] — 2026-04-08
+
+### Highlights
+
+- **🆕 `turbo_kv_4bo` / `turbo_kv_3bo`** — Per-block outlier handling research types. Each block stores the K=8 channels with the largest |rotated[i]| as exact FP16 values that overwrite the codebook reconstruction at dequant time. This is a simpler local form of the per-channel outlier handling described in the Google TurboQuant paper.
+- **Karpathy-loop validation**: per-channel outliers cut the PPL gap **by more than half** on Llama 3.2 3B (4b: +5.3% → 4bo: +2.2%). Effect is model-dependent — see notes below.
+- **Issue #15 progress**: closes the per-channel outlier handling exploration item. 5b remains the recommended quality option; 4bo/3bo ship as experimental.
+
+### KV quantization quality (Llama 3.2 3B, FP32 = 13.56 PPL)
+
+| Type | Bytes/block | Compression | PPL | Δ vs FP32 | Status |
+|---|---:|---:|---:|---:|---|
+| `turbo_kv_3b` | 56 | 9.1× | 15.39 | +13.5% | aggressive |
+| `turbo_kv_4b` ⭐ default | 72 | 7.1× | 14.28 | +5.3% | production |
+| **`turbo_kv_3bo`** 🧪 | 80 | 6.4× | 14.03 | +3.5% | research |
+| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.60** | **+0.34%** | production |
+| **`turbo_kv_4bo`** 🧪 | 96 | 5.3× | 13.86 | +2.2% | research |
+
+### Notes on the outlier types
+
+Per-channel outlier handling is **data-dependent**:
+- On Llama 3.2 3B (head_dim=128, heavier tails), `3bo` Pareto-improves over `4b`
+- On SmolLM2 135M (smaller dimensions), `3bo` regresses past `4b` because the 3-bit base is too coarse
+- `4bo` is dominated by `5b` on both models — slightly bigger and slightly worse
+
+Until per-model auto-selection is implemented, the Pareto-optimal recommendations remain `turbo_kv_4b` (default) and `turbo_kv_5b` (quality). The outlier types are exposed for researchers and benchmarking.
+
 ## [0.6.1] — 2026-04-08
 
 ### Highlights

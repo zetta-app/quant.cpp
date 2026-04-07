@@ -70,8 +70,8 @@ A C reference engine for KV cache quantization research.
 - [x] Identify the gap in literal port (commit 4da6915 — QJL contributes byte-identical zero)
 - [x] Variant F: drop QJL stage, double codebook size (commit ac3c46a — beats baseline)
 - [x] 5-bit codebook variant for ~5 bpc quality budget (commit 87e14cb)
-- [x] Regression tests pinning quality (commit on this release)
-- [ ] Per-channel outlier handling (Google paper's 32-channel split) — issue #15
+- [x] Regression tests pinning quality (commit 475872c)
+- [x] Per-channel outlier handling (turbo_kv_4bo/3bo, commits 4576910 + 5b5e4b7) — model-dependent, ships as research types; 5b remains the simpler quality champion
 - [ ] Paper-faithful Llama 3.1 8B + LongBench-E reproduction — issue #15
 
 ### Planned (after Direction 2 reproduction)
