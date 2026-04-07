@@ -152,7 +152,8 @@ static void compute_qjl_signs(const float* residual, uint8_t* signs,
 
 static void dequant_mse_rotated_2bit(const block_tq_turbo_kv_3b* block,
                                       float* rotated, int dim) {
-    float inv_std = sqrtf((float)dim);
+    float inv_std = tkv_fp16_to_fp32(block->inv_std_fp16);
+    if (inv_std < 1e-10f) inv_std = sqrtf((float)dim); /* fallback */
     uint8_t indices[TQ_BK] = {0};
     unpack_2bit(block->mse_indices, indices, dim);
     tq_codebook_dequantize(indices, rotated, dim, 2, inv_std);
@@ -160,7 +161,8 @@ static void dequant_mse_rotated_2bit(const block_tq_turbo_kv_3b* block,
 
 static void dequant_mse_rotated_3bit(const block_tq_turbo_kv_4b* block,
                                       float* rotated, int dim) {
-    float inv_std = sqrtf((float)dim);
+    float inv_std = tkv_fp16_to_fp32(block->inv_std_fp16);
+    if (inv_std < 1e-10f) inv_std = sqrtf((float)dim); /* fallback */
     uint8_t indices[TQ_BK] = {0};
     unpack_3bit(block->mse_indices, indices, dim);
     tq_codebook_dequantize(indices, rotated, dim, 3, inv_std);
@@ -195,14 +197,20 @@ void tq_turbo_kv_3b_quantize_ref(const float* src, void* dst, int n) {
     }
 
     /* Step 3: Apply RHT (in-place on rotated) */
-    uint32_t seed = TKV_DEFAULT_SEED;
-    block->rht_seed = seed;
-    tq_rht_transform(rotated, dim, seed);
+    tq_rht_transform(rotated, dim, TKV_DEFAULT_SEED);
 
-    /* Step 4: Scalar quantize with 2-bit codebook
-     * After RHT, coordinates are approximately N(0, 1/sqrt(dim)).
-     * inv_std = sqrt(dim) to normalize to N(0,1). */
-    float inv_std = sqrtf((float)dim);
+    /* Step 4: Compute per-block empirical std and quantize with 2-bit codebook.
+     * Theoretical analysis says rotated coords ~ N(0, 1/dim), but real key
+     * vectors after a single Hadamard rotation often have heavier tails or
+     * different variance per block. Using the empirical std adapts the
+     * codebook to the actual block distribution. */
+    float var_emp = 0.0f;
+    for (int i = 0; i < dim; i++) var_emp += rotated[i] * rotated[i];
+    var_emp /= (float)dim;
+    float std_emp = sqrtf(var_emp);
+    if (std_emp < 1e-10f) std_emp = 1.0f / sqrtf((float)dim);
+    float inv_std = 1.0f / std_emp;
+    block->inv_std_fp16 = tkv_fp32_to_fp16(inv_std);
     uint8_t indices[TQ_BK];
     tq_codebook_quantize(rotated, indices, dim, 2, inv_std);
 
@@ -248,7 +256,7 @@ void tq_turbo_kv_3b_dequantize_ref(const void* src, float* dst, int n) {
     if (dim > TQ_BK) dim = TQ_BK;
 
     float norm = tkv_fp16_to_fp32(block->norm);
-    uint32_t seed = block->rht_seed;
+    uint32_t seed = TKV_DEFAULT_SEED;
 
     /* MSE-only dequantize in rotated space */
     float rotated[TQ_BK];
@@ -432,11 +440,16 @@ void tq_turbo_kv_4b_quantize_ref(const float* src, void* dst, int n) {
         rotated[i] = 0.0f;
     }
 
-    uint32_t seed = TKV_DEFAULT_SEED;
-    block->rht_seed = seed;
-    tq_rht_transform(rotated, dim, seed);
+    tq_rht_transform(rotated, dim, TKV_DEFAULT_SEED);
 
-    float inv_std = sqrtf((float)dim);
+    /* Per-block empirical std (see 3-bit variant for rationale) */
+    float var_emp = 0.0f;
+    for (int i = 0; i < dim; i++) var_emp += rotated[i] * rotated[i];
+    var_emp /= (float)dim;
+    float std_emp = sqrtf(var_emp);
+    if (std_emp < 1e-10f) std_emp = 1.0f / sqrtf((float)dim);
+    float inv_std = 1.0f / std_emp;
+    block->inv_std_fp16 = tkv_fp32_to_fp16(inv_std);
     uint8_t indices[TQ_BK];
     tq_codebook_quantize(rotated, indices, dim, 3, inv_std);
     pack_3bit(indices, block->mse_indices, dim);
@@ -471,7 +484,7 @@ void tq_turbo_kv_4b_dequantize_ref(const void* src, float* dst, int n) {
     if (dim > TQ_BK) dim = TQ_BK;
 
     float norm = tkv_fp16_to_fp32(block->norm);
-    uint32_t seed = block->rht_seed;
+    uint32_t seed = TKV_DEFAULT_SEED;
 
     float rotated[TQ_BK];
     dequant_mse_rotated_3bit(block, rotated, dim);
@@ -694,7 +707,7 @@ void tq_turbo_kv_1b_dequantize_ref(const void* src, float* dst, int n) {
     if (sketch_dim < TQ_BK) sketch_dim = TQ_BK;
 
     float norm = tkv_fp16_to_fp32(block->norm);
-    uint32_t seed = block->rht_seed;
+    uint32_t seed = TKV_DEFAULT_SEED;
 
     /* Reconstruct sign vector in rotated space.
      * After RHT, coordinates are ~N(0, 1/sqrt(dim)).

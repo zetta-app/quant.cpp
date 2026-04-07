@@ -207,26 +207,28 @@ typedef struct {
 /* TurboQuant KV cache block: RHT + Lloyd-Max codebook + QJL residual
  * 3-bit variant: 2-bit codebook (4 levels) + 1-bit QJL sign hash
  * Block covers TQ_BK elements (128).
- * Layout: norm(2) + residual_norm(2) + rht_seed(4) + mse_2bit(32) + qjl_signs(16) = 56 bytes
+ * Layout: norm(2) + residual_norm(2) + inv_std(2) + _pad(2) + mse_2bit(32) + qjl_signs(16) = 56 bytes
  */
 typedef struct {
-    uint16_t norm;                     /* L2 norm of original vector (fp16)      */
-    uint16_t residual_norm;            /* L2 norm of residual after MSE (fp16)   */
-    uint32_t rht_seed;                 /* RHT random seed for this block         */
-    uint8_t  mse_indices[TQ_BK / 4];  /* 2-bit packed codebook indices (32B)    */
-    uint8_t  qjl_signs[TQ_BK / 8];    /* 1-bit QJL sign hash on residual (16B) */
+    uint16_t norm;                     /* L2 norm of original vector (fp16)        */
+    uint16_t residual_norm;            /* L2 norm of residual after MSE (fp16)     */
+    uint16_t inv_std_fp16;             /* per-block 1/std for codebook lookup      */
+    uint16_t _pad;                     /* alignment padding (was rht_seed upper)   */
+    uint8_t  mse_indices[TQ_BK / 4];  /* 2-bit packed codebook indices (32B)      */
+    uint8_t  qjl_signs[TQ_BK / 8];    /* 1-bit QJL sign hash on residual (16B)   */
 } block_tq_turbo_kv_3b;
 
 /* TurboQuant KV cache block: 4-bit variant
  * 3-bit codebook (8 levels) + 1-bit QJL sign hash
- * Layout: norm(2) + residual_norm(2) + rht_seed(4) + mse_3bit(48) + qjl_signs(16) = 72 bytes
+ * Layout: norm(2) + residual_norm(2) + inv_std(2) + _pad(2) + mse_3bit(48) + qjl_signs(16) = 72 bytes
  */
 typedef struct {
-    uint16_t norm;                         /* L2 norm of original vector (fp16)      */
-    uint16_t residual_norm;                /* L2 norm of residual after MSE (fp16)   */
-    uint32_t rht_seed;                     /* RHT random seed for this block         */
-    uint8_t  mse_indices[TQ_BK * 3 / 8];  /* 3-bit packed codebook indices (48B)    */
-    uint8_t  qjl_signs[TQ_BK / 8];        /* 1-bit QJL sign hash on residual (16B) */
+    uint16_t norm;                         /* L2 norm of original vector (fp16)        */
+    uint16_t residual_norm;                /* L2 norm of residual after MSE (fp16)     */
+    uint16_t inv_std_fp16;                 /* per-block 1/std for codebook lookup      */
+    uint16_t _pad;                         /* alignment padding                        */
+    uint8_t  mse_indices[TQ_BK * 3 / 8];  /* 3-bit packed codebook indices (48B)      */
+    uint8_t  qjl_signs[TQ_BK / 8];        /* 1-bit QJL sign hash on residual (16B)   */
 } block_tq_turbo_kv_4b;
 
 /* TurboQuant KV cache block: 1-bit Hamming attention
