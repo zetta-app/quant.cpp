@@ -2,11 +2,12 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">KV 캐시 양자화 연구를 위한 단일 헤더 C 레퍼런스 엔진</h3>
+<h3 align="center">KV 캐시 압축 LLM 추론을 위한 단일 헤더 C 엔진</h3>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2504.19874"><b>TurboQuant</b></a> (ICLR 2026), <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a> 등 7개 KV 양자화 기법을 구현합니다.<br>
-  72K LOC 순수 C, 의존성 제로. <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리 — 한 파일을 어디든 드롭.<br>
+  프로덕션: <code>uniform_4b</code> KV 캐시 (Llama 3.2 3B에서 4–7x 압축, +6% PPL).<br>
+  연구: <a href="https://arxiv.org/abs/2504.19874">TurboQuant</a>, <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a> 빌딩 블록 — 한 엔진에 7개 KV 양자화 기법.<br>
+  72K LOC 순수 C, 의존성 제로. <a href="#-단일-헤더-모드"><b>quant.h</b></a> 단일 헤더 라이브러리.<br>
   C 컴파일러가 있는 모든 곳에서 동작: <b>iOS · Android · WASM · MSVC · 마이크로컨트롤러</b>.
 </p>
 
@@ -40,30 +41,31 @@ LLM 메모리의 병목은 모델 가중치가 아니라 **KV 캐시**입니다.
 
 ## 결과
 
-> **같은 하드웨어. 4–7배 긴 컨텍스트. Perplexity 검증 완료.**
+> **같은 하드웨어. 4–7배 긴 컨텍스트. 측정된 PPL 영향 공개.**
 
-| 하드웨어 | 모델 | FP16 KV | quant.cpp KV | 배율 | PPL Δ |
-|:---------|:------|--------:|-------------:|-----:|------:|
-| 16GB Mac | Llama 3.2 3B | 50K 토큰 | **350K 토큰** | **6.9x** | +0.0% |
-| 16GB Mac | Gemma 4 26B MoE | 4K 토큰 | **30K 토큰** | **6.9x** | +0.0% |
-| 8GB 노트북 | Llama 8B (Q4) | 16K 토큰 | **61K 토큰** | **3.8x** | +0.0% |
-| 24GB RTX 3090 | Llama 8B (Q4) | 147K 토큰 | **559K 토큰** | **3.8x** | +0.0% |
+| 하드웨어 | 모델 | FP16 KV 컨텍스트 | `uniform_4b + q4` 컨텍스트 | KV 배율 | PPL Δ |
+|:---------|:------|------------:|--------------------:|------:|------:|
+| 16GB Mac | Llama 3.2 3B | 50K 토큰 | **350K 토큰** | **6.9x** | **+6.3%** |
+| 16GB Mac | Gemma 4 26B MoE | 4K 토큰 | **14K 토큰** | **3.5x** | (QK-norm aware) |
+| 8GB 노트북 | Llama 8B (Q4) | 16K 토큰 | **61K 토큰** | **3.8x** | +6.3% |
+| 24GB RTX 3090 | Llama 8B (Q4) | 147K 토큰 | **559K 토큰** | **3.8x** | +6.3% |
 
-PPL 측정: WikiText-2, SmolLM2 1.7B 베이스라인, `uniform_4b K + Q4 V` 설정. [재현 가능한 벤치마크](bench/head_to_head/) 참고.
+PPL 측정: Llama 3.2 3B Instruct, `bench/data/ppl_1k.txt` (1040 토큰), `uniform_4b K + FP16 V`. FP32 베이스라인=13.56, uniform_4b=14.41. 같은 4-bit 예산에서 llama.cpp Q4_0 KV (+10.6% PPL) 대비 우수. 전체 비교는 [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md) 참고.
 
 ## 왜 quant.cpp인가?
 
-2026년 4월, **Google이 TurboQuant를 발표했습니다** ([Zandieh et al., ICLR 2026](https://arxiv.org/abs/2504.19874)). 3비트에서 거의 무손실 KV 캐시 압축을 달성한 훌륭한 논문입니다. 하지만 오픈소스 생태계는 파편화되어 있습니다:
+LLM 메모리는 KV 캐시가 지배합니다. quant.cpp는 **실제로 동작하는 KV 캐시 양자화를 다른 누구도 제공하지 않는 폼팩터로 제공하는 미니멀 C 엔진**입니다: 단일 헤더 한 파일, 의존성 제로, iOS/Android/WASM/MSVC/마이크로컨트롤러에서 동작.
 
-- 🦀 [Rust 구현](https://github.com/RecursiveIntell/turbo-quant) — Cargo 필요, 모바일 배포 불가
-- 🐍 [PyTorch 구현](https://github.com/tonbistudio/turboquant-pytorch) — Python + Torch 런타임 필요
-- 🔥 [llama.cpp 다수 포크](https://github.com/ggml-org/llama.cpp/discussions/20969) — 머지된 구현 없음, 합의 부재
-- 📝 [Reference Python](https://github.com/scos-lab/turboquant) — 연구용
+**사용 이유 두 가지:**
 
-**quant.cpp는 유일한 단일 헤더 C 구현입니다.** 한 파일. 의존성 제로. 휴대폰, 브라우저, 게임 엔진, 마이크로컨트롤러에서 동작 — 다른 구현체들이 갈 수 없는 곳들.
+1. **무언가에 LLM 추론을 임베딩해야 합니다.** 앱, 게임, 웹페이지, 디바이스. quant.cpp는 한 파일(`quant.h`, 628KB) + libc. C 컴파일러가 동작하는 곳은 어디든.
 
-> **데이터센터에서 TurboQuant? Google의 레퍼런스를 사용하세요.**
-> **그 외 모든 곳에서 TurboQuant? quant.cpp를 사용하세요.**
+2. **KV 캐시 압축을 연구하고 싶습니다.** quant.cpp는 7개의 KV 양자화 기법을 나란히 구현: `uniform_4b/2b/3b`, `polar_3b/4b`, `qjl_1b`, `turbo_kv_*`. 각각을 한 C 파일에서 읽고 3개 함수로 새 타입을 추가할 수 있습니다.
+
+**정직한 공개**: 2026년 4월 Google이 [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874)을 발표했습니다. quant.cpp의 `turbo_kv_*` 타입은 같은 알고리즘 구조(Random Hadamard Transform → Lloyd-Max codebook → 1-bit QJL 잔차)를 구현하지만, **아직 논문 수치를 재현하지 못합니다** — 측정값과 gap 분석은 [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md). 프로덕션 권장 설정은 `uniform_4b`로, 같은 비트 예산에서 llama.cpp의 q4_0 KV와 경쟁력 있습니다.
+
+> **논문 수치 그대로의 TurboQuant가 필요하면?** [Google 레퍼런스](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) 사용.
+> **휴대폰에서 동작하는 KV 압축 + 작고 읽을 수 있는 C 엔진이 필요하면?** quant.cpp.
 
 ## 60초 시작 가이드
 

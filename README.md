@@ -2,10 +2,11 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">The single-header C reference engine for KV cache quantization research</h3>
+<h3 align="center">The single-header C engine for KV-compressed LLM inference</h3>
 
 <p align="center">
-  Implements <a href="https://arxiv.org/abs/2504.19874"><b>TurboQuant</b></a> (ICLR 2026), <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a>, and 4 other KV quantization schemes.<br>
+  Production: <code>uniform_4b</code> KV cache (4–7x compression at +6% PPL on Llama 3.2 3B).<br>
+  Research: building blocks for <a href="https://arxiv.org/abs/2504.19874">TurboQuant</a>, <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a> — 7 KV quantization types in one engine.<br>
   72K LOC pure C, zero dependencies. Ships as <a href="#-single-header-mode"><b>quant.h</b></a> — drop one file into any project.<br>
   Runs everywhere a C compiler does: <b>iOS · Android · WASM · MSVC · microcontrollers</b>.
 </p>
@@ -40,30 +41,31 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 ## The Result
 
-> **Same hardware. 4–7x longer context. Quantized with verified perplexity.**
+> **Same hardware. 4–7x longer context. Measured PPL impact disclosed.**
 
-| Hardware | Model | FP16 KV | quant.cpp KV | Gain | PPL Δ |
-|:---------|:------|--------:|-------------:|-----:|------:|
-| 16GB Mac | Llama 3.2 3B | 50K tokens | **350K tokens** | **6.9x** | +0.0% |
-| 16GB Mac | Gemma 4 26B MoE | 4K tokens | **30K tokens** | **6.9x** | +0.0% |
-| 8GB Laptop | Llama 8B (Q4) | 16K tokens | **61K tokens** | **3.8x** | +0.0% |
-| 24GB RTX 3090 | Llama 8B (Q4) | 147K tokens | **559K tokens** | **3.8x** | +0.0% |
+| Hardware | Model | FP16 KV ctx | `uniform_4b + q4` ctx | KV Gain | PPL Δ |
+|:---------|:------|------------:|----------------------:|--------:|------:|
+| 16GB Mac | Llama 3.2 3B | 50K tokens | **350K tokens** | **6.9x** | **+6.3%** |
+| 16GB Mac | Gemma 4 26B MoE | 4K tokens | **14K tokens** | **3.5x** | (QK-norm aware) |
+| 8GB Laptop | Llama 8B (Q4) | 16K tokens | **61K tokens** | **3.8x** | +6.3% |
+| 24GB RTX 3090 | Llama 8B (Q4) | 147K tokens | **559K tokens** | **3.8x** | +6.3% |
 
-PPL measured on WikiText-2, SmolLM2 1.7B baseline, `uniform_4b K + Q4 V` config. See [reproducible benchmark](bench/head_to_head/).
+PPL measured on Llama 3.2 3B Instruct, `bench/data/ppl_1k.txt` (1040 tokens), `uniform_4b K + FP16 V`. FP32 baseline = 13.56, `uniform_4b` = 14.41. Compared to llama.cpp Q4_0 KV at +10.6% PPL on the same baseline, quant.cpp `uniform_4b` is meaningfully better at the same 4-bit budget. See [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md) for the full comparison including the in-progress `turbo_kv_*` numbers.
 
 ## Why quant.cpp?
 
-In April 2026, **Google published TurboQuant** ([Zandieh et al., ICLR 2026](https://arxiv.org/abs/2504.19874)) — near-optimal KV cache compression at 3 bits. The paper is brilliant, but the open-source landscape is fragmented:
+LLM memory is dominated by the KV cache. quant.cpp is **a minimal C engine that ships KV cache quantization that actually works**, in a form factor nobody else offers: one single header, zero dependencies, runs on iOS/Android/WASM/MSVC/microcontrollers.
 
-- 🦀 [Rust implementation](https://github.com/RecursiveIntell/turbo-quant) — needs Cargo, can't ship to mobile
-- 🐍 [PyTorch implementation](https://github.com/tonbistudio/turboquant-pytorch) — needs Python + Torch runtime
-- 🔥 [Multiple llama.cpp forks](https://github.com/ggml-org/llama.cpp/discussions/20969) — none merged, no convergence
-- 📝 [Reference Python](https://github.com/scos-lab/turboquant) — research only
+**Two reasons to use it:**
 
-**quant.cpp is the only single-header C implementation.** One file. Zero dependencies. Runs on a phone, in a browser, inside a game engine, on a microcontroller. The places the others can't go.
+1. **You need to embed LLM inference inside something.** An app, a game, a web page, a device. quant.cpp is one file (`quant.h`, 628KB) plus libc. Everywhere a C compiler runs, this runs.
 
-> **TurboQuant for the data center? Use Google's reference.**
-> **TurboQuant for everywhere else? Use quant.cpp.**
+2. **You want to study KV cache compression.** quant.cpp implements 7 KV quantization schemes side by side: `uniform_4b/2b/3b`, `polar_3b/4b`, `qjl_1b`, `turbo_kv_*`. You can read each one in a single C file and add a new one in 3 functions.
+
+**Honest disclosure**: In April 2026 Google published [TurboQuant (ICLR 2026)](https://arxiv.org/abs/2504.19874). quant.cpp's `turbo_kv_*` types implement the same algorithmic structure (Random Hadamard Transform → Lloyd-Max codebook → 1-bit QJL residual), but **they do not yet reproduce the paper's reported quality** — see [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md) for measured numbers and the gap analysis. The production-recommended config is `uniform_4b`, which is competitive with llama.cpp's q4_0 KV at the same bit budget.
+
+> **Need TurboQuant numbers from a paper?** Use [Google's reference](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/).
+> **Need a small, readable C engine with KV compression that ships on a phone?** Use quant.cpp.
 
 ## Get Started in 60 Seconds
 
