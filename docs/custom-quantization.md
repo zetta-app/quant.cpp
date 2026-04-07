@@ -437,16 +437,46 @@ The scoring harness checks:
 
 Study these files for implementation patterns:
 
-| Type Family | Source File | Complexity | Good Starting Point? |
-|-------------|------------|-----------|---------------------|
-| Uniform 4-bit | `src/core/tq_uniform.c` | Simple | Yes -- closest to the example above |
-| Uniform 2-bit | `src/core/tq_uniform.c` | Medium | Yes -- shows sub-block scales |
-| Uniform 3-bit | `src/core/tq_uniform.c` | Medium | Shows 3-bit packing (non-power-of-2) |
-| Polar | `src/core/tq_polar.c` | Complex | Advanced -- polar coordinate encoding |
-| QJL | `src/core/tq_qjl.c` | Complex | Advanced -- random projection hashing |
-| Turbo | `src/core/tq_turbo.c` | Complex | Advanced -- composite (Polar + QJL residual) |
-| TurboKV | `src/core/tq_turbo.c` | Complex | Advanced -- RHT + codebook + QJL |
-| Mixed | `src/core/tq_uniform.c` | Medium | Shows outlier handling |
+| Type Family | Source File | Bytes/block | Llama 3.2 3B PPL Δ | Complexity | Pattern |
+|-------------|------------|------------:|-------------------:|-----------|---------|
+| `uniform_4b` | `src/core/tq_uniform.c` | 68 | +6.3% | Simple | Per-block min/max linear |
+| `uniform_2b` | `src/core/tq_uniform.c` | 36 | — | Medium | Per-sub-block scales |
+| `uniform_3b` | `src/core/tq_uniform.c` | 52 | — | Medium | Non-power-of-2 packing |
+| `polar_3b` / `polar_4b` | `src/core/tq_polar.c` | 72 | — | Complex | Polar coordinates `(r, θ)` |
+| `qjl_1b` | `src/core/tq_qjl.c` | 36 | — | Complex | Sign-hash random projection |
+| `turbo_3b` / `turbo_4b` | `src/core/tq_turbo.c` | 96 | — | Complex | Composite (Polar + QJL residual, legacy) |
+| **`turbo_kv_4b` ⭐** | `src/core/tq_turbo_kv.c` | 72 | **+5.3%** | Medium | **RHT + 4-bit Lloyd-Max codebook (Variant F)** |
+| **`turbo_kv_5b` 🏆** | `src/core/tq_turbo_kv.c` | 88 | **+0.34%** | Medium | RHT + 5-bit Lloyd-Max codebook |
+| `turbo_kv_3b` | `src/core/tq_turbo_kv.c` | 56 | +13.5% | Medium | RHT + 3-bit Lloyd-Max codebook |
+| `turbo_kv_4bo` 🧪 | `src/core/tq_turbo_kv.c` | 96 | +2.2% | Medium | 4b base + 8 per-block FP16 outliers |
+| `turbo_kv_3bo` 🧪 | `src/core/tq_turbo_kv.c` | 80 | +3.5% | Medium | 3b base + 8 per-block FP16 outliers |
+| `turbo_kv_1b` | `src/core/tq_turbo_kv.c` | 24 | — | Medium | 1-bit sign hash (Hamming attention) |
+| `mixed_4b8` | `src/core/tq_uniform.c` | — | — | Medium | 4-bit base + FP16 outlier table |
+
+### How the production winners were found
+
+`turbo_kv_4b` and `turbo_kv_5b` are not just hand-designed types — they're the **outputs of a 6-round Karpathy loop** of empirical iteration on Llama 3.2 3B perplexity:
+
+| Round | Variant | turbo_kv_4b PPL | Decision |
+|---:|---|---:|---|
+| 0 | Literal port (RHT + Lloyd-Max + 1-bit QJL residual) | 16.03 | baseline |
+| 1 | empirical std rescale | 15.87 | keep |
+| 2 | max-abs no-clip rescale | 15.39 | keep |
+| 3 | 99th percentile clipping | 17.24 | revert |
+| 4 | K·std sweep (K ∈ {1.5..4}) | 15.53 (best K=2) | keep |
+| 5 | uniform 8-level linear | 16.28 | revert |
+| **6** | **drop QJL, double codebook size (Variant F)** | **14.28** ✅ | **shipped** |
+
+The full ablation history with measurement methodology is in [bench/results/turboquant_reproduction.md](../bench/results/turboquant_reproduction.md).
+
+If you're adding a new type, you'll likely follow the same loop:
+1. Implement a literal version of your idea
+2. Run `./build/quant model.gguf --ppl bench/data/ppl_1k.txt -k yourtype` to measure
+3. Compare against `turbo_kv_4b` (default)
+4. Iterate one variable at a time, accept improvements, revert regressions
+5. Add a regression test that pins your final quality threshold
+
+The codebase is structured to make this loop fast (build < 30s, PPL test < 2 min on a 3B model).
 
 ### File Checklist
 

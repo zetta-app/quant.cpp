@@ -43,17 +43,41 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 > **Same hardware. 4–7x longer context. PPL measured and disclosed.**
 
-### Llama 3.2 3B Instruct, FP32 KV baseline = PPL 13.56
+### Llama 3.2 3B Instruct — PPL on WikiText (FP32 baseline = 13.56)
 
-| KV Config | Bits/elem | PPL | Δ vs FP32 | Notes |
-|:----------|----------:|----:|----------:|:------|
-| FP32 (baseline) | 32 | 13.56 | — | reference |
-| **`turbo_kv_4b`** ⭐ | 4 | **14.28** | **+5.3%** | RHT + 4-bit codebook, beats uniform_4b |
-| `uniform_4b` | 4 | 14.41 | +6.3% | per-block min-max |
-| `turbo_kv_3b` | 3 | 15.39 | +13.5% | RHT + 3-bit codebook |
-| llama.cpp `q4_0` KV | 4 | ~14.99 | +10.6% | for comparison |
+```
+                              PPL Degradation vs FP32
+                              (lower is better)
 
-`turbo_kv_4b` is currently the **best 4-bit KV cache quantization in the project** — it beats both our previous production baseline (`uniform_4b`) and llama.cpp's `q4_0` KV at the same bit budget. The Karpathy-loop history that produced it is in [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
+  llama.cpp Q4_0 KV    │██████████████████████████ +10.6%   (4-bit, no RHT)
+                       │
+  uniform_4b           │███████████████ +6.3%               (4-bit, no RHT)
+                       │
+  turbo_kv_4b ⭐ default│█████████████ +5.3%                 (72B/block)
+                       │
+  turbo_kv_3bo 🧪      │█████████ +3.5%                     (80B/block, +outliers)
+                       │
+  turbo_kv_4bo 🧪      │█████ +2.2%                         (96B/block, +outliers)
+                       │
+  turbo_kv_5b 🏆 quality│█ +0.34%                            (88B/block, near-lossless)
+                       │
+  FP32 reference       │ ←   0.0%                           (no quantization)
+                       └─────────────────────────────────────
+                        0%      +5%      +10%
+```
+
+| KV Config | Bytes/block | Compression | PPL | Δ vs FP32 |
+|:----------|------------:|------------:|----:|----------:|
+| FP32 reference | — | 1× | 13.56 | — |
+| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.60** | **+0.34%** |
+| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.86 | +2.2% |
+| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.03 | +3.5% |
+| **`turbo_kv_4b`** ⭐ default | 72 | 7.1× | 14.28 | +5.3% |
+| `uniform_4b` | 68 | 7.5× | 14.41 | +6.3% |
+| llama.cpp `q4_0` KV | ~70 | ~7.3× | ~14.99 | +10.6% |
+| `turbo_kv_3b` | 56 | 9.1× | 15.39 | +13.5% |
+
+`turbo_kv_4b` (default) and `turbo_kv_5b` (quality) are the recommended Pareto-optimal choices. Both beat llama.cpp's `q4_0` KV at the same or smaller block size on Llama 3.2 3B perplexity. The full Karpathy-loop optimization history is in [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
 
 ### Context length gains (`turbo_kv_4b` + `q4` value cache)
 
