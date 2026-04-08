@@ -24,6 +24,10 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 /* Forward declarations from other modules */
 extern void tq_codebook_quantize(const float* src, uint8_t* dst_indices,
                                   int n, int bits, float inv_std);
@@ -356,6 +360,23 @@ void tq_turbo_kv_3b_attention_ref(const float* query, const void* kv_cache,
         s_cb3_i8_init = 1;
     }
     int8x16_t cb_vec = vld1q_s8(s_cb3_i8);
+#elif defined(__AVX2__)
+    /* 8-entry codebook fits in lower 8 bytes; PSHUFB only uses low 4 bits of
+     * the index, and our 3-bit indices are guaranteed to be in [0..7]. */
+    static int8_t s_cb3_i8[16] = {0};
+    static int s_cb3_i8_init = 0;
+    if (!s_cb3_i8_init) {
+        for (int j = 0; j < 8; j++) {
+            float v = cb[j] * (127.0f / 2.1520f);
+            int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+            if (q < -127) q = -127;
+            if (q >  127) q =  127;
+            s_cb3_i8[j] = (int8_t)q;
+        }
+        for (int j = 8; j < 16; j++) s_cb3_i8[j] = 0;
+        s_cb3_i8_init = 1;
+    }
+    const __m128i cb3_xmm = _mm_loadu_si128((const __m128i*)s_cb3_i8);
 #endif
 
     for (int seq = 0; seq < seq_len; seq++) {
@@ -424,6 +445,63 @@ void tq_turbo_kv_3b_attention_ref(const float* query, const void* kv_cache,
         mse_dot = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
         /* Tail */
+        for (; d < dim; d++) {
+            int bit_off = d * 3;
+            int byte_idx = bit_off / 8;
+            int bit_pos = bit_off % 8;
+            uint16_t v = mi[byte_idx];
+            if (bit_pos > 5) v |= (uint16_t)mi[byte_idx + 1] << 8;
+            int idx = (v >> bit_pos) & 0x07;
+            mse_dot += q_rot[d] * (s_cb3_i8[idx] * per_block_scale);
+        }
+#elif defined(__AVX2__)
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        const __m256 scale_v = _mm256_set1_ps(per_block_scale);
+
+        int d = 0;
+        for (; d + 15 < dim; d += 16) {
+            const uint8_t* p = mi + (d * 3) / 8;
+            uint64_t w; memcpy(&w, p, 8);
+
+            uint8_t idx_buf[16];
+            idx_buf[0]  = (uint8_t)((w >>  0) & 0x07);
+            idx_buf[1]  = (uint8_t)((w >>  3) & 0x07);
+            idx_buf[2]  = (uint8_t)((w >>  6) & 0x07);
+            idx_buf[3]  = (uint8_t)((w >>  9) & 0x07);
+            idx_buf[4]  = (uint8_t)((w >> 12) & 0x07);
+            idx_buf[5]  = (uint8_t)((w >> 15) & 0x07);
+            idx_buf[6]  = (uint8_t)((w >> 18) & 0x07);
+            idx_buf[7]  = (uint8_t)((w >> 21) & 0x07);
+            idx_buf[8]  = (uint8_t)((w >> 24) & 0x07);
+            idx_buf[9]  = (uint8_t)((w >> 27) & 0x07);
+            idx_buf[10] = (uint8_t)((w >> 30) & 0x07);
+            idx_buf[11] = (uint8_t)((w >> 33) & 0x07);
+            idx_buf[12] = (uint8_t)((w >> 36) & 0x07);
+            idx_buf[13] = (uint8_t)((w >> 39) & 0x07);
+            idx_buf[14] = (uint8_t)((w >> 42) & 0x07);
+            idx_buf[15] = (uint8_t)((w >> 45) & 0x07);
+
+            __m128i indices = _mm_loadu_si128((const __m128i*)idx_buf);
+            __m128i vals    = _mm_shuffle_epi8(cb3_xmm, indices);
+
+            __m256i i32_lo = _mm256_cvtepi8_epi32(vals);
+            __m256i i32_hi = _mm256_cvtepi8_epi32(_mm_srli_si128(vals, 8));
+            __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_lo), scale_v);
+            __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_hi), scale_v);
+
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 0]), f0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 8]), f1, acc1);
+        }
+        {
+            __m256 sum = _mm256_add_ps(acc0, acc1);
+            __m128 lo  = _mm256_castps256_ps128(sum);
+            __m128 hi  = _mm256_extractf128_ps(sum, 1);
+            __m128 s   = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            mse_dot = _mm_cvtss_f32(s);
+        }
         for (; d < dim; d++) {
             int bit_off = d * 3;
             int byte_idx = bit_off / 8;
@@ -577,6 +655,26 @@ void tq_turbo_kv_4b_attention_ref(const float* query, const void* kv_cache,
         s_cb_i8_init = 1;
     }
     int8x16_t cb_vec = vld1q_s8(s_cb_i8);
+#elif defined(__AVX2__)
+    /* x86 AVX2 mirror of the NEON tbl pattern.
+     * _mm_shuffle_epi8 implements a 16-entry int8 table lookup in 1 instruction
+     * (PSHUFB), exactly matching vqtbl1q_s8. Round 10's NEON breakthrough ports
+     * to AVX2 1:1, since 16-entry codebook fits a 128-bit register on both ISAs.
+     */
+    static int8_t s_cb_i8[16] = {0};
+    static int s_cb_i8_init = 0;
+    if (!s_cb_i8_init) {
+        for (int j = 0; j < 16; j++) {
+            float v = cb[j] * (127.0f / 2.7326f);
+            int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+            if (q < -127) q = -127;
+            if (q >  127) q =  127;
+            s_cb_i8[j] = (int8_t)q;
+        }
+        s_cb_i8_init = 1;
+    }
+    const __m128i cb_xmm  = _mm_loadu_si128((const __m128i*)s_cb_i8);
+    const __m128i mask0F  = _mm_set1_epi8(0x0F);
 #endif
 
     for (int seq = 0; seq < seq_len; seq++) {
@@ -651,6 +749,55 @@ void tq_turbo_kv_4b_attention_ref(const float* query, const void* kv_cache,
         mse_dot = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
         /* Tail: scalar fallback for any remaining elements */
+        for (; d < dim; d++) {
+            uint8_t bv = mi[d / 2];
+            int idx = (d & 1) ? (bv >> 4) : (bv & 0x0F);
+            mse_dot += q_rot[d] * (s_cb_i8[idx] * per_block_scale);
+        }
+#elif defined(__AVX2__)
+        /* AVX2 path: 32 elements per iter, mirroring the NEON layout. */
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        const __m256 scale_v = _mm256_set1_ps(per_block_scale);
+
+        int d = 0;
+        for (; d + 31 < dim; d += 32) {
+            __m128i bytes    = _mm_loadu_si128((const __m128i*)(mi + d / 2));
+            __m128i low_nib  = _mm_and_si128(bytes, mask0F);
+            __m128i high_nib = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask0F);
+            __m128i low_vals  = _mm_shuffle_epi8(cb_xmm, low_nib);
+            __m128i high_vals = _mm_shuffle_epi8(cb_xmm, high_nib);
+
+            /* Interleave: result[2i]=low[i], result[2i+1]=high[i] */
+            __m128i inter_lo = _mm_unpacklo_epi8(low_vals, high_vals); /* elems 0..15 */
+            __m128i inter_hi = _mm_unpackhi_epi8(low_vals, high_vals); /* elems 16..31 */
+
+            __m256i i32_0 = _mm256_cvtepi8_epi32(inter_lo);
+            __m256i i32_1 = _mm256_cvtepi8_epi32(_mm_srli_si128(inter_lo, 8));
+            __m256i i32_2 = _mm256_cvtepi8_epi32(inter_hi);
+            __m256i i32_3 = _mm256_cvtepi8_epi32(_mm_srli_si128(inter_hi, 8));
+
+            __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_0), scale_v);
+            __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_1), scale_v);
+            __m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_2), scale_v);
+            __m256 f3 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_3), scale_v);
+
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d +  0]), f0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d +  8]), f1, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 16]), f2, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 24]), f3, acc3);
+        }
+        {
+            __m256 sum = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+            __m128 lo  = _mm256_castps256_ps128(sum);
+            __m128 hi  = _mm256_extractf128_ps(sum, 1);
+            __m128 s   = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            mse_dot = _mm_cvtss_f32(s);
+        }
         for (; d < dim; d++) {
             uint8_t bv = mi[d / 2];
             int idx = (d & 1) ? (bv >> 4) : (bv & 0x0F);
@@ -1317,6 +1464,30 @@ void tq_turbo_kv_5b_attention_ref(const float* query, const void* kv_cache,
         s_cb5_i8_init = 1;
     }
     int8x16x2_t cb_vec = { vld1q_s8(s_cb5_i8), vld1q_s8(s_cb5_i8 + 16) };
+#elif defined(__AVX2__)
+    /* AVX2 mirror of NEON vqtbl2q_s8 (32-entry table lookup).
+     *
+     * AVX2's PSHUFB is per-lane 16-entry only. We split the 32-entry codebook
+     * into cb_lo (entries 0..15) and cb_hi (entries 16..31), do two PSHUFBs
+     * with indices & 0x0F, then BLENDV based on the original bit 4 of each
+     * index (1 → use cb_hi). Cost: ~5 ops vs NEON's 1, still SIMD over scalar.
+     */
+    static int8_t s_cb5_i8[32] = {0};
+    static int s_cb5_i8_init = 0;
+    if (!s_cb5_i8_init) {
+        for (int j = 0; j < 32; j++) {
+            float v = cb[j] * (127.0f / 1.9956f);
+            int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+            if (q < -127) q = -127;
+            if (q >  127) q =  127;
+            s_cb5_i8[j] = (int8_t)q;
+        }
+        s_cb5_i8_init = 1;
+    }
+    const __m128i cb5_lo_xmm = _mm_loadu_si128((const __m128i*)(s_cb5_i8 +  0));
+    const __m128i cb5_hi_xmm = _mm_loadu_si128((const __m128i*)(s_cb5_i8 + 16));
+    const __m128i mask0F_x   = _mm_set1_epi8(0x0F);
+    const __m128i mask80_x   = _mm_set1_epi8((char)0x80);
 #endif
 
     for (int seq = 0; seq < seq_len; seq++) {
@@ -1396,6 +1567,71 @@ void tq_turbo_kv_5b_attention_ref(const float* query, const void* kv_cache,
         mse_dot = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
         /* Tail: scalar fallback for remaining elements */
+        for (; d < dim; d++) {
+            int bit_off = d * 5;
+            int byte_idx = bit_off / 8;
+            int bit_pos = bit_off % 8;
+            uint16_t v = mi[byte_idx];
+            if (bit_pos > 3) v |= (uint16_t)mi[byte_idx + 1] << 8;
+            int idx = (v >> bit_pos) & 0x1F;
+            mse_dot += q_rot[d] * (s_cb5_i8[idx] * per_block_scale);
+        }
+#elif defined(__AVX2__)
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        const __m256 scale_v = _mm256_set1_ps(per_block_scale);
+
+        int d = 0;
+        for (; d + 15 < dim; d += 16) {
+            /* 5-bit unpack: 16 indices = 10 bytes (= two 5-byte groups) */
+            const uint8_t* p0 = mi + (d * 5) / 8;
+            uint64_t w0; memcpy(&w0, p0, 8);
+            const uint8_t* p1 = p0 + 5;
+            uint64_t w1; memcpy(&w1, p1, 8);
+
+            uint8_t idx_buf[16];
+            idx_buf[0]  = (uint8_t)((w0 >>  0) & 0x1F);
+            idx_buf[1]  = (uint8_t)((w0 >>  5) & 0x1F);
+            idx_buf[2]  = (uint8_t)((w0 >> 10) & 0x1F);
+            idx_buf[3]  = (uint8_t)((w0 >> 15) & 0x1F);
+            idx_buf[4]  = (uint8_t)((w0 >> 20) & 0x1F);
+            idx_buf[5]  = (uint8_t)((w0 >> 25) & 0x1F);
+            idx_buf[6]  = (uint8_t)((w0 >> 30) & 0x1F);
+            idx_buf[7]  = (uint8_t)((w0 >> 35) & 0x1F);
+            idx_buf[8]  = (uint8_t)((w1 >>  0) & 0x1F);
+            idx_buf[9]  = (uint8_t)((w1 >>  5) & 0x1F);
+            idx_buf[10] = (uint8_t)((w1 >> 10) & 0x1F);
+            idx_buf[11] = (uint8_t)((w1 >> 15) & 0x1F);
+            idx_buf[12] = (uint8_t)((w1 >> 20) & 0x1F);
+            idx_buf[13] = (uint8_t)((w1 >> 25) & 0x1F);
+            idx_buf[14] = (uint8_t)((w1 >> 30) & 0x1F);
+            idx_buf[15] = (uint8_t)((w1 >> 35) & 0x1F);
+
+            __m128i indices  = _mm_loadu_si128((const __m128i*)idx_buf);
+            __m128i lo_idx   = _mm_and_si128(indices, mask0F_x);
+            __m128i lo_vals  = _mm_shuffle_epi8(cb5_lo_xmm, lo_idx);
+            __m128i hi_vals  = _mm_shuffle_epi8(cb5_hi_xmm, lo_idx);
+            /* Bit 4 of original index → bit 7 (sign) for blendv selector */
+            __m128i sel_mask = _mm_and_si128(_mm_slli_epi16(indices, 3), mask80_x);
+            __m128i vals     = _mm_blendv_epi8(lo_vals, hi_vals, sel_mask);
+
+            __m256i i32_lo = _mm256_cvtepi8_epi32(vals);
+            __m256i i32_hi = _mm256_cvtepi8_epi32(_mm_srli_si128(vals, 8));
+            __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_lo), scale_v);
+            __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_hi), scale_v);
+
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 0]), f0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 8]), f1, acc1);
+        }
+        {
+            __m256 sum = _mm256_add_ps(acc0, acc1);
+            __m128 lo  = _mm256_castps256_ps128(sum);
+            __m128 hi  = _mm256_extractf128_ps(sum, 1);
+            __m128 s   = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            mse_dot = _mm_cvtss_f32(s);
+        }
         for (; d < dim; d++) {
             int bit_off = d * 5;
             int byte_idx = bit_off / 8;
@@ -1883,6 +2119,23 @@ void tq_turbo_kv_5b_fast_attention_ref(const float* query, const void* kv_cache,
         s_cb5fast_init = 1;
     }
     int8x16x2_t cb_vec = { vld1q_s8(s_cb5fast_i8), vld1q_s8(s_cb5fast_i8 + 16) };
+#elif defined(__AVX2__)
+    static int8_t s_cb5fast_i8[32] = {0};
+    static int s_cb5fast_init = 0;
+    if (!s_cb5fast_init) {
+        for (int j = 0; j < 32; j++) {
+            float v = cb[j] * (127.0f / 1.9956f);
+            int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+            if (q < -127) q = -127;
+            if (q >  127) q =  127;
+            s_cb5fast_i8[j] = (int8_t)q;
+        }
+        s_cb5fast_init = 1;
+    }
+    const __m128i cb5f_lo_xmm = _mm_loadu_si128((const __m128i*)(s_cb5fast_i8 +  0));
+    const __m128i cb5f_hi_xmm = _mm_loadu_si128((const __m128i*)(s_cb5fast_i8 + 16));
+    const __m128i mask0F_xf   = _mm_set1_epi8(0x0F);
+    const __m128i mask80_xf   = _mm_set1_epi8((char)0x80);
 #endif
 
     for (int seq = 0; seq < seq_len; seq++) {
@@ -1928,6 +2181,42 @@ void tq_turbo_kv_5b_fast_attention_ref(const float* query, const void* kv_cache,
         }
         mse_dot = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
+        for (; d < dim; d++) {
+            mse_dot += q_rot[d] * (s_cb5fast_i8[mi[d]] * per_block_scale);
+        }
+#elif defined(__AVX2__)
+        /* Direct 1-byte-per-index loads — no scalar unpack. The cleanest
+         * AVX2 path of all turbo_kv variants thanks to byte alignment. */
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        const __m256 scale_v = _mm256_set1_ps(per_block_scale);
+
+        int d = 0;
+        for (; d + 15 < dim; d += 16) {
+            __m128i indices  = _mm_loadu_si128((const __m128i*)(mi + d));
+            __m128i lo_idx   = _mm_and_si128(indices, mask0F_xf);
+            __m128i lo_vals  = _mm_shuffle_epi8(cb5f_lo_xmm, lo_idx);
+            __m128i hi_vals  = _mm_shuffle_epi8(cb5f_hi_xmm, lo_idx);
+            __m128i sel_mask = _mm_and_si128(_mm_slli_epi16(indices, 3), mask80_xf);
+            __m128i vals     = _mm_blendv_epi8(lo_vals, hi_vals, sel_mask);
+
+            __m256i i32_lo = _mm256_cvtepi8_epi32(vals);
+            __m256i i32_hi = _mm256_cvtepi8_epi32(_mm_srli_si128(vals, 8));
+            __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_lo), scale_v);
+            __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(i32_hi), scale_v);
+
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 0]), f0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(&q_rot[d + 8]), f1, acc1);
+        }
+        {
+            __m256 sum = _mm256_add_ps(acc0, acc1);
+            __m128 lo  = _mm256_castps256_ps128(sum);
+            __m128 hi  = _mm256_extractf128_ps(sum, 1);
+            __m128 s   = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            mse_dot = _mm_cvtss_f32(s);
+        }
         for (; d < dim; d++) {
             mse_dot += q_rot[d] * (s_cb5fast_i8[mi[d]] * per_block_scale);
         }

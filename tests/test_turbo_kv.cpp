@@ -488,6 +488,9 @@ TEST(TurboKV, ZeroInput) {
 
 extern "C" {
 void tq_turbo_kv_5b_quantize_ref(const float* src, void* dst, int n);
+void tq_turbo_kv_5b_fast_quantize_ref(const float* src, void* dst, int n);
+void tq_turbo_kv_5b_fast_attention_ref(const float* query, const void* kv,
+                                         float* scores, int seq_len, int head_dim);
 void tq_turbo_kv_5b_attention_ref(const float* query, const void* kv,
                                     float* scores, int seq_len, int head_dim);
 }
@@ -625,4 +628,34 @@ TEST(TurboKVRegression, KV_5B_BeatsKV_4B) {
     EXPECT_GE(cos5, cos4)
         << "5-bit must be at least as accurate as 4-bit (5b=" << cos5
         << ", 4b=" << cos4 << ")";
+}
+
+TEST(TurboKVRegression, KV_5B_FAST_AttentionCosine) {
+    /* turbo_kv_5b_fast uses the same 32-entry codebook as 5b but with a
+     * 1-byte-per-index layout (no scalar bit unpack). Quality must match
+     * the 5b path bit-for-bit on the codebook lookup; only the layout differs. */
+    const int dim = TQ_BK;
+    const int n_keys = 256;
+
+    std::vector<std::vector<float>> keys;
+    synth_keys(keys, n_keys, dim, /*seed=*/0xC0FFEE);
+    std::vector<float> q;
+    synth_query(q, dim, /*seed=*/0xBADC0DE);
+
+    std::vector<float> ref_scores;
+    fp32_attention(q, keys, ref_scores);
+
+    std::vector<block_tq_turbo_kv_5b_fast> blocks(n_keys);
+    for (int s = 0; s < n_keys; s++) {
+        memset(&blocks[s], 0, sizeof(blocks[s]));
+        tq_turbo_kv_5b_fast_quantize_ref(keys[s].data(), &blocks[s], dim);
+    }
+
+    std::vector<float> est_scores(n_keys);
+    tq_turbo_kv_5b_fast_attention_ref(q.data(), blocks.data(), est_scores.data(),
+                                        n_keys, dim);
+
+    double cos = compute_cosine(ref_scores.data(), est_scores.data(), n_keys);
+    EXPECT_GT(cos, 0.999)
+        << "turbo_kv_5b_fast attention cosine regressed below 0.999";
 }
