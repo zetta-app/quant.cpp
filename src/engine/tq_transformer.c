@@ -1650,11 +1650,16 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             for (int t = 0; t < attn_start; t++) atth[t] = -1e30f;
 
             /* Fast path: no post-norm, no high-res window, attention type
-             * supports the fused kernel (which is true for all turbo_kv_*). */
+             * supports the fused kernel (which is true for all turbo_kv_*).
+             *
+             * Round 9: still gather + bulk attention. Skipping gather with
+             * strided per-position attention turned out NOT to help —
+             * Apple Silicon's prefetcher handles the strided pattern fine,
+             * and the gather lets the CPU's L1 prefetcher walk through a
+             * contiguous block, which is cache-efficient.
+             */
             if (!needs_post_norm && !k_hr_active && traits->attention != NULL
                 && attn_start == 0) {
-                /* Gather quantized blocks for this kv_head into a contiguous
-                 * buffer (the layer-stride layout has interleaved kv heads). */
                 size_t head_block_bytes = s->quant_head_stride;
                 size_t pos_stride_bytes = (size_t)cache_n_kv_heads * head_block_bytes;
                 uint8_t* layer_base = (uint8_t*)s->quant_key_cache
@@ -1667,7 +1672,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                     memcpy(gather_dst + (size_t)t * head_block_bytes, src, head_block_bytes);
                 }
 
-                /* Single bulk attention call computes all seq_len scores */
+                /* Single bulk attention call (query pre-rotated inside) */
                 traits->attention(qh, s->quant_key_buf, atth, seq_len, head_dim);
 
                 /* Apply scale */
