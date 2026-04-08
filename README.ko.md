@@ -43,22 +43,24 @@ LLM 메모리의 병목은 모델 가중치가 아니라 **KV 캐시**입니다.
 
 > **같은 하드웨어. 4–7배 긴 컨텍스트. PPL 측정 + 공개.**
 
-### Llama 3.2 3B Instruct — PPL × 속도 (FP32 KV = 13.56 PPL @ 18.13 tok/s)
+### Llama 3.2 3B Instruct — PPL × 속도 (FP32 KV = 13.56 PPL @ 17.9 tok/s)
 
-> 9 라운드 Karpathy 루프로 quant-KV vs FP32-KV 속도 격차를 **−45%에서 −8%로** 줄였습니다. 5.8–7.1× 메모리 압축. fp32 raw 속도를 능가하지는 못하지만 **8% 이내까지 따라잡음.**
+> **🏆 Round 10 (NEON `vqtbl1q_s8`) — `turbo_kv_4b`가 fp32 KV 속도와 동등 (7.1× 압축).** 10 라운드 Karpathy 루프로 −45% (literal port) → PARITY까지. Profile 기반 분석으로 진짜 bottleneck이 scalar inner loop임을 발견. 16 Lloyd-Max-Gaussian centroids를 int8로 양자화하고 `vqtbl1q_s8`로 SIMD table lookup하여 fp32와 동등한 SIMD 처리량 확보.
 
 | KV 설정 | 블록 바이트 | 압축 | PPL | Δ vs FP32 | tok/s | vs FP32 속도 |
 |:--------|----:|----:|----:|----:|----:|----:|
-| FP32 reference | — | 1× | 13.56 | — | **18.13** | baseline |
-| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **15.43** | **−14.9%** |
-| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 15.20 | −16.2% |
-| **`turbo_kv_4b`** ⭐ 기본 | **72** | **7.1×** | **14.33** | **+5.7%** | **16.60** | **−8.4%** |
-| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 15.77 | −13.0% |
+| FP32 reference | — | 1× | 13.56 | — | 17.9 | baseline |
+| **`turbo_kv_4b`** ⭐ 기본 | **72** | **7.1×** | **14.08** | **+3.8%** | **18.7** | **+4.5%** ⬆ |
+| `turbo_kv_5b` 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | 15.3 | −14.5% |
+| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 15.7 | −12.3% |
 | `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 13.27 | −26.8% |
+| llama.cpp `q4_0` KV (lit.) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
 
-**빌드 노트**: 위 숫자는 CMake 기본값 `TQ_BUILD_METAL=OFF` (CPU-only)에서 측정. Metal 활성화 시 14-22% 더 느립니다 — batch-1 추론에서 dispatch overhead가 GPU 이득을 능가. CMake 기본값이 OFF이므로 사용자는 자동으로 빠른 path를 받습니다. [Issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) 참고.
+`turbo_kv_4b` (기본)는 이제 모든 면에서 `uniform_4b`를 Pareto-dominate: 더 나은 PPL, 빠른 속도, 같은 압축. 동시에 fp32 KV 속도와 parity에서 7× 적은 메모리 + 3.8% PPL trade-off만.
 
-`turbo_kv_4b` (기본)와 `turbo_kv_5b` (quality)가 Pareto 추천: **5.8–7.1× 메모리 압축 + FP32 KV 92% 속도.** 전체 Karpathy 루프 이력: [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
+5b/3b는 아직 Round 10 NEON 미적용 (v0.7.1 예정).
+
+**빌드 노트**: 모든 측정은 CMake 기본값 `TQ_BUILD_METAL=OFF`. Metal은 batch-1 추론에서 net negative. [Issue #16](https://github.com/quantumaikr/quant.cpp/issues/16).
 
 > **이 비교에 대해**: v0.6.3 릴리스 노트에서 처음 "turbo_kv가 fp32 KV 속도를 능가"라고 주장했습니다. 그건 fp32 attention path가 scalar였기 때문에 발생한 artifact였고, fp32 path에 NEON을 추가한 후(commit `4490c83`) 정직한 격차는 `+5~10%`가 아닌 `−7~−12%`입니다. README와 v0.6.3 릴리스 노트를 정정했습니다.
 

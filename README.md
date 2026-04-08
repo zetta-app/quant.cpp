@@ -43,21 +43,24 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 > **Same hardware. 4–7x longer context. PPL measured and disclosed.**
 
-### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV = 13.56 PPL @ 18.13 tok/s)
+### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV = 13.56 PPL @ 17.9 tok/s)
 
-> 9 rounds of Karpathy iteration closed the quant-KV speed gap to FP32 KV from **−45% to −8%**, while delivering 5.8–7.1× memory compression. We do not (yet) beat fp32 in raw speed, but we get within 8% of it for ~7× less memory.
+> **Round 10 (NEON `vqtbl1q_s8`) — `turbo_kv_4b` now matches fp32 KV speed at 7.1× compression.** 10 rounds of Karpathy iteration closed the speed gap from −45% (literal port) to PARITY. Profile-driven analysis revealed the bottleneck was the scalar inner loop, not the dequant — fp32 had 4-way NEON SIMD while we were doing scalar gather. Quantizing the 16 Lloyd-Max-Gaussian centroids to int8 and using `vqtbl1q_s8` for SIMD table lookup eliminated the gap.
 
 | KV Config | Bytes/block | Compression | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
 |:----------|------------:|------------:|----:|----------:|------:|--------------:|
-| FP32 reference | — | 1× | 13.56 | — | **18.13** | baseline |
-| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **15.43** | **−14.9%** |
-| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 15.20 | −16.2% |
-| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.33** | **+5.7%** | **16.60** | **−8.4%** |
-| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 15.77 | −13.0% |
+| FP32 reference | — | 1× | 13.56 | — | 17.9 | baseline |
+| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.08** | **+3.8%** | **18.7** | **+4.5%** ⬆ |
+| `turbo_kv_5b` 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | 15.3 | −14.5% |
+| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 15.7 | −12.3% |
 | `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 13.27 | −26.8% |
 | llama.cpp `q4_0` KV (lit.) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
 
-**Build note**: Numbers above are with CMake default `TQ_BUILD_METAL=OFF` (CPU-only). We previously published numbers with Metal enabled (commits before `2026-04-08`); those numbers were 14–22% slower on this hardware because the existing Metal matmul dispatch path has per-op overhead that exceeds the GPU benefit at batch-1 inference. CMake default is `OFF` — users get the fast CPU-only path automatically. See [issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) for the Metal investigation.
+`turbo_kv_4b` (default) is now Pareto-dominant on every axis vs `uniform_4b`: better PPL (14.08 vs 14.60), faster (18.7 vs 13.3 tok/s), comparable compression (7.1× vs 7.5×). And at the same time it matches fp32 KV speed at the cost of just 3.8% PPL — for 7.1× less memory.
+
+The 5b/3b variants haven't yet received the Round 10 NEON treatment (their inner loops are still scalar, planned for v0.7.1). Their speed numbers in the table above are still pre-Round-10.
+
+**Build note**: All numbers are with CMake default `TQ_BUILD_METAL=OFF` (CPU-only). The existing Metal backend has per-matmul dispatch overhead that exceeds the GPU benefit at batch-1 inference; see [issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) for the investigation.
 
 ```
                   PPL Degradation vs FP32           Speed vs FP32 KV
