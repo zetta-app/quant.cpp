@@ -43,46 +43,47 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 > **Same hardware. 4–7x longer context. PPL measured and disclosed.**
 
-### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV NEON = 13.56 PPL @ 14.8 tok/s)
+### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV = 13.56 PPL @ 18.13 tok/s)
 
 > 9 rounds of Karpathy iteration closed the quant-KV speed gap to FP32 KV from **−45% to −8%**, while delivering 5.8–7.1× memory compression. We do not (yet) beat fp32 in raw speed, but we get within 8% of it for ~7× less memory.
 
 | KV Config | Bytes/block | Compression | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
 |:----------|------------:|------------:|----:|----------:|------:|--------------:|
-| FP32 reference (NEON) | — | 1× | 13.56 | — | 14.83 | baseline |
-| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **13.13** | **−11.5%** |
-| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 12.7 | −14% |
-| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.33** | **+5.7%** | **13.67** | **−7.8%** |
-| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 13.4 | −9.6% |
-| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.17 | +4.5% | 9.3 | −37% |
-| `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 11.7 | −21% |
+| FP32 reference | — | 1× | 13.56 | — | **18.13** | baseline |
+| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **15.43** | **−14.9%** |
+| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 15.20 | −16.2% |
+| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.33** | **+5.7%** | **16.60** | **−8.4%** |
+| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 15.77 | −13.0% |
+| `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 13.27 | −26.8% |
 | llama.cpp `q4_0` KV (lit.) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
+
+**Build note**: Numbers above are with CMake default `TQ_BUILD_METAL=OFF` (CPU-only). We previously published numbers with Metal enabled (commits before `2026-04-08`); those numbers were 14–22% slower on this hardware because the existing Metal matmul dispatch path has per-op overhead that exceeds the GPU benefit at batch-1 inference. CMake default is `OFF` — users get the fast CPU-only path automatically. See [issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) for the Metal investigation.
 
 ```
                   PPL Degradation vs FP32           Speed vs FP32 KV
                        (lower is better)              (higher is better)
 
-  turbo_kv_5b     │█ +0.7%                       █████████ −11.5%
-  turbo_kv_4bo    │██▌ +2.5%                     ████████ −14%
-  turbo_kv_4b ⭐  │█████ +5.7%                   ██████████ −7.8%
-  turbo_kv_3b     │█████████████ +13.3%          █████████ −9.6%
-  uniform_4b      │██████ +7.7%                  ███████ −21%
+  turbo_kv_5b     │█ +0.7%                       █████████ −14.9%
+  turbo_kv_4bo    │██▌ +2.5%                     ████████ −16.2%
+  turbo_kv_4b ⭐  │█████ +5.7%                   ██████████ −8.4%
+  turbo_kv_3b     │█████████████ +13.3%          █████████ −13.0%
+  uniform_4b      │██████ +7.7%                  ███████ −26.8%
   llama.cpp q4_0  │██████████ +10.6%             — (not measured)
-  FP32 reference  │ ← 0%                         14.83 tok/s ←
+  FP32 reference  │ ← 0%                         18.13 tok/s ←
                    0%   +5%   +10%               0   25%   50%   75%   100%
 ```
 
 `turbo_kv_4b` (default) and `turbo_kv_5b` (quality) are the Pareto-optimal recommendations: **5.8–7.1× memory compression at 92% of FP32 KV speed.** Full Karpathy-loop history (9 rounds across 3 sessions) in [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
 
-### Cross-size validation (3 Llama-family models)
+### Cross-size validation (3 Llama-family models, all measured CPU-only)
 
-| Model | turbo_kv_5b PPL Δ | turbo_kv_4b PPL Δ |
-|---|---:|---:|
-| SmolLM2 135M Instruct | +1.7% | +5.8% |
-| Llama 3.2 1B Instruct | **+0.7%** | +7.3% |
-| Llama 3.2 3B Instruct | **+0.7%** | +5.7% |
+| Model | FP32 baseline | turbo_kv_5b PPL Δ | turbo_kv_4b PPL Δ | turbo_kv_4b tok/s | vs FP32 speed |
+|---|---:|---:|---:|---:|---:|
+| SmolLM2 135M | 18.62 PPL @ 70.4 t/s | +1.7% | +5.8% | 60.2 | −14.5% |
+| Llama 3.2 1B | 16.88 PPL @ 41.1 t/s | +0.7% | +7.3% | 34.4 | −16.3% |
+| Llama 3.2 3B | 13.56 PPL @ 18.13 t/s | +0.7% | +5.7% | 16.60 | −8.4% |
 
-`turbo_kv_5b` is consistently near-lossless across model sizes (~1% PPL Δ). `turbo_kv_4b` stays in the 5–8% range. **Recommendation**: use `turbo_kv_3b` only on models ≥ 3B parameters (the 8-level codebook is too coarse for small models — +61% PPL on Llama 3.2 1B).
+`turbo_kv_5b` is consistently near-lossless across model sizes (~1% PPL Δ). `turbo_kv_4b` stays in the 5–8% PPL range and runs at 84–92% of FP32 KV speed. **Recommendation**: use `turbo_kv_3b` only on models ≥ 3B parameters (the 8-level codebook is too coarse for small models — +61% PPL on Llama 3.2 1B).
 
 > **About this comparison**: We previously published v0.6.3 release notes claiming `turbo_kv` beats `fp32` KV speed. That was an artifact of the fp32 attention path being unoptimized scalar — once we added NEON to the fp32 path (commit `4490c83`), the honest gap is `−7%` to `−12%`, not `+5%` to `+10%`. We've corrected the README and the v0.6.3 release notes.
 
