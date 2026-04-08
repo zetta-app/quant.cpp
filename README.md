@@ -43,41 +43,37 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 > **Same hardware. 4–7x longer context. PPL measured and disclosed.**
 
-### Llama 3.2 3B Instruct — PPL on WikiText (FP32 baseline = 13.56)
+### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV = 13.56 PPL @ 12.6 tok/s)
+
+> **`turbo_kv_4b` is now both 7× more compressed AND faster than fp32 KV** at long context. The Karpathy loop closed the speed gap completely (PPL eval throughput).
+
+| KV Config | Bytes/block | Compression | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
+|:----------|------------:|------------:|----:|----------:|------:|--------------:|
+| FP32 reference | — | 1× | 13.56 | — | 12.6 | baseline |
+| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **13.2** | **+5%** ⬆ |
+| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 12.7 | +1% |
+| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.17 | +4.5% | 9.3 | -26% |
+| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.33** | **+5.7%** | **13.9** | **+10%** ⬆ |
+| `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 11.7 | -7% |
+| **`turbo_kv_3b`** | **56** | **9.1×** | 15.36 | +13.3% | **13.4** | **+6%** ⬆ |
+| llama.cpp `q4_0` KV (lit. survey) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
 
 ```
-                              PPL Degradation vs FP32
-                              (lower is better)
+                  PPL Degradation vs FP32           Throughput vs FP32
+                       (lower is better)              (higher is better)
 
-  llama.cpp Q4_0 KV    │██████████████████████████ +10.6%   (4-bit, no RHT)
-                       │
-  uniform_4b           │███████████████ +6.3%               (4-bit, no RHT)
-                       │
-  turbo_kv_4b ⭐ default│█████████████ +5.3%                 (72B/block)
-                       │
-  turbo_kv_3bo 🧪      │█████████ +3.5%                     (80B/block, +outliers)
-                       │
-  turbo_kv_4bo 🧪      │█████ +2.2%                         (96B/block, +outliers)
-                       │
-  turbo_kv_5b 🏆 quality│█ +0.34%                            (88B/block, near-lossless)
-                       │
-  FP32 reference       │ ←   0.0%                           (no quantization)
-                       └─────────────────────────────────────
-                        0%      +5%      +10%
+  turbo_kv_5b     │█ +0.7%                       ████████████ +5%   ⬆
+  turbo_kv_4bo    │██▌ +2.5%                     ██████████▌ +1%
+  turbo_kv_3bo    │████▌ +4.5%                   ██████████ -26%   ↓
+  turbo_kv_4b ⭐  │█████ +5.7%                   ████████████▌ +10% ⬆
+  uniform_4b      │██████ +7.7%                  ████████████ -7%
+  turbo_kv_3b     │█████████████ +13.3%          ████████████ +6%   ⬆
+  llama.cpp q4_0  │██████████ +10.6%             — (not measured)
+  FP32 reference  │ ← 0%                         12.6 tok/s
+                   0%   +5%   +10%               9    10    11    12    13    14
 ```
 
-| KV Config | Bytes/block | Compression | PPL | Δ vs FP32 |
-|:----------|------------:|------------:|----:|----------:|
-| FP32 reference | — | 1× | 13.56 | — |
-| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.60** | **+0.34%** |
-| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.86 | +2.2% |
-| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.03 | +3.5% |
-| **`turbo_kv_4b`** ⭐ default | 72 | 7.1× | 14.28 | +5.3% |
-| `uniform_4b` | 68 | 7.5× | 14.41 | +6.3% |
-| llama.cpp `q4_0` KV | ~70 | ~7.3× | ~14.99 | +10.6% |
-| `turbo_kv_3b` | 56 | 9.1× | 15.39 | +13.5% |
-
-`turbo_kv_4b` (default) and `turbo_kv_5b` (quality) are the recommended Pareto-optimal choices. Both beat llama.cpp's `q4_0` KV at the same or smaller block size on Llama 3.2 3B perplexity. The full Karpathy-loop optimization history is in [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
+`turbo_kv_4b` (default) and `turbo_kv_5b` (quality) are the Pareto-optimal recommendations. **Both compress 5.8–7.1× and run faster than uncompressed FP32 KV.** Full Karpathy-loop history (9 rounds across 3 sessions) in [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
 
 ### Context length gains (`turbo_kv_4b` + `q4` value cache)
 

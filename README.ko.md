@@ -43,40 +43,22 @@ LLM 메모리의 병목은 모델 가중치가 아니라 **KV 캐시**입니다.
 
 > **같은 하드웨어. 4–7배 긴 컨텍스트. PPL 측정 + 공개.**
 
-### Llama 3.2 3B Instruct — WikiText PPL (FP32 베이스라인 = 13.56)
+### Llama 3.2 3B Instruct — PPL × 속도 (FP32 KV = 13.56 PPL @ 12.6 tok/s)
 
-```
-                              FP32 대비 PPL 저하 (낮을수록 좋음)
+> **`turbo_kv_4b`는 fp32 KV보다 7배 더 압축되었으면서 더 빠릅니다** (long context 기준). Karpathy 루프로 속도 격차를 완전히 없앴습니다.
 
-  llama.cpp Q4_0 KV    │██████████████████████████ +10.6%   (4-bit, RHT 없음)
-                       │
-  uniform_4b           │███████████████ +6.3%               (4-bit, RHT 없음)
-                       │
-  turbo_kv_4b ⭐ 기본   │█████████████ +5.3%                 (72B/블록)
-                       │
-  turbo_kv_3bo 🧪      │█████████ +3.5%                     (80B/블록, +outliers)
-                       │
-  turbo_kv_4bo 🧪      │█████ +2.2%                         (96B/블록, +outliers)
-                       │
-  turbo_kv_5b 🏆 quality│█ +0.34%                            (88B/블록, 거의 무손실)
-                       │
-  FP32 reference       │ ← 0.0%                             (양자화 없음)
-                       └─────────────────────────────────────
-                        0%      +5%      +10%
-```
+| KV 설정 | 블록 바이트 | 압축 | PPL | Δ vs FP32 | tok/s | vs FP32 속도 |
+|:--------|----:|----:|----:|----:|----:|----:|
+| FP32 reference | — | 1× | 13.56 | — | 12.6 | baseline |
+| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **13.2** | **+5%** ⬆ |
+| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 12.7 | +1% |
+| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.17 | +4.5% | 9.3 | -26% |
+| **`turbo_kv_4b`** ⭐ 기본 | **72** | **7.1×** | **14.33** | **+5.7%** | **13.9** | **+10%** ⬆ |
+| `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 11.7 | -7% |
+| **`turbo_kv_3b`** | **56** | **9.1×** | 15.36 | +13.3% | **13.4** | **+6%** ⬆ |
+| llama.cpp `q4_0` KV (lit.) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
 
-| KV 설정 | 블록 바이트 | 압축 | PPL | Δ vs FP32 |
-|:--------|----:|----:|----:|----:|
-| FP32 reference | — | 1× | 13.56 | — |
-| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.60** | **+0.34%** |
-| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.86 | +2.2% |
-| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.03 | +3.5% |
-| **`turbo_kv_4b`** ⭐ 기본 | 72 | 7.1× | 14.28 | +5.3% |
-| `uniform_4b` | 68 | 7.5× | 14.41 | +6.3% |
-| llama.cpp `q4_0` KV | ~70 | ~7.3× | ~14.99 | +10.6% |
-| `turbo_kv_3b` | 56 | 9.1× | 15.39 | +13.5% |
-
-`turbo_kv_4b` (기본)와 `turbo_kv_5b` (quality)가 Pareto-optimal 추천. 두 가지 모두 llama.cpp `q4_0` KV를 같거나 작은 블록 사이즈에서 능가. 전체 Karpathy 루프 이력은 [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
+`turbo_kv_4b` (기본)와 `turbo_kv_5b` (quality)가 Pareto-optimal 추천. **둘 다 5.8–7.1× 압축 + uncompressed FP32 KV보다 빠름.** 전체 Karpathy 루프 이력 (9 rounds across 3 sessions): [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
 
 ### 컨텍스트 길이 증가 (`turbo_kv_4b` + `q4` value cache)
 
