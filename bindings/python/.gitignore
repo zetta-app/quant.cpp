@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+dist/
+wheelhouse/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Bundled at build time from ../../quant.h — never commit
+quantcpp/_quant.h
+quantcpp/_quant_impl.c
+
+# Compiled shared libraries — never commit
+quantcpp/libquant.so
+quantcpp/libquant.dylib
+quantcpp/quant.dll

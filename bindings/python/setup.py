@@ -25,13 +25,36 @@ from setuptools.command.build_py import build_py
 # ---------------------------------------------------------------------------
 
 HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parent.parent          # quant.cpp repo root
-QUANT_H = PROJECT_ROOT / "quant.h"
+PROJECT_ROOT = HERE.parent.parent          # quant.cpp repo root (only exists in dev tree)
+PKG_DIR = HERE / "quantcpp"
 
-# The tiny C file that triggers the implementation
+# Bundled header location (always inside the package — required for sdist).
+# In the dev tree we copy quant.h here on every build so MANIFEST/sdist
+# automatically picks it up. End users installing from sdist see only the
+# bundled copy.
+BUNDLED_HEADER = PKG_DIR / "_quant.h"
+QUANT_H_DEV    = PROJECT_ROOT / "quant.h"
+
+def _ensure_bundled_header() -> Path:
+    """Ensure quantcpp/_quant.h exists. Refresh from dev tree when newer."""
+    if QUANT_H_DEV.is_file():
+        if (not BUNDLED_HEADER.exists() or
+                QUANT_H_DEV.stat().st_mtime > BUNDLED_HEADER.stat().st_mtime):
+            shutil.copyfile(QUANT_H_DEV, BUNDLED_HEADER)
+            print(f"[quantcpp] Bundled {QUANT_H_DEV} -> {BUNDLED_HEADER}")
+    if not BUNDLED_HEADER.is_file():
+        raise FileNotFoundError(
+            f"Bundled header missing: {BUNDLED_HEADER}. "
+            "Either build from the quant.cpp repo (where ../../quant.h exists) "
+            "or install a published sdist that already contains _quant.h."
+        )
+    return BUNDLED_HEADER
+
+# The tiny C file that triggers the implementation. Uses the bundled header
+# name so it works identically in dev tree and in installed sdist.
 _IMPL_C = """
 #define QUANT_IMPLEMENTATION
-#include "quant.h"
+#include "_quant.h"
 """
 
 
@@ -57,19 +80,17 @@ def _find_cc() -> str:
 
 
 def _compile_shared_lib(output_dir: Path) -> Path:
-    """Compile quant.h into a shared library and return the output path."""
-    if not QUANT_H.is_file():
-        raise FileNotFoundError(
-            f"quant.h not found at {QUANT_H}. "
-            "Make sure you are building from the quant.cpp repository."
-        )
+    """Compile the bundled _quant.h into a shared library."""
+    # Make sure the bundled header is in place. In the dev tree this copies
+    # from ../../quant.h; in an installed sdist it's already there.
+    header = _ensure_bundled_header()
 
     output_dir.mkdir(parents=True, exist_ok=True)
     lib_name = _lib_name()
     lib_path = output_dir / lib_name
 
-    # Write the implementation .c file
-    impl_c = output_dir / "_quant_impl.c"
+    # Place the impl .c next to the header so the include path is just `.`
+    impl_c = header.parent / "_quant_impl.c"
     impl_c.write_text(_IMPL_C)
 
     cc = _find_cc()
@@ -86,7 +107,7 @@ def _compile_shared_lib(output_dir: Path) -> Path:
     cmd += [
         "-O2",
         "-fPIC",
-        "-I", str(PROJECT_ROOT),
+        "-I", str(header.parent),
         str(impl_c),
         "-o", str(lib_path),
         "-lm",
@@ -99,7 +120,7 @@ def _compile_shared_lib(output_dir: Path) -> Path:
     # Suppress common warnings from single-header builds
     cmd += ["-w"]
 
-    print(f"[quantcpp] Compiling {QUANT_H.name} -> {lib_name}")
+    print(f"[quantcpp] Compiling {header.name} -> {lib_name}")
     print(f"[quantcpp] Command: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -151,12 +172,36 @@ class BuildInPlace(build_py):
 
 def _get_build_class():
     """Choose build class based on whether this is an editable install."""
-    # pip install -e . sets this; regular install does not
     if "develop" in sys.argv or "editable_wheel" in sys.argv:
         return BuildInPlace
     return BuildWithCompile
 
 
+# Force platform-specific wheel tag (libquant.{so,dylib,dll} ships in pkg).
+# Without this, setuptools generates a py3-none-any wheel that pip happily
+# installs on the wrong OS.
+from setuptools.dist import Distribution as _Distribution
+class _BinaryDistribution(_Distribution):
+    def has_ext_modules(self):
+        return True
+    def is_pure(self):
+        return False
+
+
+# Make sure the bundled header lives in quantcpp/_quant.h *before* setuptools
+# walks the package contents. This guarantees sdist includes it without us
+# touching MANIFEST.in (sdist is always built in dev tree where ../../quant.h
+# exists; downstream sdist installs already contain the bundled file).
+try:
+    _ensure_bundled_header()
+except FileNotFoundError as _e:
+    # Don't break metadata-only commands (e.g. pip's get_requires hook running
+    # in an isolated copy without the dev tree). The header check will fire
+    # again at compile time with a clearer error.
+    print(f"[quantcpp] WARNING (continuing): {_e}", file=sys.stderr)
+
+
 setup(
     cmdclass={"build_py": _get_build_class()},
+    distclass=_BinaryDistribution,
 )
