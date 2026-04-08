@@ -472,21 +472,118 @@ void tq_turbo_kv_4b_attention_ref(const float* query, const void* kv_cache,
     /* Hoist codebook pointer (constant for all blocks) */
     const float* cb = tq_codebook_centroids(4);
 
+    /* Round 10: NEON 16-entry table lookup via vqtbl1q_s8.
+     *
+     * The 16 Lloyd-Max-Gaussian centroids span [-2.7326, +2.7326]. We map
+     * them to int8 in [-127, +127] by scaling by (127 / 2.7326) ≈ 46.46.
+     * This loses ~1% precision (8-bit covers 256 levels over 5.5 range,
+     * step ~0.022 vs typical centroid spacing 0.13–0.66) which is well
+     * below our regression threshold (cosine ≥ 0.99 for 4b).
+     *
+     * The lookup uses vqtbl1q_s8 (1 instruction, 16 byte gathers from a
+     * 16-byte register). Then int8→int16→fp32 conversion + per-block
+     * scale gives 16-element processing per ~10 NEON instructions vs
+     * the previous ~32 scalar instructions.
+     */
+#ifdef __ARM_NEON
+    /* Static int8 codebook (computed once at startup; safe across blocks) */
+    static int8_t s_cb_i8[16] = {0};
+    static int s_cb_i8_init = 0;
+    static const float CB_I8_RECIP = 2.7326f / 127.0f; /* fp32 = int8 * recip */
+    if (!s_cb_i8_init) {
+        for (int j = 0; j < 16; j++) {
+            float v = cb[j] * (127.0f / 2.7326f);
+            int q = (int)(v >= 0 ? v + 0.5f : v - 0.5f);
+            if (q < -127) q = -127;
+            if (q >  127) q =  127;
+            s_cb_i8[j] = (int8_t)q;
+        }
+        s_cb_i8_init = 1;
+    }
+    int8x16_t cb_vec = vld1q_s8(s_cb_i8);
+#endif
+
     for (int seq = 0; seq < seq_len; seq++) {
         const block_tq_turbo_kv_4b* block = &blocks_4b[seq];
         float norm = tkv_fp16_to_fp32(block->norm);
         float inv_std = tkv_fp16_to_fp32(block->inv_std_fp16);
         if (inv_std < 1e-10f) inv_std = sqrtf((float)dim);
-        float scale = 1.0f / inv_std;
+        float per_block_scale = CB_I8_RECIP / inv_std; /* fp32 = int8 * this */
 
-        /* Per-block pre-scaled LUT (16 floats, fits in 64 bytes — L1 hot) */
-        float lut[16];
-        for (int j = 0; j < 16; j++) lut[j] = cb[j] * scale;
-
-        /* Round 4: fused scalar dequant + dot product, 4 accumulators.
-         * Eliminates the rotated[] intermediate buffer entirely.
-         * Apple Silicon's 6 ALUs + L1-hot LUT make scalar gather fast. */
         const uint8_t* mi = block->mse_indices;
+        float mse_dot = 0.0f;
+
+#ifdef __ARM_NEON
+        /* Process 32 elements per iteration: 16 bytes of mse_indices */
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+        float32x4_t scale_v = vdupq_n_f32(per_block_scale);
+
+        int d = 0;
+        for (; d + 31 < dim; d += 32) {
+            /* Load 16 bytes (= 32 nibbles = 32 elements) from mse_indices */
+            uint8x16_t bytes = vld1q_u8(mi + d / 2);
+
+            /* Split into low / high nibbles. low[i] = byte[i] & 0x0F = even-position element, high[i] = byte[i] >> 4 = odd-position element. */
+            uint8x16_t low_nib  = vandq_u8(bytes, vdupq_n_u8(0x0F));
+            uint8x16_t high_nib = vshrq_n_u8(bytes, 4);
+
+            /* Table lookup: gather centroid int8 values via the 4-bit nibble */
+            int8x16_t low_vals  = vqtbl1q_s8(cb_vec, low_nib);
+            int8x16_t high_vals = vqtbl1q_s8(cb_vec, high_nib);
+
+            /* Interleave low/high so result element [2i] = low[i], [2i+1] = high[i] */
+            int8x16x2_t inter = vzipq_s8(low_vals, high_vals);
+
+            /* Convert int8 → int16 → fp32 (16 lanes split into 4×4) */
+            int16x8_t i16_lo  = vmovl_s8(vget_low_s8(inter.val[0]));
+            int16x8_t i16_hi  = vmovl_s8(vget_high_s8(inter.val[0]));
+            int16x8_t i16_lo2 = vmovl_s8(vget_low_s8(inter.val[1]));
+            int16x8_t i16_hi2 = vmovl_s8(vget_high_s8(inter.val[1]));
+
+            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16_lo)));
+            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16_lo)));
+            float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16_hi)));
+            float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16_hi)));
+            float32x4_t f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16_lo2)));
+            float32x4_t f5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16_lo2)));
+            float32x4_t f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16_hi2)));
+            float32x4_t f7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16_hi2)));
+
+            /* Apply per-block scale */
+            f0 = vmulq_f32(f0, scale_v);
+            f1 = vmulq_f32(f1, scale_v);
+            f2 = vmulq_f32(f2, scale_v);
+            f3 = vmulq_f32(f3, scale_v);
+            f4 = vmulq_f32(f4, scale_v);
+            f5 = vmulq_f32(f5, scale_v);
+            f6 = vmulq_f32(f6, scale_v);
+            f7 = vmulq_f32(f7, scale_v);
+
+            /* FMA against the query */
+            acc0 = vfmaq_f32(acc0, vld1q_f32(&q_rot[d +  0]), f0);
+            acc1 = vfmaq_f32(acc1, vld1q_f32(&q_rot[d +  4]), f1);
+            acc2 = vfmaq_f32(acc2, vld1q_f32(&q_rot[d +  8]), f2);
+            acc3 = vfmaq_f32(acc3, vld1q_f32(&q_rot[d + 12]), f3);
+            acc0 = vfmaq_f32(acc0, vld1q_f32(&q_rot[d + 16]), f4);
+            acc1 = vfmaq_f32(acc1, vld1q_f32(&q_rot[d + 20]), f5);
+            acc2 = vfmaq_f32(acc2, vld1q_f32(&q_rot[d + 24]), f6);
+            acc3 = vfmaq_f32(acc3, vld1q_f32(&q_rot[d + 28]), f7);
+        }
+        mse_dot = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+
+        /* Tail: scalar fallback for any remaining elements */
+        for (; d < dim; d++) {
+            uint8_t bv = mi[d / 2];
+            int idx = (d & 1) ? (bv >> 4) : (bv & 0x0F);
+            mse_dot += q_rot[d] * (s_cb_i8[idx] * per_block_scale);
+        }
+#else
+        /* Scalar fallback */
+        float lut[16];
+        for (int j = 0; j < 16; j++) lut[j] = cb[j] / inv_std;
         float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
         int d = 0;
         for (; d + 7 < dim; d += 8) {
@@ -503,12 +600,13 @@ void tq_turbo_kv_4b_attention_ref(const float* query, const void* kv_cache,
             a2 += q_rot[d + 6] * lut[b3 & 0x0F];
             a3 += q_rot[d + 7] * lut[b3 >> 4];
         }
-        float mse_dot = (a0 + a1) + (a2 + a3);
+        mse_dot = (a0 + a1) + (a2 + a3);
         for (; d < dim; d++) {
             uint8_t bv = mi[d / 2];
             int idx = (d & 1) ? (bv >> 4) : (bv & 0x0F);
             mse_dot += q_rot[d] * lut[idx];
         }
+#endif
 
         scores[seq] = norm * mse_dot;
     }
