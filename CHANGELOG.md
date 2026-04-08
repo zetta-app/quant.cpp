@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.6.5] — 2026-04-08
+
+### 🚨 Re-baseline: all benchmarks now CPU-only (Metal is slower)
+
+P3 (Metal compute graph for KV attention) investigation revealed that the existing Metal backend (`TQ_BUILD_METAL=ON`) is **net negative** on every model size we tested — 13–40% slower than CPU-only. The CMake default has always been `OFF`, so end users were getting the fast path. But our internal benchmarks (including all numbers in v0.6.0–v0.6.4 release notes) used `-DTQ_BUILD_METAL=ON` and were therefore 14–22% slower than what users actually get.
+
+### Re-baselined numbers (Llama 3.2 3B Instruct, FP32 baseline = 13.56 PPL)
+
+| Type | Bytes/block | tok/s (Metal OFF) | vs FP32 | PPL Δ |
+|---|---:|---:|---:|---:|
+| **FP32 KV** | — | **18.13** | baseline | — |
+| **`turbo_kv_4b`** ⭐ | 72 | 16.60 | **−8.4%** | +5.7% |
+| `turbo_kv_3b` | 56 | 15.77 | −13.0% | +13.3% |
+| **`turbo_kv_5b`** 🏆 | 88 | 15.43 | −14.9% | +0.7% |
+| `turbo_kv_4bo` | 96 | 15.20 | −16.2% | +2.5% |
+| `uniform_4b` | 68 | 13.27 | −26.8% | +7.7% |
+
+The relative gaps to FP32 are essentially unchanged (turbo_kv_4b is still ~8% slower) — both paths got the same ~20% speedup from removing Metal overhead. Pareto rankings unchanged.
+
+### Cross-model Metal investigation
+
+| Model | Metal OFF speedup vs Metal ON |
+|---|---|
+| SmolLM2 135M | neutral (within noise) |
+| Llama 3.2 1B | +13–17% |
+| Llama 3.2 3B | +14–22% |
+| Gemma 4 26B | **+40%** |
+
+Even on the largest model (Gemma 4 26B), Metal is net negative. Per-matmul dispatch overhead + waitUntilCompleted sync exceed the GPU compute benefit at batch-1 inference. Filed [issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) with investigation plan.
+
+### What changed in v0.6.5
+
+| File | Change |
+|------|--------|
+| `README.md`, `README.ko.md` | Re-baselined headline tables and ASCII charts. New build note linking to issue #16. |
+| `CHANGELOG.md` | This entry. |
+| Issue #16 | Filed: Metal backend is currently slower than CPU-only |
+
+No source code changes — the CMake default was already `OFF`. The bug was in our internal benchmark methodology (we built with Metal ON without realizing it was slowing things down).
+
+### Honest corrections so far in the v0.6.x series
+
+This is now the **third** honest correction we've caught and fixed before it spread:
+
+1. **v0.6.0**: "lossless 7× compression" → measured "+6.3% PPL on Llama 3.2 3B"
+2. **v0.6.4**: "turbo_kv beats fp32 KV speed" → measured "−7% vs fp32 (NEON)"
+3. **v0.6.5**: "benchmarks with Metal" → re-measured "benchmarks without Metal (which is the user default)"
+
+Each correction was caught by the validation discipline documented in our `feedback_validation_first` memory. **Validation > marketing.**
+
 ## [0.6.4] — 2026-04-08
 
 ### Honest validation pass
