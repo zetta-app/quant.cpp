@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.8.0] — 2026-04-09
+
+### Cross-platform SIMD: AVX2 port of turbo_kv attention
+
+Round 10/11's NEON `vqtbl1q_s8` / `vqtbl2q_s8` table-lookup pattern is now mirrored on x86 AVX2 for all four turbo_kv attention variants. The breakthrough that achieved fp32 parity on Apple Silicon now extends to Linux/Windows x86-64 builds.
+
+| Variant | NEON instruction | AVX2 instruction(s) | Layout |
+|---|---|---|---|
+| 4b | `vqtbl1q_s8` | `_mm_shuffle_epi8` | 16-entry codebook fits in 1 register |
+| 5b | `vqtbl2q_s8` | 2× `_mm_shuffle_epi8` + `_mm_blendv_epi8` | 32-entry codebook split low/high |
+| 5b_fast | `vqtbl2q_s8` | same as 5b, no bit-unpack | direct 1-byte index loads |
+| 3b | `vqtbl1q_s8` (lower 8) | `_mm_shuffle_epi8` | 8-entry fits trivially |
+
+The 32-entry codebook (5b/5b_fast) needs the BLENDV bit-trick on AVX2 since `PSHUFB` is per-lane 16-entry only. Performance is unmeasured on x86 in this release (CI builds & runs the new tests; benchmarking deferred to v0.8.x).
+
+Tests added:
+- `TurboKVRegression.KV_5B_FAST_AttentionCosine` — was missing coverage; now exercises 5b_fast on synthetic Gaussian keys (cosine > 0.999).
+
+### Investigation: Issue #16 Metal dispatch overhead
+
+Added `tq_metal_diag_get/reset()` flush counter so the PPL tool prints `flushes/token` and `ops/flush` at end of run. Reproducing the issue's exact command on Llama 3.2 3B Q8_0 turbo_kv_4b shows **0 flushes/token** — Metal batch path is never entered for Q8_0 weights because the gate `layer_has_gguf` requires `gguf_w*` (Q4_K on-the-fly path). Metal=ON and Metal=OFF are now identical in throughput on this model.
+
+The remaining suspected slowdown sources (Q4_K + `tq_metal_forward_layer` Q4 path) are documented as next steps in the issue. The diag counter unblocks anyone with the right model from getting empirical numbers in one command.
+
+### llama.cpp PR validation: KL divergence tool
+
+`tools/quant.c` gains `--save-logits` and `--kl-baseline` for two-pass KL measurement against an fp32 baseline:
+
+```bash
+quant model.gguf --ppl text.txt -k fp32        --save-logits base.bin
+quant model.gguf --ppl text.txt -k turbo_kv_4b --kl-baseline base.bin
+# → "KL divergence (baseline || quantized): mean = 0.157466 over 1040 tokens"
+```
+
+This is the standard llama-perplexity-style validation needed by the upcoming llama.cpp PR (`docs/pr/2026-04-09-llama-cpp-pr-draft.md`).
+
+### Explored and reverted
+
+- **vdotq query quantization** (v0.9.0 candidate): replacing the int8→fp32→fma chain with `vdotq_s32(int8_codebook, int8_query)` gave +6% speed but **+1.5% PPL regression** on turbo_kv_4b. The cosine test (>0.99) was not sensitive enough to catch it; PPL gating caught it. Reverted; documented in memory `feedback_vdotq_query_quant_tradeoff`.
+
+### Deferred
+
+- **WASM SIMD port**: requires un-stubbing turbo_kv attention in `quant.h` (single-header) first. Tracked for v0.8.1.
+
 ## [0.7.1] — 2026-04-08
 
 ### Round 11 — NEON tbl pattern applied to 3b/5b (partial parity)

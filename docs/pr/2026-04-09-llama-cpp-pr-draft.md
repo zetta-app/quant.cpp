@@ -87,7 +87,7 @@ Per https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md the follow
 |---|---|---|
 | Convert a small model to GGUF using the new type | N/A (KV-only) | This is a runtime KV cache type, not a weight quantization type. Models are not re-converted. |
 | Perplexity comparison vs FP16/BF16 and similar types | ✅ | See result table above. PPL +3.8% vs FP32 KV on Llama 3.2 3B (Q8_0 weights). Need llama.cpp-side reproduction. |
-| KL divergence data | ⚠️ TODO | quant.cpp does not currently compute KL div. Will add to the reference engine and report before merge. |
+| KL divergence data | ✅ DONE (commit fd4148b) | quant.cpp now has `--save-logits`/`--kl-baseline`. Smoke-test on SmolLM2 135M: fp32 PPL 18.66 → turbo_kv_4b PPL 19.73 (+5.7%), mean KL 0.1575 over 1040 tokens. Reproduce on Llama 3.2 3B before submission. |
 | Pure CPU performance benchmarking vs similar types | ✅ | tok/s on Llama 3.2 3B PPL eval, 3-run average, no Metal. See result table above. |
 | Code style: 4-space indent, snake_case, no modern STL | ✅ | The reference C code follows these. ggml port will too. |
 
