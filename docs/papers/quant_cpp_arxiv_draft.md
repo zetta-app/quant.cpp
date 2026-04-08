@@ -122,18 +122,19 @@ This validation step is now part of our standard process: **after any claimed pe
 - **Quality metric**: Forward-pass perplexity via `--ppl` flag (teacher-forced)
 - **Speed metric**: Tokens per second on the same PPL eval (representative of attention-heavy workloads)
 
-### 4.2 Llama 3.2 3B Instruct results
+### 4.2 Llama 3.2 3B Instruct results (CPU-only, CMake default)
 
 | KV Config | Bytes/block | Compression | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
 |:----------|------------:|------------:|----:|----------:|------:|--------------:|
-| FP32 reference (NEON) | — | 1× | 13.56 | — | 14.83 | baseline |
-| `turbo_kv_5b` (quality) | 88 | 5.8× | **13.65** | **+0.7%** | 13.13 | −11.5% |
-| `turbo_kv_4bo` (research) | 96 | 5.3× | 13.90 | +2.5% | 12.7 | −14% |
-| `turbo_kv_4b` (default) | 72 | 7.1× | 14.33 | +5.7% | 13.67 | **−7.8%** |
-| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 13.4 | −9.6% |
-| `turbo_kv_3bo` (research) | 80 | 6.4× | 14.17 | +4.5% | 9.3 | −37% |
-| `uniform_4b` (legacy) | 68 | 7.5× | 14.60 | +7.7% | 11.7 | −21% |
+| FP32 reference | — | 1× | 13.56 | — | **18.13** | baseline |
+| `turbo_kv_5b` (quality) | 88 | 5.8× | **13.65** | **+0.7%** | 15.43 | −14.9% |
+| `turbo_kv_4bo` (research) | 96 | 5.3× | 13.90 | +2.5% | 15.20 | −16.2% |
+| `turbo_kv_4b` (default) | 72 | 7.1× | 14.33 | +5.7% | **16.60** | **−8.4%** |
+| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 15.77 | −13.0% |
+| `uniform_4b` (legacy) | 68 | 7.5× | 14.60 | +7.7% | 13.27 | −26.8% |
 | llama.cpp `q4_0` KV (lit. survey) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
+
+These numbers are with CMake default `TQ_BUILD_METAL=OFF`. The Metal backend is currently a net negative on Apple Silicon at batch-1 inference (per-matmul dispatch overhead exceeds GPU compute benefit) and is disabled by default. See Section 5.5 for the investigation.
 
 The Pareto-optimal recommendations are:
 
@@ -200,7 +201,26 @@ Against the published TurboQuant (which we cannot directly run for comparison), 
 
 A central design constraint of quant.cpp is single-header portability. The 192 KB WebAssembly binary, the iOS / Android / MSVC support, and the absence of any framework dependency are deliberate choices that exclude many research-grade techniques (e.g., learned codebooks, per-token routing) that would require runtime infrastructure beyond `libc + libm + pthreads`. Variant F was selected partly because it fits into 64 bytes of inline state per 128-element block with no auxiliary tables.
 
-### 5.4 What we learned about Karpathy-loop discipline
+### 5.4 Metal backend investigation: dispatch overhead at batch-1
+
+We initially planned to add Metal compute kernels for the Variant F attention path, hoping to push beyond the CPU NEON ceiling. While benchmarking the existing Metal matmul backend (which has been in the codebase since v0.5) with `TQ_BUILD_METAL=ON`, we discovered that **enabling Metal makes inference 13–40% slower** on every model size we tested, including the largest model we have access to (Gemma 4 26B-A4B).
+
+| Model | Metal-OFF speedup vs Metal-ON |
+|---|---|
+| SmolLM2 135M | neutral (within noise) |
+| Llama 3.2 1B | +13–17% |
+| Llama 3.2 3B | +14–22% |
+| Gemma 4 26B-A4B | **+40%** |
+
+The current Metal path uses per-matmul dispatch with `commit + waitUntilCompleted` at flush points. The per-op dispatch overhead exceeds the GPU compute benefit at batch-1 inference. This is the same issue that killed earlier attempts at a full GPU compute graph.
+
+The CMake default has always been `TQ_BUILD_METAL=OFF`, so end users were always getting the fast CPU path. But our internal benchmarks for v0.6.0–v0.6.4 used `-DTQ_BUILD_METAL=ON` and were therefore 14–22% slower than what users actually got. v0.6.5 republished the corrected numbers (this section reflects the corrected baseline).
+
+The lesson: **always benchmark with the exact build flags a user gets from `cmake -B build`, not the flags in your dev environment**. A parallel `build_default/` directory built without overrides is the canonical comparison.
+
+We did not pursue adding Metal kernels for turbo_kv attention because the existing Metal path needs to be fixed (or removed) first; adding more Metal kernels would compound the problem. Issue #16 in the project tracker documents the investigation plan: profile the dispatch overhead source, find a model-size threshold above which Metal wins, or remove the Metal path entirely.
+
+### 5.5 What we learned about Karpathy-loop discipline
 
 Two lessons stand out:
 
