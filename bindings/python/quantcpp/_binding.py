@@ -101,11 +101,13 @@ ON_TOKEN_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 class QuantConfig(ctypes.Structure):
     """Mirror of quant_config from quant.h."""
     _fields_ = [
-        ("temperature", ctypes.c_float),   # default: 0.7
-        ("top_p", ctypes.c_float),         # default: 0.9
-        ("max_tokens", ctypes.c_int),      # default: 256
-        ("n_threads", ctypes.c_int),       # default: 4
-        ("kv_compress", ctypes.c_int),     # 0=off, 1=4-bit, 2=delta+3-bit
+        ("temperature", ctypes.c_float),     # default: 0.7
+        ("top_p", ctypes.c_float),           # default: 0.9
+        ("max_tokens", ctypes.c_int),        # default: 256
+        ("n_threads", ctypes.c_int),         # default: 4
+        ("kv_compress", ctypes.c_int),       # 0=off, 1=4-bit, 2=delta+3-bit
+        ("context_length", ctypes.c_int),    # 0=auto(4096), or user override
+        ("k_highres_window", ctypes.c_int),  # 0=off, 128=sweet spot for progressive
     ]
 
 
@@ -133,6 +135,23 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     # char* quant_ask(quant_ctx* ctx, const char* prompt)
     lib.quant_ask.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.quant_ask.restype = ctypes.c_void_p  # We use c_void_p so we can free()
+
+    # void quant_free_string(char*) — added in v0.8.2 to free quant_ask
+    # results without cross-heap libc.free() crashes on macOS arm64.
+    # Optional: older single-headers may not export this symbol.
+    if hasattr(lib, "quant_free_string"):
+        lib.quant_free_string.argtypes = [ctypes.c_void_p]
+        lib.quant_free_string.restype = None
+
+    # int quant_save_context(quant_ctx* ctx, const char* path)
+    if hasattr(lib, "quant_save_context"):
+        lib.quant_save_context.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.quant_save_context.restype = ctypes.c_int
+
+    # int quant_load_context(quant_ctx* ctx, const char* path)
+    if hasattr(lib, "quant_load_context"):
+        lib.quant_load_context.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.quant_load_context.restype = ctypes.c_int
 
     # void quant_free_ctx(quant_ctx* ctx)
     lib.quant_free_ctx.argtypes = [ctypes.c_void_p]
@@ -181,6 +200,8 @@ def new_context(
     max_tokens: int = 256,
     n_threads: int = 4,
     kv_compress: int = 1,
+    context_length: int = 0,
+    k_highres_window: int = 0,
 ) -> ctypes.c_void_p:
     """Create an inference context with the given config."""
     lib = _get_lib()
@@ -190,6 +211,8 @@ def new_context(
         max_tokens=max_tokens,
         n_threads=n_threads,
         kv_compress=kv_compress,
+        context_length=context_length,
+        k_highres_window=k_highres_window,
     )
     ctx = lib.quant_new(model, ctypes.byref(cfg))
     if not ctx:

@@ -1,6 +1,6 @@
 # Variant F derivation — from TurboQuant literal port to HIGGS-style simplification
 
-> **Important attribution update (2026-04-08)**: Following [Tim Dettmers' comment in llama.cpp #20969](https://github.com/ggml-org/llama.cpp/discussions/20969), we now credit **HIGGS** (Malinovskii et al., Nov 2024, [arXiv:2411.17525](https://arxiv.org/abs/2411.17525)) for the Random Hadamard Transform + scalar grid quantization pattern. The shipped Variant F is structurally closest to HIGGS (RHT + MSE-optimal grids on rotated values), applied to KV cache like TurboQuant, with both the QJL residual stage and the per-channel outlier split removed through ablation. We do **not** claim our shipped variant is the published TurboQuant algorithm — it is an empirically-derived simplification arrived at through 9 Karpathy-loop rounds.
+> **Important attribution update (2026-04-08)**: After observing [Tim Dettmers' general comment in llama.cpp discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969) — directed at the thread's participants in general (6+ forks were all loosely calling their work "TurboQuant"), not at us specifically — we recognized the substance applied to our naming as well and updated our docs to credit **HIGGS** (Malinovskii et al., Nov 2024, [arXiv:2411.17525](https://arxiv.org/abs/2411.17525)) for the Random Hadamard Transform + scalar grid quantization pattern. The shipped Variant F is structurally closest to HIGGS (RHT + MSE-optimal grids on rotated values), applied to KV cache like TurboQuant, with both the QJL residual stage and the per-channel outlier split removed through ablation. We do **not** claim our shipped variant is the published TurboQuant algorithm — it is an empirically-derived simplification arrived at through 9 Karpathy-loop rounds.
 
 
 
@@ -48,6 +48,34 @@ Total improvement vs literal port: **−1.75 PPL on 4b, −10.45 PPL on 3b**.
 | `uniform_4b` + FP16 V | 4 | **14.41** | **+6.3%** | simple per-block min-max ✅ recommended |
 | `turbo_kv_4b` + FP16 V | 4 | 16.03 | +18.2% | RHT + 3-bit codebook + 1-bit QJL |
 | `turbo_kv_3b` + FP16 V | 3 | 25.84 | +90.6% | RHT + 2-bit codebook + 1-bit QJL ❌ |
+
+### Llama 3.2 1B Instruct (added 2026-04-08)
+
+| KV type | Bits/elem | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
+|---|---:|---:|---:|---:|---:|
+| **fp32** | 32 | 16.88 | baseline | 35.2 | baseline |
+| **`turbo_kv_5b`** 🏆 | 5 | 17.00 | **+0.7%** | 28.3 | −19.6% |
+| **`turbo_kv_4b`** ⭐ | 4 | 18.11 | +7.3% | 30.4 | −13.6% |
+| `uniform_4b` | 4 | 19.21 | +13.8% | 28.0 | −20.5% |
+| `turbo_kv_3b` | 3 | 27.18 | **+61%** ❌ | 28.3 | −19.6% |
+
+**Cross-size pattern (3 models tested):**
+
+| Model | turbo_kv_4b PPL Δ | turbo_kv_5b PPL Δ | turbo_kv_3b PPL Δ |
+|---|---:|---:|---:|
+| SmolLM2 135M | +5.8% | +1.7% | n/a |
+| Llama 3.2 1B | **+7.3%** | **+0.7%** | **+61%** ❌ |
+| Llama 3.2 3B | +5.7% | +0.7% | +13.3% |
+
+Findings:
+- **`turbo_kv_5b` is consistently near-lossless** across model sizes (~1% PPL Δ)
+- **`turbo_kv_4b` PPL gap is 5–8% across sizes**, slightly worse on smaller models
+- **`turbo_kv_3b` is unsuitable below 3B parameters** — 3-bit codebook is too coarse for the smaller models' more concentrated KV distributions
+- Speed gap to fp32 widens on smaller models (−7% on 3B → −14% on 1B → −20% on 135M) because the per-token attention overhead is a larger fraction of total work when matmul is small
+
+### Llama 3.1 8B Instruct (paper baseline) — TODO
+
+The Google TurboQuant paper benchmarks on Llama 3.1 8B with LongBench-E. We attempted to run our PPL eval on this model but Q8_0 (8 GB) hit swap on the 16 GB test machine and Q4_K_M (4.6 GB) was prohibitively slow (>50 min for one fp32 measurement). Llama 3.1 8B reproduction is deferred to a session with more RAM or a server-class machine.
 
 ### SmolLM2 135M Instruct
 

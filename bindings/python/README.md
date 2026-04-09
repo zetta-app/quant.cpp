@@ -5,16 +5,17 @@ Python bindings for [quant.cpp](https://github.com/quantumaikr/quant.cpp) -- a m
 ## Installation
 
 ```bash
-cd quant.cpp/bindings/python
-pip install .
+pip install quantcpp
 ```
 
-This compiles `quant.h` into a shared library automatically using your system C compiler (`cc`, `gcc`, or `clang`). No external dependencies required.
+Pre-built wheels are published for Linux (x86_64, aarch64), macOS (Intel + Apple Silicon), and Windows (x64). On other platforms pip falls back to the source distribution and compiles `quant.h` automatically using your system C compiler — no external dependencies.
 
-For development (editable install):
+### From source (dev tree)
 
 ```bash
-pip install -e .
+cd quant.cpp/bindings/python
+pip install .          # build + install
+pip install -e .       # editable / development install
 ```
 
 To point at a pre-built library instead:

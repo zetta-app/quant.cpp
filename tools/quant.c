@@ -84,6 +84,7 @@ static tq_type parse_kv_type(const char* s) {
     if (strcmp(s, "turbo_kv_5b") == 0) return TQ_TYPE_TURBO_KV_5B;
     if (strcmp(s, "turbo_kv_4bo") == 0) return TQ_TYPE_TURBO_KV_4BO;
     if (strcmp(s, "turbo_kv_3bo") == 0) return TQ_TYPE_TURBO_KV_3BO;
+    if (strcmp(s, "turbo_kv_5b_fast") == 0) return TQ_TYPE_TURBO_KV_5B_FAST;
     if (strcmp(s, "turbo_kv_1b") == 0) return TQ_TYPE_TURBO_KV_1B;
     if (strcmp(s, "qjl_1b") == 0)     return TQ_TYPE_QJL_1B;
     if (strcmp(s, "mixed_4b8") == 0)  return TQ_TYPE_MIXED_4B8;
@@ -133,6 +134,30 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --k-window <N>   Age-based K: recent N tokens FP32, rest quantized\n");
     fprintf(stderr, "  --version        Print version and exit\n");
     fprintf(stderr, "  --json           JSON output for --ppl (machine-parseable)\n");
+    fprintf(stderr, "  --save-logits <f> Save per-token softmax (fp16) to file during --ppl\n");
+    fprintf(stderr, "  --kl-baseline <f> Read baseline softmax from file and report KL divergence\n");
+}
+
+/* ---------- fp16 helpers (local) for KL save/load ---------- */
+static uint16_t qtool_fp32_to_fp16(float v) {
+    union { float f; uint32_t u; } b; b.f = v;
+    uint32_t sign = (b.u >> 16) & 0x8000;
+    int32_t  exp  = ((b.u >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (b.u >> 13) & 0x03FF;
+    if (exp <= 0)  return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+static float qtool_fp16_to_fp32(uint16_t h) {
+    union { float f; uint32_t u; } b;
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x03FF;
+    if (exp == 0)  { b.u = sign; return b.f; }
+    if (exp == 31) { b.u = sign | 0x7F800000 | (mant << 13); return b.f; }
+    exp = exp - 15 + 127;
+    b.u = sign | (exp << 23) | (mant << 13);
+    return b.f;
 }
 
 int main(int argc, char** argv) {
@@ -168,6 +193,8 @@ int main(int argc, char** argv) {
     int k_highres_window = 0; /* age-based: recent N keys at FP32, rest at 2-bit */
     int json_output = 0;     /* 1 = JSON output for --ppl */
     int chat_mode = 0;       /* 1 = auto-wrap prompt with chat template */
+    const char* save_logits_file = NULL;
+    const char* kl_baseline_file = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -255,6 +282,10 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--version") == 0) {
             print_version();
             return 0;
+        } else if (strcmp(argv[i], "--save-logits") == 0 && i + 1 < argc) {
+            save_logits_file = argv[++i];
+        } else if (strcmp(argv[i], "--kl-baseline") == 0 && i + 1 < argc) {
+            kl_baseline_file = argv[++i];
         } else if (strcmp(argv[i], "--json") == 0) {
             json_output = 1;
         } else if (strcmp(argv[i], "--chat") == 0 || strcmp(argv[i], "-c") == 0) {
@@ -321,6 +352,18 @@ int main(int argc, char** argv) {
         extern int tq_init_vulkan_backend(void);
         if (tq_init_vulkan_backend() == 0) {
             fprintf(stderr, "Vulkan backend: ready (KV cache quantization on GPU)\n");
+        }
+    }
+#endif
+#ifdef TQ_BUILD_CUDA
+    {
+        extern int  tq_init_cuda_backend(void);
+        extern void tq_cuda_override_traits(void);
+        if (tq_init_cuda_backend() == 0) {
+            tq_cuda_override_traits();
+            fprintf(stderr, "CUDA backend: ready (KV cache quantization on GPU)\n");
+        } else {
+            fprintf(stderr, "CUDA backend: init failed, falling back to CPU\n");
         }
     }
 #endif
@@ -431,6 +474,34 @@ int main(int argc, char** argv) {
             fprintf(stderr, "K highres window: %d tokens at FP32 (age-based progressive)\n", k_highres_window);
         }
 
+        /* KL/save-logits setup. Format: int32 n_tokens, int32 vocab, then
+         * n_tokens × vocab × fp16 softmax probabilities. */
+        FILE* save_fp = NULL;
+        FILE* kl_fp   = NULL;
+        double total_kl = 0.0;
+        long n_kl = 0;
+        uint16_t* kl_buf = NULL;
+        if (save_logits_file) {
+            save_fp = fopen(save_logits_file, "wb");
+            if (!save_fp) { fprintf(stderr, "Error: cannot open --save-logits %s\n", save_logits_file); return 1; }
+            int32_t hdr[2] = { n_tokens - 1, c->vocab_size };
+            fwrite(hdr, sizeof(int32_t), 2, save_fp);
+        }
+        if (kl_baseline_file) {
+            kl_fp = fopen(kl_baseline_file, "rb");
+            if (!kl_fp) { fprintf(stderr, "Error: cannot open --kl-baseline %s\n", kl_baseline_file); return 1; }
+            int32_t hdr[2] = {0,0};
+            if (fread(hdr, sizeof(int32_t), 2, kl_fp) != 2 || hdr[1] != c->vocab_size) {
+                fprintf(stderr, "Error: KL baseline header mismatch (expected vocab=%d)\n", c->vocab_size);
+                return 1;
+            }
+            fprintf(stderr, "KL baseline: %d tokens × vocab %d\n", hdr[0], hdr[1]);
+        }
+        if (save_fp || kl_fp) {
+            kl_buf = (uint16_t*)malloc((size_t)c->vocab_size * sizeof(uint16_t));
+            if (!kl_buf) { fprintf(stderr, "Error: oom\n"); return 1; }
+        }
+
         /* Teacher-forced forward: accumulate negative log-likelihood */
         double total_nll = 0.0;
         int n_eval = 0;
@@ -463,6 +534,49 @@ int main(int argc, char** argv) {
             total_nll -= log_prob;
             n_eval++;
 
+            /* Optional: compute full softmax for save / KL divergence. */
+            if (save_fp || kl_fp) {
+                /* p[j] = exp(logits[j] - max_logit) / exp(log_sum)
+                 *      = exp((logits[j] - max_logit) - log_sum)            */
+                double cur_kl = 0.0;
+                for (int j = 0; j < c->vocab_size; j++) {
+                    float p = (float)exp((double)(logits[j] - max_logit) - log_sum);
+                    if (save_fp) kl_buf[j] = qtool_fp32_to_fp16(p);
+                    if (kl_fp) {
+                        /* Fold into KL accumulation: read baseline below. */
+                        kl_buf[j] = qtool_fp32_to_fp16(p); /* reuse buf for current */
+                    }
+                    (void)cur_kl;
+                }
+                if (save_fp) {
+                    fwrite(kl_buf, sizeof(uint16_t), (size_t)c->vocab_size, save_fp);
+                }
+                if (kl_fp) {
+                    /* Read baseline row, compute KL(baseline || current). */
+                    static uint16_t* base_buf = NULL;
+                    static int base_buf_v = 0;
+                    if (base_buf_v != c->vocab_size) {
+                        free(base_buf);
+                        base_buf = (uint16_t*)malloc((size_t)c->vocab_size * sizeof(uint16_t));
+                        base_buf_v = c->vocab_size;
+                    }
+                    if (fread(base_buf, sizeof(uint16_t), (size_t)c->vocab_size, kl_fp)
+                            == (size_t)c->vocab_size) {
+                        double kl = 0.0;
+                        for (int j = 0; j < c->vocab_size; j++) {
+                            float pb = qtool_fp16_to_fp32(base_buf[j]);
+                            float pc = qtool_fp16_to_fp32(kl_buf[j]);
+                            if (pb > 1e-12f) {
+                                if (pc < 1e-20f) pc = 1e-20f;
+                                kl += (double)pb * (log((double)pb) - log((double)pc));
+                            }
+                        }
+                        total_kl += kl;
+                        n_kl++;
+                    }
+                }
+            }
+
             if ((i + 1) % 50 == 0) {
                 double ppl_so_far = exp(total_nll / (double)n_eval);
                 fprintf(stderr, "  [%d/%d] PPL so far: %.4f\n", i + 1, n_tokens - 1, ppl_so_far);
@@ -494,8 +608,32 @@ int main(int argc, char** argv) {
                 (double)n_eval / ppl_elapsed);
         fprintf(stderr, "==========================\n");
 
+        if (kl_fp && n_kl > 0) {
+            double mean_kl = total_kl / (double)n_kl;
+            fprintf(stderr, "KL divergence (baseline || quantized): mean = %.6f over %ld tokens\n",
+                    mean_kl, n_kl);
+        }
+        if (save_fp) { fclose(save_fp); fprintf(stderr, "Saved logits to %s\n", save_logits_file); }
+        if (kl_fp)   { fclose(kl_fp); }
+        free(kl_buf);
+
         /* Machine-parseable */
         fprintf(stderr, "PPL_CSV:%d,%.6f,%.4f\n", n_eval, avg_nll, perplexity);
+
+#ifdef TQ_HAS_METAL
+        {
+            extern void tq_metal_diag_get(unsigned long*, unsigned long*);
+            unsigned long n_flushes = 0, n_ops = 0;
+            tq_metal_diag_get(&n_flushes, &n_ops);
+            if (n_flushes > 0 && n_eval > 0) {
+                fprintf(stderr, "Metal diag: %lu flushes, %lu ops total, "
+                                "%.1f flushes/token, %.1f ops/flush\n",
+                        n_flushes, n_ops,
+                        (double)n_flushes / (double)n_eval,
+                        (double)n_ops / (double)n_flushes);
+            }
+        }
+#endif
 
         /* JSON output (--json flag) */
         if (json_output) {

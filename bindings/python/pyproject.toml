@@ -1,24 +1,30 @@
 [build-system]
-requires = ["setuptools>=64"]
+# setuptools 77+ enforces PEP 639 license validation which requires
+# packaging>=24.2 in the build env — cibuildwheel constrains packaging==24.1
+# so we cannot bump it. Pin setuptools <77 until we migrate fully to PEP 639.
+requires = ["setuptools>=64,<77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "quantcpp"
-version = "0.5.0"
-description = "Python bindings for quant.cpp -- minimal LLM inference with KV compression"
+version = "0.10.1"
+description = "Single-header LLM inference engine with KV cache compression (7× compression at fp32 parity)"
 readme = "README.md"
-license = "Apache-2.0"
-requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
 authors = [
-    { name = "quant.cpp contributors" },
+    { name = "quantumaikr", email = "noreply@quantumaikr.com" },
 ]
-keywords = ["llm", "inference", "quantization", "kv-cache", "compression", "gguf"]
+keywords = [
+    "llm", "inference", "quantization", "kv-cache",
+    "compression", "gguf", "embedded", "single-header",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Programming Language :: C",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -27,15 +33,47 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]
-Homepage = "https://github.com/quantumaikr/quant.cpp"
-Source = "https://github.com/quantumaikr/quant.cpp"
-Issues = "https://github.com/quantumaikr/quant.cpp/issues"
+Homepage      = "https://github.com/quantumaikr/quant.cpp"
+Documentation = "https://github.com/quantumaikr/quant.cpp#readme"
+Source        = "https://github.com/quantumaikr/quant.cpp"
+Issues        = "https://github.com/quantumaikr/quant.cpp/issues"
+Changelog     = "https://github.com/quantumaikr/quant.cpp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "build", "twine"]
 
 [tool.setuptools.packages.find]
 include = ["quantcpp*"]
+
+[tool.setuptools.package-data]
+quantcpp = ["_quant.h", "*.so", "*.dylib", "*.dll"]
+
+# ---------------------------------------------------------------------------
+# cibuildwheel — pre-built binary wheels for PyPI
+# ---------------------------------------------------------------------------
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip  = "*-musllinux_i686 *-manylinux_i686 pp*"
+
+# setup.py copies ./quant.h → quantcpp/_quant.h on import; the CI workflow
+# stages quant.h into the package-dir before invoking cibuildwheel.
+# (No before-build hook needed; setup.py runs as part of the wheel build.)
+
+# Smoke-test the built wheel before publishing
+test-command = "python -c \"import quantcpp; print('quantcpp', quantcpp.__version__)\""
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+manylinux-x86_64-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

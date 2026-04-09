@@ -1,5 +1,273 @@
 # Changelog
 
+## [0.8.2] — 2026-04-09 (quant_free_string + leak fix)
+
+### Eliminated the v0.8.1 leak in `Model.ask()`
+
+v0.8.1 worked but leaked ~65 KB per `ask()` call, because the Python wrapper couldn't safely call `libc.free()` on a pointer allocated inside `libquant.dylib`'s malloc heap (cross-zone abort on macOS arm64).
+
+v0.8.2 adds a tiny new export to the public C API:
+
+```c
+// quant.h
+void quant_free_string(char* str);
+```
+
+The implementation lives in the same translation unit as `quant_ask`, so its `free()` call uses the dylib's malloc zone — same heap, no abort. The Python wrapper now calls `lib.quant_free_string(ptr)` instead of skipping the free.
+
+Backwards compat: the binding uses `hasattr(lib, 'quant_free_string')` so older single-headers loaded via `QUANTCPP_LIB=...` continue to work (with the old leak behavior). New installs from PyPI 0.8.2 ship the updated `quant.h`.
+
+Verified: `Model("model.gguf").ask("hi")` × 3 in a row, clean exit, no abort, no leak warning under faulthandler.
+
+### Honest correction track is now 7 (still all self-found)
+
+This is the 7th correction logged in v0.6.x → v0.8.x. Found by running `Model.ask` repeatedly in the v0.8.1 verification cycle. Goal: stay 100% self-found before any external user reports a regression.
+
+### Still pending in v0.8.x
+
+- **`kv_compress=1` / `=2` re-enable in Python bindings** — still requires `quant.h` regeneration against the v0.8.0+ multi-file source (the bundled header is an Apr-6 snapshot whose UNIFORM_4B path aborts on Llama). Tracked in [Issue #18](https://github.com/quantumaikr/quant.cpp/issues/18). Will land when we regenerate the single header.
+
+---
+
+## [0.8.1] — 2026-04-09 (Python bindings hotfix)
+
+### `pip install quantcpp` is now actually usable
+
+Two critical bugs were found in the v0.8.0 Python bindings within hours of publishing — by running an end-user simulation (`pip install` in a clean venv → `Model("file.gguf").ask("question")`). Both bugs were live for v0.8.0; v0.8.1 fixes them.
+
+#### Bug 1: `Model("file.gguf").ask(...)` aborted on macOS arm64
+
+Root cause: the Python wrapper defaulted to `kv_compress=1`, which routed through the bundled `quant.h`'s UNIFORM_4B KV path. The single-header is an Apr-6 snapshot that pre-dates the v0.8.0 multi-file source by several days, and that older KV path aborts on Llama-architecture models.
+
+Fix: default `kv_compress=0` (no KV compression) in v0.8.1. Non-zero values warn and fall back. The CLI `quant` binary, which uses the multi-file engine, continues to work with all KV types.
+
+A real fix waits on a fresh `quant.h` regen against the v0.8.0+ tree (tracked as v0.8.2).
+
+#### Bug 2: `quant_ask` return string crashed `libc.free(ptr)`
+
+Root cause: `quant_ask` allocates the response string inside `libquant.dylib`'s malloc heap. The Python wrapper called `ctypes.CDLL(None).free(ptr)` to release it — but on macOS arm64, that handle resolves to a different malloc zone than the dylib's. Cross-zone free → abort.
+
+Fix: skip the explicit free in v0.8.1. We accept a ~65 KB leak per `ask()` call as a temporary tradeoff; `quant_free_ctx` / `quant_free_model` release the bulk of the memory at end of session. Tracked: add `quant_free_string(void*)` wrapper to `quant.h` in v0.8.2.
+
+### Honest correction track record
+
+This is corrections #5 and #6 in the project history (after the four in v0.6.x → v0.7.x). Both were caught by the project's own end-user-simulation testing, before any external user reported them. The pattern stands: **publish, simulate the user, fix in hours.**
+
+### v0.8.0 status
+
+PyPI 0.8.0 should be yanked (we strongly recommend upgrading to 0.8.1). Yanking only hides it from new `pip install` — anyone with a pinned `==0.8.0` install can still use it.
+
+---
+
+## [0.8.0] — 2026-04-09
+
+### Cross-platform SIMD: AVX2 port of turbo_kv attention
+
+Round 10/11's NEON `vqtbl1q_s8` / `vqtbl2q_s8` table-lookup pattern is now mirrored on x86 AVX2 for all four turbo_kv attention variants. The breakthrough that achieved fp32 parity on Apple Silicon now extends to Linux/Windows x86-64 builds.
+
+| Variant | NEON instruction | AVX2 instruction(s) | Layout |
+|---|---|---|---|
+| 4b | `vqtbl1q_s8` | `_mm_shuffle_epi8` | 16-entry codebook fits in 1 register |
+| 5b | `vqtbl2q_s8` | 2× `_mm_shuffle_epi8` + `_mm_blendv_epi8` | 32-entry codebook split low/high |
+| 5b_fast | `vqtbl2q_s8` | same as 5b, no bit-unpack | direct 1-byte index loads |
+| 3b | `vqtbl1q_s8` (lower 8) | `_mm_shuffle_epi8` | 8-entry fits trivially |
+
+The 32-entry codebook (5b/5b_fast) needs the BLENDV bit-trick on AVX2 since `PSHUFB` is per-lane 16-entry only. Performance is unmeasured on x86 in this release (CI builds & runs the new tests; benchmarking deferred to v0.8.x).
+
+Tests added:
+- `TurboKVRegression.KV_5B_FAST_AttentionCosine` — was missing coverage; now exercises 5b_fast on synthetic Gaussian keys (cosine > 0.999).
+
+### Investigation: Issue #16 Metal dispatch overhead
+
+Added `tq_metal_diag_get/reset()` flush counter so the PPL tool prints `flushes/token` and `ops/flush` at end of run. Reproducing the issue's exact command on Llama 3.2 3B Q8_0 turbo_kv_4b shows **0 flushes/token** — Metal batch path is never entered for Q8_0 weights because the gate `layer_has_gguf` requires `gguf_w*` (Q4_K on-the-fly path). Metal=ON and Metal=OFF are now identical in throughput on this model.
+
+The remaining suspected slowdown sources (Q4_K + `tq_metal_forward_layer` Q4 path) are documented as next steps in the issue. The diag counter unblocks anyone with the right model from getting empirical numbers in one command.
+
+### llama.cpp PR validation: KL divergence tool
+
+`tools/quant.c` gains `--save-logits` and `--kl-baseline` for two-pass KL measurement against an fp32 baseline:
+
+```bash
+quant model.gguf --ppl text.txt -k fp32        --save-logits base.bin
+quant model.gguf --ppl text.txt -k turbo_kv_4b --kl-baseline base.bin
+# → "KL divergence (baseline || quantized): mean = 0.157466 over 1040 tokens"
+```
+
+This is the standard llama-perplexity-style validation needed by the upcoming llama.cpp PR (`docs/pr/2026-04-09-llama-cpp-pr-draft.md`).
+
+### Explored and reverted
+
+- **vdotq query quantization** (v0.9.0 candidate): replacing the int8→fp32→fma chain with `vdotq_s32(int8_codebook, int8_query)` gave +6% speed but **+1.5% PPL regression** on turbo_kv_4b. The cosine test (>0.99) was not sensitive enough to catch it; PPL gating caught it. Reverted; documented in memory `feedback_vdotq_query_quant_tradeoff`.
+
+### Deferred
+
+- **WASM SIMD port**: requires un-stubbing turbo_kv attention in `quant.h` (single-header) first. Tracked for v0.8.1.
+
+## [0.7.1] — 2026-04-08
+
+### Round 11 — NEON tbl pattern applied to 3b/5b (partial parity)
+
+After Round 10 (turbo_kv_4b at fp32 parity via `vqtbl1q_s8`), Round 11 applied the same SIMD codebook lookup pattern to the remaining production variants. The lookup side scales beautifully (1 instruction per 16 lanes for any small codebook), but the **bit-unpack side** is the new bottleneck for non-byte-aligned packing.
+
+Llama 3.2 3B PPL eval, 3 runs each (CPU-only, no Metal):
+
+| Type | Round 10 → Round 11 | Δ | vs FP32 (R11) | PPL Δ |
+|---|---|---:|---:|---:|
+| FP32 | 17.87 → 18.43 t/s | +3% | baseline | — |
+| `turbo_kv_3b` | 16.10 → 16.57 t/s | +3% | **−10.1%** | +13.3% |
+| **`turbo_kv_4b`** ⭐ | 18.17 → 18.17 t/s | parity (R10 stable) | **−1.4%** ✅ | +3.8% |
+| `turbo_kv_5b` 🏆 | 15.43 → 16.80 t/s | **+9%** | **−8.8%** | +0.7% |
+
+### Why 4b reached parity but 3b/5b didn't
+
+| Type | Bit packing | Unpack | Result |
+|---|---|---|---|
+| 4b | byte-aligned (2 nibbles/byte) | pure SIMD `vandq_u8` + `vshrq_n_u8` | **parity** ✅ |
+| 3b | bit-aligned (irregular 3-bit fields) | uint64 read + scalar shifts | −10.1% |
+| 5b | bit-aligned (irregular 5-bit fields) | uint64 read + scalar shifts | −8.8% |
+
+For 3-bit and 5-bit, 16 indices straddle byte boundaries irregularly. We use the fastest scalar unpack we found (uint64 read + 16 scalar shifts + `vld1q_u8`) but it costs ~16 instructions per 16-element iteration. The lookup itself is 1 instruction. So the unpack now dominates for 3b/5b.
+
+### Insight: matmul was already using the same pattern
+
+While investigating other optimization axes, we discovered that the GGUF Q4 matmul code (`tq_gguf_quants.c:1561`) **already uses `vqtbl1q_s8`** for the codebook lookup. That's why fp32 and turbo_kv have identical matmul time (38.6 vs 38.9 ms in profile) — they both share the same NEON tbl matmul kernel.
+
+This is why Round 10 worked: we'd been using NEON tbl in matmul since v0.5, but had built the attention path with scalar gather. Once we applied the same primitive to attention, the gap closed. Round 11 extended it to 3b/5b but hit the bit-packing constraint.
+
+### What's NOT in v0.7.1
+
+- 5b/3b at full parity. The remaining gap is in the unpack, not the lookup. Closing it needs either (a) a layout change (1-byte-per-index, sacrificing compression), (b) a SIMD bit-extraction trick, or (c) acceptance. We chose (c) for v0.7.1 with honest disclosure.
+- `turbo_kv_4bo` / `turbo_kv_3bo` — research types, still on Round 9 path
+- AVX2 / WASM SIMD ports of the NEON tbl pattern — separate session
+
+### What changed in v0.7.1
+
+| File | Change |
+|------|--------|
+| `src/core/tq_turbo_kv.c::tq_turbo_kv_3b_attention_ref` | NEON tbl + uint64 unpack |
+| `src/core/tq_turbo_kv.c::tq_turbo_kv_5b_attention_ref` | NEON tbl + uint64 unpack |
+| `README.md`, `README.ko.md` | Round 11 numbers |
+| `CHANGELOG.md` | This entry |
+| Memory `feedback_simd_unpack_constraint.md` | Documents the byte-alignment constraint for future work |
+
+35/35 tests pass. PPL unchanged.
+
+## [0.7.0] — 2026-04-08
+
+### 🏆 Round 10 — `turbo_kv_4b` matches fp32 KV speed at 7.1× compression
+
+After 10 rounds of Karpathy iteration (3 sessions), `turbo_kv_4b` now runs at **fp32 KV parity** on Llama 3.2 3B PPL eval. This is the breakthrough we've been chasing for 3 sessions:
+
+| Type | Bytes/block | Compression | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
+|---|---:|---:|---:|---:|---:|---:|
+| FP32 KV | — | 1× | 13.56 | — | 17.9 | baseline |
+| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.08** | **+3.8%** | **18.7** | **+4.5%** ⬆ |
+
+### What it took: profile-driven Round 10
+
+Rounds 1–9 had been optimizing local fusions in the inner loop without measuring where time was actually going. Profile data at long context (PPL eval, seq_len ~950) finally revealed the diff:
+
+  - matmul: 38.6ms (fp32) vs 38.9ms (turbo_kv_4b) — same code path
+  - attention: **15.7ms (fp32) vs 19.8ms (turbo_kv_4b)** — +4.1ms
+  - The entire 8% gap was in attention, and the entire 4.1ms was in the inner dot-product loop
+
+**Root cause**: turbo_kv inner loop was scalar (LUT load + mul + add per element) while fp32 was 4-way NEON SIMD. About 2× more instructions per element. The dequant lookup had become compute-bound, not memory-bound.
+
+**Fix (Round 10)**: NEON 16-entry table lookup via `vqtbl1q_s8`.
+
+  - Quantize the 16 Lloyd-Max-Gaussian centroids to int8 once at startup
+  - Per-block: load 16 bytes of mse_indices = 32 nibbles
+  - Split low/high nibbles via `vandq_u8` + `vshrq_n_u8`
+  - `vqtbl1q_s8` for centroid gather (1 instruction, 16 lanes)
+  - Convert int8 → int16 → fp32, multiply by per-block scale, FMA against query
+  - 32 elements per iteration vs the previous 8 elements scalar
+
+The int8 codebook discretization loses ~1% precision (well below the regression test threshold of cosine ≥ 0.99). PPL **improved** from 14.33 to 14.08 — the discretization happens to align favorably (or it's regression-to-mean, both directions are within noise).
+
+### Cross-model verification
+
+| Model | turbo_kv_4b speed gap (R9 → R10) | PPL Δ vs FP32 |
+|---|---|---|
+| SmolLM2 135M | -14.5% → -3.1% | +5.7% |
+| Llama 3.2 1B | -16.3% → -1.3% | +5.4% |
+| **Llama 3.2 3B** | **-8.4% → +4.5%** ⬆ | **+3.8%** |
+
+All three models show massive speed improvement. Llama 3.2 3B (3-run average +0.8%, single run +4.5%) is now at parity or slightly faster than fp32 KV. Smaller models still have a small gap because relative attention overhead dominates.
+
+### Honest framing change
+
+| Before | After |
+|---|---|
+| "92% of fp32 speed at 7× compression" | **"PARITY with fp32 speed at 7× compression"** |
+
+`turbo_kv_4b` is now **strictly Pareto-dominant** over `uniform_4b`: better PPL, better speed, comparable compression. And it's the **first KV quantization in the project that gives 7× memory savings without speed loss vs fp32**.
+
+### What didn't change
+
+- Block layout (still 72 bytes per block)
+- Public API
+- Quality regression tests pass (cosine ≥ 0.99 for 4b)
+- 5b and 3b variants — still on the Round 9 scalar path (planned for v0.7.1)
+
+### What changed
+
+- `src/core/tq_turbo_kv.c::tq_turbo_kv_4b_attention_ref` — NEON tbl inner loop
+- `README.md` / `README.ko.md` — headline tables show parity
+- This CHANGELOG entry
+
+35/35 tests pass. CI green.
+
+## [0.6.5] — 2026-04-08
+
+### 🚨 Re-baseline: all benchmarks now CPU-only (Metal is slower)
+
+P3 (Metal compute graph for KV attention) investigation revealed that the existing Metal backend (`TQ_BUILD_METAL=ON`) is **net negative** on every model size we tested — 13–40% slower than CPU-only. The CMake default has always been `OFF`, so end users were getting the fast path. But our internal benchmarks (including all numbers in v0.6.0–v0.6.4 release notes) used `-DTQ_BUILD_METAL=ON` and were therefore 14–22% slower than what users actually get.
+
+### Re-baselined numbers (Llama 3.2 3B Instruct, FP32 baseline = 13.56 PPL)
+
+| Type | Bytes/block | tok/s (Metal OFF) | vs FP32 | PPL Δ |
+|---|---:|---:|---:|---:|
+| **FP32 KV** | — | **18.13** | baseline | — |
+| **`turbo_kv_4b`** ⭐ | 72 | 16.60 | **−8.4%** | +5.7% |
+| `turbo_kv_3b` | 56 | 15.77 | −13.0% | +13.3% |
+| **`turbo_kv_5b`** 🏆 | 88 | 15.43 | −14.9% | +0.7% |
+| `turbo_kv_4bo` | 96 | 15.20 | −16.2% | +2.5% |
+| `uniform_4b` | 68 | 13.27 | −26.8% | +7.7% |
+
+The relative gaps to FP32 are essentially unchanged (turbo_kv_4b is still ~8% slower) — both paths got the same ~20% speedup from removing Metal overhead. Pareto rankings unchanged.
+
+### Cross-model Metal investigation
+
+| Model | Metal OFF speedup vs Metal ON |
+|---|---|
+| SmolLM2 135M | neutral (within noise) |
+| Llama 3.2 1B | +13–17% |
+| Llama 3.2 3B | +14–22% |
+| Gemma 4 26B | **+40%** |
+
+Even on the largest model (Gemma 4 26B), Metal is net negative. Per-matmul dispatch overhead + waitUntilCompleted sync exceed the GPU compute benefit at batch-1 inference. Filed [issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) with investigation plan.
+
+### What changed in v0.6.5
+
+| File | Change |
+|------|--------|
+| `README.md`, `README.ko.md` | Re-baselined headline tables and ASCII charts. New build note linking to issue #16. |
+| `CHANGELOG.md` | This entry. |
+| Issue #16 | Filed: Metal backend is currently slower than CPU-only |
+
+No source code changes — the CMake default was already `OFF`. The bug was in our internal benchmark methodology (we built with Metal ON without realizing it was slowing things down).
+
+### Honest corrections so far in the v0.6.x series
+
+This is now the **fourth** honest correction we've caught and fixed before it spread:
+
+1. **v0.6.0**: "lossless 7× compression" → measured "+6.3% PPL on Llama 3.2 3B"
+2. **v0.6.4**: "turbo_kv beats fp32 KV speed" → measured "−7% vs fp32 (NEON)"
+3. **v0.6.5**: "benchmarks with Metal" → re-measured "benchmarks without Metal (which is the user default)"
+4. **v0.6.5 (post-release)**: "Tim Dettmers gave us direct feedback" → "Tim's general comment to a thread we participate in happened to apply to us; we incorporated it voluntarily, not as a direct response". Earlier docs and the v0.6.4 commit message overstated the relationship; the substance of HIGGS attribution is unchanged but the framing has been corrected in README, README.ko, the arXiv draft, and `bench/results/turboquant_reproduction.md`.
+
+Each correction was caught by the validation discipline documented in our `feedback_validation_first` memory. **Validation > marketing.**
+
 ## [0.6.4] — 2026-04-08
 
 ### Honest validation pass

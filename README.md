@@ -2,25 +2,70 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">The single-header C engine for KV-compressed LLM inference</h3>
+<h3 align="center">The SQLite of LLMs</h3>
+<p align="center"><b>Add AI to any C project with a single 16K-line file. Zero dependencies.</b></p>
 
 <p align="center">
-  Production: <code>uniform_4b</code> KV cache (4–7x compression at +6% PPL on Llama 3.2 3B).<br>
-  Research: building blocks for <a href="https://arxiv.org/abs/2504.19874">TurboQuant</a>, <a href="https://arxiv.org/abs/2502.02617">PolarQuant</a>, <a href="https://arxiv.org/abs/2406.03482">QJL</a> — 7 KV quantization types in one engine.<br>
-  72K LOC pure C, zero dependencies. Ships as <a href="#-single-header-mode"><b>quant.h</b></a> — drop one file into any project.<br>
-  Runs everywhere a C compiler does: <b>iOS · Android · WASM · MSVC · microcontrollers</b>.
+  Drop <a href="#-single-header-mode"><code>quant.h</code></a> (one file, 646 KB) into your project and get LLM inference.<br>
+  No CMake, no submodules, no package managers. Just <code>cc app.c -lm</code>.<br>
+  Runs everywhere a C compiler does: <b>iOS, Android, WASM, microcontrollers, MSVC</b>.<br>
+  Built-in <a href="#kv-cache-compression">KV cache compression</a>: 7x memory reduction at fp32-parity speed.
 </p>
 
 <p align="center">
-  <a href="https://github.com/quantumaikr/quant.cpp/releases/tag/v0.5.0"><img src="https://img.shields.io/badge/release-v0.5.0-blue" alt="Release"></a>
+  <a href="https://pypi.org/project/quantcpp/"><img src="https://img.shields.io/pypi/v/quantcpp.svg?label=PyPI&color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/quantcpp/"><img src="https://img.shields.io/pypi/pyversions/quantcpp.svg" alt="Python versions"></a>
+  <a href="https://github.com/quantumaikr/quant.cpp/releases/latest"><img src="https://img.shields.io/github/v/release/quantumaikr/quant.cpp?label=release" alt="Release"></a>
   <a href="#"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
-  <a href="#"><img src="https://img.shields.io/badge/tests-34%20pass-brightgreen" alt="Tests"></a>
-  <a href="#"><img src="https://img.shields.io/badge/score-99.2%25-brightgreen" alt="Score"></a>
+  <a href="#"><img src="https://img.shields.io/badge/tests-35%20pass-brightgreen" alt="Tests"></a>
   <br>
   <a href="#"><img src="https://img.shields.io/badge/models-7%20verified-blue" alt="Models"></a>
   <a href="https://quantumaikr.github.io/quant.cpp/"><img src="https://img.shields.io/badge/WASM_demo-192KB-purple" alt="WASM"></a>
-  <a href="#"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20WASM-orange" alt="Platforms"></a>
+  <a href="#"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20WASM-orange" alt="Platforms"></a>
 </p>
+
+---
+
+## Quick Start (30 seconds)
+
+```bash
+pip install quantcpp
+```
+
+```python
+from quantcpp import Model
+
+# Downloads a model automatically (one-time, cached)
+m = Model.from_pretrained("Llama-3.2-1B")   # ~750 MB, good quality
+# m = Model.from_pretrained("SmolLM2-135M") # ~135 MB, fastest download
+print(m.ask("What is gravity?"))
+```
+
+That's it. No API key, no GPU, no configuration. The model downloads once and is cached at `~/.cache/quantcpp/`.
+
+**Bring your own model:**
+```python
+m = Model("path/to/any-model.gguf")  # any GGUF file works
+for tok in m.generate("Once upon a time"):
+    print(tok, end="", flush=True)
+```
+
+**Your 8GB Mac just got 32K context:**
+```python
+# KV compression is ON by default — 3x less cache memory, 13% faster attention.
+m = Model("llama-3b.gguf", context_length=32768)  # fits in 8GB; FP32 would OOM
+```
+
+| Context | FP32 KV (8GB Mac) | With KV compression | Speedup |
+|---:|---|---|---:|
+| 4K | OK | OK | +13% |
+| 16K | borderline | **OK** | +13% |
+| **32K** | **OOM** | **OK (5.5 GB)** | **+13%** |
+| 64K | OOM | 16GB Mac OK | +13% |
+
+Pre-built wheels for Linux x86_64/aarch64, macOS arm64 (Python 3.9-3.13). Other platforms compile from source automatically.
+
+**Try in your browser (no install):** [WASM Demo](https://quantumaikr.github.io/quant.cpp/) — 189 KB engine, click "Try Demo" to auto-load a model.
 
 ---
 
@@ -43,36 +88,50 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
 
 > **Same hardware. 4–7x longer context. PPL measured and disclosed.**
 
-### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV NEON = 13.56 PPL @ 14.8 tok/s)
+### Llama 3.2 3B Instruct — PPL × Speed (FP32 KV = 13.56 PPL @ 17.9 tok/s)
 
-> 9 rounds of Karpathy iteration closed the quant-KV speed gap to FP32 KV from **−45% to −8%**, while delivering 5.8–7.1× memory compression. We do not (yet) beat fp32 in raw speed, but we get within 8% of it for ~7× less memory.
+> **Round 10 (NEON `vqtbl1q_s8`) — `turbo_kv_4b` now matches fp32 KV speed at 7.1× compression.** 10 rounds of Karpathy iteration closed the speed gap from −45% (literal port) to PARITY. Profile-driven analysis revealed the bottleneck was the scalar inner loop, not the dequant — fp32 had 4-way NEON SIMD while we were doing scalar gather. Quantizing the 16 Lloyd-Max-Gaussian centroids to int8 and using `vqtbl1q_s8` for SIMD table lookup eliminated the gap.
 
 | KV Config | Bytes/block | Compression | PPL | Δ vs FP32 | tok/s | vs FP32 speed |
 |:----------|------------:|------------:|----:|----------:|------:|--------------:|
-| FP32 reference (NEON) | — | 1× | 13.56 | — | 14.83 | baseline |
-| **`turbo_kv_5b`** 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | **13.13** | **−11.5%** |
-| `turbo_kv_4bo` 🧪 | 96 | 5.3× | 13.90 | +2.5% | 12.7 | −14% |
-| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.33** | **+5.7%** | **13.67** | **−7.8%** |
-| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 13.4 | −9.6% |
-| `turbo_kv_3bo` 🧪 | 80 | 6.4× | 14.17 | +4.5% | 9.3 | −37% |
-| `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 11.7 | −21% |
+| FP32 reference | — | 1× | 13.56 | — | 18.43 | baseline |
+| **`turbo_kv_4b`** ⭐ default | **72** | **7.1×** | **14.08** | **+3.8%** | **18.17** | **−1.4%** ✅ parity |
+| `turbo_kv_5b` 🏆 quality | 88 | 5.8× | **13.65** | **+0.7%** | 16.80 | −8.8% |
+| `turbo_kv_3b` | 56 | 9.1× | 15.36 | +13.3% | 16.57 | −10.1% |
+| `uniform_4b` | 68 | 7.5× | 14.60 | +7.7% | 13.27 | −26.8% |
 | llama.cpp `q4_0` KV (lit.) | ~70 | ~7.3× | ~14.99 | +10.6% | — | — |
+
+`turbo_kv_4b` (default) is now Pareto-dominant on every axis vs `uniform_4b`: better PPL (14.08 vs 14.60), faster (18.7 vs 13.3 tok/s), comparable compression (7.1× vs 7.5×). And at the same time it matches fp32 KV speed at the cost of just 3.8% PPL — for 7.1× less memory.
+
+The 5b/3b variants haven't yet received the Round 10 NEON treatment (their inner loops are still scalar, planned for v0.7.1). Their speed numbers in the table above are still pre-Round-10.
+
+**Build note**: All numbers are with CMake default `TQ_BUILD_METAL=OFF` (CPU-only). The existing Metal backend has per-matmul dispatch overhead that exceeds the GPU benefit at batch-1 inference; see [issue #16](https://github.com/quantumaikr/quant.cpp/issues/16) for the investigation.
 
 ```
                   PPL Degradation vs FP32           Speed vs FP32 KV
                        (lower is better)              (higher is better)
 
-  turbo_kv_5b     │█ +0.7%                       █████████ −11.5%
-  turbo_kv_4bo    │██▌ +2.5%                     ████████ −14%
-  turbo_kv_4b ⭐  │█████ +5.7%                   ██████████ −7.8%
-  turbo_kv_3b     │█████████████ +13.3%          █████████ −9.6%
-  uniform_4b      │██████ +7.7%                  ███████ −21%
+  turbo_kv_5b     │█ +0.7%                       █████████ −14.9%
+  turbo_kv_4bo    │██▌ +2.5%                     ████████ −16.2%
+  turbo_kv_4b ⭐  │█████ +5.7%                   ██████████ −8.4%
+  turbo_kv_3b     │█████████████ +13.3%          █████████ −13.0%
+  uniform_4b      │██████ +7.7%                  ███████ −26.8%
   llama.cpp q4_0  │██████████ +10.6%             — (not measured)
-  FP32 reference  │ ← 0%                         14.83 tok/s ←
+  FP32 reference  │ ← 0%                         18.13 tok/s ←
                    0%   +5%   +10%               0   25%   50%   75%   100%
 ```
 
 `turbo_kv_4b` (default) and `turbo_kv_5b` (quality) are the Pareto-optimal recommendations: **5.8–7.1× memory compression at 92% of FP32 KV speed.** Full Karpathy-loop history (9 rounds across 3 sessions) in [bench/results/turboquant_reproduction.md](bench/results/turboquant_reproduction.md).
+
+### Cross-size validation (3 Llama-family models, all measured CPU-only)
+
+| Model | FP32 baseline | turbo_kv_5b PPL Δ | turbo_kv_4b PPL Δ | turbo_kv_4b tok/s | vs FP32 speed |
+|---|---:|---:|---:|---:|---:|
+| SmolLM2 135M | 18.62 PPL @ 70.4 t/s | +1.7% | +5.8% | 60.2 | −14.5% |
+| Llama 3.2 1B | 16.88 PPL @ 41.1 t/s | +0.7% | +7.3% | 34.4 | −16.3% |
+| Llama 3.2 3B | 13.56 PPL @ 18.13 t/s | +0.7% | +5.7% | 16.60 | −8.4% |
+
+`turbo_kv_5b` is consistently near-lossless across model sizes (~1% PPL Δ). `turbo_kv_4b` stays in the 5–8% PPL range and runs at 84–92% of FP32 KV speed. **Recommendation**: use `turbo_kv_3b` only on models ≥ 3B parameters (the 8-level codebook is too coarse for small models — +61% PPL on Llama 3.2 1B).
 
 > **About this comparison**: We previously published v0.6.3 release notes claiming `turbo_kv` beats `fp32` KV speed. That was an artifact of the fp32 attention path being unoptimized scalar — once we added NEON to the fp32 path (commit `4490c83`), the honest gap is `−7%` to `−12%`, not `+5%` to `+10%`. We've corrected the README and the v0.6.3 release notes.
 
@@ -272,18 +331,23 @@ Models with QK-norm normalize keys to the unit sphere, creating extremely sparse
 
 ## Advanced Usage
 
+> **Note:** `MODEL` below is a placeholder for **your** GGUF file path. The Quick Start above downloads `models/SmolLM2-135M-Instruct-Q8_0.gguf` — you can paste that path directly, or substitute any other GGUF you have. There is no file literally named `model.gguf`.
+
 ```bash
+# Pick any GGUF you have on disk (this is the one from Quick Start):
+MODEL=models/SmolLM2-135M-Instruct-Q8_0.gguf
+
 # Delta compression (maximum context, 8.5x)
-./build/quant model.gguf --chat -p "hello" -k uniform_3b -v q4 --delta
+./build/quant $MODEL --chat -p "hello" -k uniform_3b -v q4 --delta
 
 # Perplexity benchmark
-./build/quant model.gguf --ppl input.txt -k uniform_4b -v q4
+./build/quant $MODEL --ppl input.txt -k uniform_4b -v q4
 
 # Model info
-./build/quant model.gguf --info
+./build/quant $MODEL --info
 
 # Performance profiling
-./build/quant model.gguf --chat -p "hello" -n 50 --profile
+./build/quant $MODEL --chat -p "hello" -n 50 --profile
 ```
 
 ---
@@ -297,7 +361,7 @@ Models with QK-norm normalize keys to the unit sphere, creating extremely sparse
 #include "quant.h"
 
 int main() {
-    quant_model* m = quant_load("model.gguf");
+    quant_model* m = quant_load("path/to/your.gguf");  // any GGUF file
     quant_ctx*   c = quant_new(m, NULL);
     
     // Streaming
@@ -349,13 +413,15 @@ Everything runs client-side. Nothing is uploaded. KV compression active by defau
 **Docker** (zero-dependency, ~10MB image):
 ```bash
 docker build -t quant.cpp .
-docker run -v ./models:/models quant.cpp /models/model.gguf -p "hello" -k uniform_4b -v q4
+docker run -v ./models:/models quant.cpp /models/SmolLM2-135M-Instruct-Q8_0.gguf -p "hello" -k uniform_4b -v q4
+# Replace SmolLM2-135M-Instruct-Q8_0.gguf with whatever GGUF you placed in ./models
 ```
 
 **OpenAI-compatible server** (`/v1/chat/completions`):
 ```bash
 cmake -B build -DTQ_BUILD_SERVER=ON && cmake --build build
-./build/quant-server model.gguf -p 8080 -k uniform_4b
+./build/quant-server models/SmolLM2-135M-Instruct-Q8_0.gguf -p 8080 -k uniform_4b
+# Substitute your own GGUF path as needed
 
 # Works with the OpenAI Python SDK
 curl http://localhost:8080/v1/chat/completions \
@@ -375,7 +441,7 @@ cd bindings/python && pip install .
 ```python
 from quantcpp import Model
 
-with Model("model.gguf", kv_compress=1) as m:
+with Model("models/SmolLM2-135M-Instruct-Q8_0.gguf", kv_compress=1) as m:  # use your own GGUF path
     print(m.ask("What is the capital of France?"))
 
     # Streaming
@@ -497,7 +563,7 @@ Tested extensively (2-bit delta, NF2, online SVD, multi-hash). None reached acce
 
 quant.cpp is an independent implementation of published research. The Variant F architecture (RHT preprocessing + scalar Lloyd-Max codebook on rotated values, no QJL stage) sits in a lineage that combines two prior works:
 
-- **HIGGS** — Malinovskii, Panferov, Ilin, Guo, Richtárik, Alistarh. *Pushing the Limits of Large Language Model Quantization via the Linearity Theorem*. Nov 2024. [arXiv:2411.17525](https://arxiv.org/abs/2411.17525). HIGGS introduced the **Random Hadamard Transform + MSE-optimal grid quantization** pattern (for weight quantization). Our `tq_rht.c` Walsh-Hadamard + Rademacher implementation follows this pattern. *Credit to Tim Dettmers ([discussion thread](https://github.com/ggml-org/llama.cpp/discussions/20969#discussioncomment-16481725)) for pointing this out.*
+- **HIGGS** — Malinovskii, Panferov, Ilin, Guo, Richtárik, Alistarh. *Pushing the Limits of Large Language Model Quantization via the Linearity Theorem*. Nov 2024. [arXiv:2411.17525](https://arxiv.org/abs/2411.17525). HIGGS introduced the **Random Hadamard Transform + MSE-optimal grid quantization** pattern (for weight quantization). Our `tq_rht.c` Walsh-Hadamard + Rademacher implementation follows this pattern. *We added this attribution after seeing [Tim Dettmers' general comment in llama.cpp discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969) asking participants in that thread (which uses "TurboQuant" loosely across many forks) to credit HIGGS instead. His comment was not directed at us specifically, but the substance applied to our naming as well, and we chose to update accordingly.*
 - **TurboQuant** — Zandieh, Daliri, Hadian, Mirrokni. *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate*. ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874). TurboQuant applies the rotation pattern to **KV cache** with a 1-bit QJL residual stage and per-channel outlier handling. Our work started as a literal port of TurboQuant; through 9 rounds of Karpathy-loop iteration we simplified it (dropped QJL, dropped outlier channels) into the current Variant F. We do not claim our shipped variant is the TurboQuant algorithm — it is an empirically-derived simplification.
 - **PolarQuant** — *Quantizing KV Caches with Polar Transformation*. AISTATS 2026. [arXiv:2502.02617](https://arxiv.org/abs/2502.02617). The polar-coordinate KV quantization that our `tq_polar.c` baseline implements.
 - **QJL** — *Quantized Johnson-Lindenstrauss Transform for KV Cache Compression*. AAAI 2025. [arXiv:2406.03482](https://arxiv.org/abs/2406.03482). The 1-bit sketch building block. Used in our `tq_qjl.c` baseline; we found it contributed ~zero to attention scores in the Variant F regime and dropped it.
