@@ -55,6 +55,28 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure --timeout 120 -C Release
 
+      # 10-year position guard: fail CI if structural moats erode.
+      # Runs on Linux only (POSIX shell). Checks single-header LOC/size,
+      # zero-deps, papers count, honest correction track, PyPI presence.
+      - name: 10-year position guard
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          chmod +x score.sh
+          bash score.sh --position 2>&1 | tee /tmp/position.log
+          # Extract dimension percentage; require >= 75%.
+          pct=$(grep -E '^\s*position\s' /tmp/position.log | awk '{print $2}' | tr -d '%')
+          echo "position dimension: ${pct}%"
+          if [ -z "$pct" ]; then
+            echo "could not parse position score"
+            exit 1
+          fi
+          # bash arithmetic: integer compare
+          if [ "${pct%.*}" -lt 75 ]; then
+            echo "::error::Position dimension regressed below 75% (${pct}%)"
+            exit 1
+          fi
+
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@v4

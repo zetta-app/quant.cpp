@@ -307,6 +307,103 @@ eval_integration() {
 }
 
 # ============================================================
+# DIMENSION 6: 10-YEAR POSITION (structural moats)
+# ------------------------------------------------------------
+# These metrics protect the project's defensible position:
+# single-header embeddability, zero deps, research velocity,
+# claim audit-ability. Anything that erodes them should drag
+# the score, even if other dimensions look fine.
+# ============================================================
+eval_position() {
+    echo -e "\n${BOLD}${CYAN}[6/6] 10-YEAR POSITION (structural moats)${NC}"
+
+    # ----- Single-header LOC budget (≤ 16,000 lines) -----
+    local sh_loc=0
+    if [ -f "$PROJECT_DIR/quant.h" ]; then
+        sh_loc=$(wc -l < "$PROJECT_DIR/quant.h" | tr -d ' ')
+    fi
+    local sh_loc_score=0
+    if [ "$sh_loc" -gt 0 ] && [ "$sh_loc" -le 16000 ]; then
+        sh_loc_score=1
+    fi
+    log_score "position" "single_header_loc" "$sh_loc_score" 1 2
+    print_item "single_header_loc ($sh_loc / 16000)" "$sh_loc_score" 1 2
+
+    # ----- Single-header binary size budget (≤ 700 KB) -----
+    local sh_size=0
+    if [ -f "$PROJECT_DIR/quant.h" ]; then
+        # macOS / BSD stat -f%z, GNU stat -c%s — try both
+        sh_size=$(stat -f%z "$PROJECT_DIR/quant.h" 2>/dev/null || stat -c%s "$PROJECT_DIR/quant.h" 2>/dev/null || echo 0)
+    fi
+    local sh_size_kb=$((sh_size / 1024))
+    local sh_size_score=0
+    if [ "$sh_size_kb" -gt 0 ] && [ "$sh_size_kb" -le 700 ]; then
+        sh_size_score=1
+    fi
+    log_score "position" "single_header_size" "$sh_size_score" 1 1
+    print_item "single_header_size (${sh_size_kb} KB / 700)" "$sh_size_score" 1 1
+
+    # ----- Zero external dependencies in core (libc/libm/intrinsics/OS) -----
+    # Allowed:
+    #   - C standard library headers
+    #   - SIMD intrinsics (arm_neon.h, immintrin.h, wasm_simd128.h)
+    #   - OS threading / kernel headers (pthread.h, windows.h, sched.h)
+    #   - Project headers (turboquant/*, tq_*)
+    # A failure here means we picked up a real third-party dep.
+    local bad_includes=0
+    if [ -d "$PROJECT_DIR/src/core" ]; then
+        bad_includes=$(grep -hE '^[[:space:]]*#include[[:space:]]*[<"]' "$PROJECT_DIR/src/core/"*.c 2>/dev/null \
+            | grep -vE '<(stdint|string|math|stdlib|stdio|stddef|stdbool|assert|float|limits|inttypes|errno|time|ctype|signal)\.h>' \
+            | grep -vE '<(arm_neon|immintrin|wasm_simd128|x86intrin|emmintrin|smmintrin|tmmintrin|nmmintrin|avxintrin|avx2intrin)\.h>' \
+            | grep -vE '<(pthread|sched|unistd|sys/[a-z_]+|windows|fcntl)\.h>' \
+            | grep -vE '"(turboquant/|tq_)' \
+            | wc -l | tr -d ' ')
+    fi
+    local deps_score=0
+    [ "$bad_includes" = "0" ] && deps_score=1
+    log_score "position" "core_zero_deps" "$deps_score" 1 2
+    print_item "core_zero_deps ($bad_includes foreign includes)" "$deps_score" 1 2
+
+    # ----- Papers ported (research velocity proxy) -----
+    # Counts implementation files matching known KV-quant paper algorithms.
+    # Goal is +1 every quarter; baseline as of v0.8.0 = 5 (polar, qjl, turbo,
+    # uniform, turbo_kv). Score reflects whether we're maintaining the count.
+    local papers=0
+    [ -f "$PROJECT_DIR/src/core/tq_polar.c" ]    && papers=$((papers + 1))
+    [ -f "$PROJECT_DIR/src/core/tq_qjl.c" ]      && papers=$((papers + 1))
+    [ -f "$PROJECT_DIR/src/core/tq_turbo.c" ]    && papers=$((papers + 1))
+    [ -f "$PROJECT_DIR/src/core/tq_uniform.c" ]  && papers=$((papers + 1))
+    [ -f "$PROJECT_DIR/src/core/tq_turbo_kv.c" ] && papers=$((papers + 1))
+    log_score "position" "papers_implemented" "$papers" 5 2
+    print_item "papers_implemented" "$papers" 5 2
+
+    # ----- Honest correction track (CHANGELOG retrospective entries) -----
+    # Counts CHANGELOG headings that name a self-correction. Reframes
+    # corrections as a positive — they're our trust asset.
+    local corrections=0
+    if [ -f "$PROJECT_DIR/CHANGELOG.md" ]; then
+        corrections=$(grep -ciE 'honest correction|self.?corrected|hotfix|retracted|retract' \
+                      "$PROJECT_DIR/CHANGELOG.md" 2>/dev/null || echo 0)
+    fi
+    # Cap at 10 — beyond that the metric stops rewarding new ones.
+    [ "$corrections" -gt 10 ] && corrections=10
+    local correction_score=0
+    [ "$corrections" -ge 4 ] && correction_score=1
+    log_score "position" "honest_corrections" "$correction_score" 1 1
+    print_item "honest_corrections ($corrections logged)" "$correction_score" 1 1
+
+    # ----- PyPI distribution channel live -----
+    local pypi_live=0
+    if [ -f "$PROJECT_DIR/bindings/python/pyproject.toml" ] && \
+       grep -q '^name *= *"quantcpp"' "$PROJECT_DIR/bindings/python/pyproject.toml" && \
+       [ -f "$PROJECT_DIR/.github/workflows/publish.yml" ]; then
+        pypi_live=1
+    fi
+    log_score "position" "pypi_distribution" "$pypi_live" 1 1
+    print_item "pypi_distribution" "$pypi_live" 1 1
+}
+
+# ============================================================
 # FINAL REPORT
 # ============================================================
 print_final() {
@@ -333,7 +430,7 @@ print_final() {
     # Dimension breakdown
     echo ""
     echo "  Dimension Breakdown:"
-    for dim in structure correctness quality performance integration; do
+    for dim in structure correctness quality performance integration position; do
         local ds=0 dw=0
         while IFS='|' read -r cat name score max weight; do
             if [ "$cat" = "$dim" ]; then
@@ -350,8 +447,16 @@ print_final() {
         fi
     done
 
-    # Save history
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $final" >> "$SCORE_LOG"
+    # Save history — only for full / quick evaluations.
+    # Single-dimension modes (--bench, --quality, --position) skip the log
+    # so partial scores don't pollute the trend line.
+    case "$MODE" in
+        --bench|--quality|--position)
+            ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $final" >> "$SCORE_LOG"
+            ;;
+    esac
 
     # Trend
     if [ -f "$SCORE_LOG" ] && [ "$(wc -l < "$SCORE_LOG" | tr -d ' ')" -gt 1 ]; then
@@ -379,6 +484,7 @@ case "$MODE" in
     --quick)
         eval_structure
         eval_correctness
+        eval_position
         ;;
     --bench)
         eval_performance
@@ -386,12 +492,16 @@ case "$MODE" in
     --quality)
         eval_quality
         ;;
+    --position)
+        eval_position
+        ;;
     --full|*)
         eval_structure
         eval_correctness
         eval_quality
         eval_performance
         eval_integration
+        eval_position
         ;;
 esac
 
