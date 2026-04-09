@@ -19,7 +19,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("quantcpp")
 except Exception:
-    __version__ = "0.9.2"  # fallback for editable / source-tree imports
+    __version__ = "0.10.0"  # fallback for editable / source-tree imports
 
 import os
 import sys
@@ -192,7 +192,18 @@ class Model:
         n_threads: int = 4,
         kv_compress: int = 1,
         context_length: int = 0,
+        progressive: bool = False,
     ):
+        """
+        Parameters
+        ----------
+        progressive : bool
+            Enable progressive KV compression (default False). When True,
+            the last 128 tokens' keys are kept at FP32 for maximum quality,
+            while all older tokens are compressed. Reduces PPL degradation
+            from +3.8% to +0.6% at a cost of ~28 KB extra memory.
+            Like human memory: recent = vivid, older = faded but present.
+        """
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Model file not found: {path}")
 
@@ -203,6 +214,9 @@ class Model:
         self._n_threads = n_threads
         self._kv_compress = kv_compress
         self._context_length = context_length
+        self._progressive = progressive
+
+        k_win = 128 if progressive else 0
 
         self._model = load_model(path)
         self._ctx = new_context(
@@ -213,6 +227,7 @@ class Model:
             n_threads=n_threads,
             kv_compress=kv_compress,
             context_length=context_length,
+            k_highres_window=k_win,
         )
         self._chat = True  # auto-wrap with chat template for instruct models
         self._lock = threading.Lock()

@@ -107,6 +107,7 @@ class QuantConfig(ctypes.Structure):
         ("n_threads", ctypes.c_int),         # default: 4
         ("kv_compress", ctypes.c_int),       # 0=off, 1=4-bit, 2=delta+3-bit
         ("context_length", ctypes.c_int),    # 0=auto(4096), or user override
+        ("k_highres_window", ctypes.c_int),  # 0=off, 128=sweet spot for progressive
     ]
 
 
@@ -190,6 +191,7 @@ def new_context(
     n_threads: int = 4,
     kv_compress: int = 1,
     context_length: int = 0,
+    k_highres_window: int = 0,
 ) -> ctypes.c_void_p:
     """Create an inference context with the given config."""
     lib = _get_lib()
@@ -200,6 +202,7 @@ def new_context(
         n_threads=n_threads,
         kv_compress=kv_compress,
         context_length=context_length,
+        k_highres_window=k_highres_window,
     )
     ctx = lib.quant_new(model, ctypes.byref(cfg))
     if not ctx:
