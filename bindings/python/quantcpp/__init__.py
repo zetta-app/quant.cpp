@@ -21,7 +21,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("quantcpp")
 except Exception:
-    __version__ = "0.8.0"  # fallback for editable / source-tree imports
+    __version__ = "0.8.1"  # fallback for editable / source-tree imports
 
 import os
 import threading
@@ -76,8 +76,28 @@ class Model:
         top_p: float = 0.9,
         max_tokens: int = 256,
         n_threads: int = 4,
-        kv_compress: int = 1,
+        kv_compress: int = 0,
     ):
+        """
+        .. note::
+           ``kv_compress=1`` and ``kv_compress=2`` are temporarily disabled in
+           the Python bindings (v0.8.x) — the bundled ``quant.h`` single
+           header carries an older KV compression path that aborts on Llama
+           architectures. The CLI ``quant`` binary uses the multi-file engine
+           and works with all KV types. KV compression will be re-enabled in
+           the bindings once ``quant.h`` is re-generated against the v0.8.0+
+           tree (tracked as v0.8.1: WASM SIMD / un-stub turbo_kv).
+        """
+        if kv_compress not in (0,):
+            import warnings
+            warnings.warn(
+                "kv_compress != 0 is not supported in the Python bindings of "
+                "quantcpp 0.8.x — falling back to kv_compress=0. Use the CLI "
+                "binary for KV compression until v0.8.2.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            kv_compress = 0
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Model file not found: {path}")
 
@@ -139,12 +159,13 @@ class Model:
         result = ctypes.cast(ptr, ctypes.c_char_p).value
         text = result.decode("utf-8", errors="replace") if result else ""
 
-        # Free the C-allocated string
-        if sys.platform == "win32":
-            libc = ctypes.cdll.msvcrt
-        else:
-            libc = ctypes.CDLL(None)
-        libc.free(ptr)
+        # NOTE (v0.8.1): the C string returned by quant_ask is allocated
+        # inside libquant.dylib's malloc heap. Calling ctypes.CDLL(None).free
+        # on it crashes on macOS arm64 because Python's libc handle resolves
+        # to a different malloc zone than the dylib's. We accept a ~65 KB
+        # leak per ask() call as a temporary tradeoff. quant_free_ctx /
+        # quant_free_model release the bulk of the memory at end of session.
+        # Tracked: add quant_free_string(void*) to quant.h in v0.8.2.
 
         return text
 
