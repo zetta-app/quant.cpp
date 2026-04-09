@@ -28,6 +28,7 @@ add_library(turboquant STATIC
     ${TQ_CPU_SOURCES}
     ${TQ_ENGINE_SOURCES}
 )
+set_target_properties(turboquant PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(turboquant PUBLIC include)
 
 # Platform-specific linking
