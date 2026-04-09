@@ -62,17 +62,7 @@ static float tkv_fp16_to_fp32(uint16_t h) {
     return bits.f;
 }
 
-/* ============================================================
- * QJL random entry helper (must match tq_qjl.c exactly)
- * ============================================================ */
-
-static float tkv_qjl_random_entry(int dim_idx, int sketch_idx) {
-    uint32_t h = (uint32_t)(dim_idx * 2654435761u + sketch_idx * 340573321u);
-    h ^= h >> 16;
-    h *= 0x45d9f3b;
-    h ^= h >> 16;
-    return (h & 1) ? 1.0f : -1.0f;
-}
+/* (tkv_qjl_random_entry removed — dead code, QJL residual dropped in Variant F) */
 
 /* ============================================================
  * Block seed: deterministic per-block seed based on position
@@ -83,24 +73,6 @@ static float tkv_qjl_random_entry(int dim_idx, int sketch_idx) {
 /* ============================================================
  * Bit packing helpers for codebook indices
  * ============================================================ */
-
-/* Pack 2-bit indices: 4 values per byte, LSB-first */
-static void pack_2bit(const uint8_t* indices, uint8_t* packed, int n) {
-    memset(packed, 0, (size_t)((n + 3) / 4));
-    for (int i = 0; i < n; i++) {
-        int byte_idx = i / 4;
-        int bit_pos  = (i % 4) * 2;
-        packed[byte_idx] |= (uint8_t)((indices[i] & 0x03) << bit_pos);
-    }
-}
-
-static void unpack_2bit(const uint8_t* packed, uint8_t* indices, int n) {
-    for (int i = 0; i < n; i++) {
-        int byte_idx = i / 4;
-        int bit_pos  = (i % 4) * 2;
-        indices[i] = (packed[byte_idx] >> bit_pos) & 0x03;
-    }
-}
 
 /* Pack 3-bit indices: using LSB-first bit-stream packing */
 static void pack_3bit(const uint8_t* indices, uint8_t* packed, int n) {
@@ -118,37 +90,9 @@ static void pack_3bit(const uint8_t* indices, uint8_t* packed, int n) {
     }
 }
 
-static void unpack_3bit(const uint8_t* packed, uint8_t* indices, int n) {
-    for (int i = 0; i < n; i++) {
-        int bit_offset = i * 3;
-        int byte_idx = bit_offset / 8;
-        int bit_pos  = bit_offset % 8;
-        uint16_t val = (uint16_t)packed[byte_idx];
-        if (bit_pos > 5 && byte_idx + 1 < (n * 3 + 7) / 8) {
-            val |= (uint16_t)packed[byte_idx + 1] << 8;
-        }
-        indices[i] = (uint8_t)((val >> bit_pos) & 0x07);
-    }
-}
+/* (unpack_3bit removed — dead code, only pack_3bit is called) */
 
-/* ============================================================
- * QJL sign hash on residual (simplified, inline)
- * ============================================================ */
-
-static void compute_qjl_signs(const float* residual, uint8_t* signs,
-                                int dim, int n_sketch) {
-    int hash_bytes = n_sketch / 8;
-    memset(signs, 0, (size_t)hash_bytes);
-    for (int s = 0; s < n_sketch; s++) {
-        float proj = 0.0f;
-        for (int d = 0; d < dim; d++) {
-            proj += residual[d] * tkv_qjl_random_entry(d, s);
-        }
-        if (proj > 0.0f) {
-            signs[s / 8] |= (uint8_t)(1 << (s % 8));
-        }
-    }
-}
+/* (compute_qjl_signs removed — dead code, QJL residual was dropped in Variant F) */
 
 /* ============================================================
  * Internal: MSE-only dequantize in rotated space (shared helper)
@@ -1319,19 +1263,7 @@ static void pack_5bit(const uint8_t* indices, uint8_t* packed, int n) {
     }
 }
 
-static void unpack_5bit(const uint8_t* packed, uint8_t* indices, int n) {
-    int total_bytes = (n * 5 + 7) / 8;
-    for (int i = 0; i < n; i++) {
-        int bit_offset = i * 5;
-        int byte_idx = bit_offset / 8;
-        int bit_pos  = bit_offset % 8;
-        uint16_t val = (uint16_t)packed[byte_idx];
-        if (bit_pos > 3 && byte_idx + 1 < total_bytes) {
-            val |= (uint16_t)packed[byte_idx + 1] << 8;
-        }
-        indices[i] = (uint8_t)((val >> bit_pos) & 0x1F);
-    }
-}
+/* (unpack_5bit removed — dead code, 5b dequant uses inline uint64 reads) */
 
 void tq_turbo_kv_5b_quantize_ref(const float* src, void* dst, int n) {
     block_tq_turbo_kv_5b* block = (block_tq_turbo_kv_5b*)dst;
