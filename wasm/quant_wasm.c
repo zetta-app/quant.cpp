@@ -119,14 +119,16 @@ int wasm_generate(const char* prompt, float temperature, int max_tokens) {
 
     double elapsed = emscripten_get_now() - t0;
 
-    if (result) {
+    if (result && result[0] != '\0') {
         /* Send full result (quant_ask doesn't use callback) */
         js_on_token(result);
         int n_tokens = (int)strlen(result) / 4; /* rough estimate */
         js_on_done(n_tokens, elapsed);
-        free(result);
+        quant_free_string(result);
     } else {
-        js_on_status("Generation failed");
+        if (result) quant_free_string(result);
+        js_on_done(0, elapsed);
+        js_on_status("No output — try a different prompt");
     }
 
     g_generating = 0;

@@ -300,16 +300,21 @@ async function generate() {
         addMessage('system', msg);
     };
 
-    // Call generation
-    const promptPtr = Module.allocateUTF8(text);
-    Module._wasm_generate(promptPtr, 0.7, 256);
-    Module._free(promptPtr);
+    // Wrap with ChatML template (instruct models need this to generate)
+    const chatPrompt = `<|im_start|>user\n${text}<|im_end|>\n<|im_start|>assistant\n`;
 
-    if (!output) {
-        assistantDiv.innerHTML = '<em style="color:#666">No output generated</em>';
-    }
-    generating = false;
-    document.getElementById('sendBtn').disabled = false;
+    // Run generation asynchronously so the UI doesn't freeze
+    setTimeout(() => {
+        const promptPtr = Module.allocateUTF8(chatPrompt);
+        Module._wasm_generate(promptPtr, 0.7, 256);
+        Module._free(promptPtr);
+
+        if (!output) {
+            assistantDiv.innerHTML = '<em style="color:#666">No output generated. Try a longer prompt.</em>';
+        }
+        generating = false;
+        document.getElementById('sendBtn').disabled = false;
+    }, 50);  // yield to browser for one frame to show the spinner
 }
 </script>
 
