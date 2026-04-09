@@ -101,11 +101,12 @@ ON_TOKEN_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 class QuantConfig(ctypes.Structure):
     """Mirror of quant_config from quant.h."""
     _fields_ = [
-        ("temperature", ctypes.c_float),   # default: 0.7
-        ("top_p", ctypes.c_float),         # default: 0.9
-        ("max_tokens", ctypes.c_int),      # default: 256
-        ("n_threads", ctypes.c_int),       # default: 4
-        ("kv_compress", ctypes.c_int),     # 0=off, 1=4-bit, 2=delta+3-bit
+        ("temperature", ctypes.c_float),     # default: 0.7
+        ("top_p", ctypes.c_float),           # default: 0.9
+        ("max_tokens", ctypes.c_int),        # default: 256
+        ("n_threads", ctypes.c_int),         # default: 4
+        ("kv_compress", ctypes.c_int),       # 0=off, 1=4-bit, 2=delta+3-bit
+        ("context_length", ctypes.c_int),    # 0=auto(4096), or user override
     ]
 
 
@@ -188,6 +189,7 @@ def new_context(
     max_tokens: int = 256,
     n_threads: int = 4,
     kv_compress: int = 1,
+    context_length: int = 0,
 ) -> ctypes.c_void_p:
     """Create an inference context with the given config."""
     lib = _get_lib()
@@ -197,6 +199,7 @@ def new_context(
         max_tokens=max_tokens,
         n_threads=n_threads,
         kv_compress=kv_compress,
+        context_length=context_length,
     )
     ctx = lib.quant_new(model, ctypes.byref(cfg))
     if not ctx:

@@ -19,7 +19,7 @@ try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("quantcpp")
 except Exception:
-    __version__ = "0.9.0"  # fallback for editable / source-tree imports
+    __version__ = "0.9.1"  # fallback for editable / source-tree imports
 
 import os
 import sys
@@ -182,6 +182,7 @@ class Model:
         max_tokens: int = 256,
         n_threads: int = 4,
         kv_compress: int = 1,
+        context_length: int = 0,
     ):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Model file not found: {path}")
@@ -192,6 +193,7 @@ class Model:
         self._max_tokens = max_tokens
         self._n_threads = n_threads
         self._kv_compress = kv_compress
+        self._context_length = context_length
 
         self._model = load_model(path)
         self._ctx = new_context(
@@ -201,6 +203,7 @@ class Model:
             max_tokens=max_tokens,
             n_threads=n_threads,
             kv_compress=kv_compress,
+            context_length=context_length,
         )
         self._chat = True  # auto-wrap with chat template for instruct models
         self._lock = threading.Lock()

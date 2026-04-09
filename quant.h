@@ -41,6 +41,9 @@ typedef struct {
     int   max_tokens;    // default: 256
     int   n_threads;     // default: 4
     int   kv_compress;   // 0=off, 1=4-bit K+V (default), 2=delta+3-bit
+    int   context_length;// 0=auto (4096), or user override. With kv_compress=1,
+                         // you can safely set much larger values (e.g. 32768)
+                         // because KV cache uses ~4x less memory.
 } quant_config;
 
 // Load a GGUF model file. Returns NULL on failure.
@@ -15682,6 +15685,26 @@ quant_ctx* quant_new(quant_model* model, const quant_config* config) {
     }
 
     tq_model_t* m = (tq_model_t*)model;
+
+    /* Override context length if user requested it. With KV compression,
+     * larger context is safe on the same hardware budget. The default
+     * cap (4096) was set during model loading for safety; here we lift it. */
+    if (config && config->context_length > 0) {
+        int req = config->context_length;
+        /* Clamp to model's absolute max (from GGUF metadata) to prevent
+         * RoPE frequency mismatch. Re-read the original GGUF value: */
+        int gguf_max = 131072; /* conservative fallback */
+        if (m->gguf_ctx) {
+            gguf_max = tq_gguf_get_i32(m->gguf_ctx, "llama.context_length", 131072);
+            if (gguf_max <= 0) gguf_max = 131072;
+        }
+        if (req > gguf_max) req = gguf_max;
+        if (req > m->config.max_seq_len) {
+            fprintf(stderr, "quant_new: extending context %d -> %d (user request)\n",
+                    m->config.max_seq_len, req);
+            m->config.max_seq_len = req;
+        }
+    }
 
     /* Set thread count */
     if (gc.n_threads > 1) {
