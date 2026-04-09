@@ -10,7 +10,7 @@ name = "quantcpp"
 version = "0.8.0"
 description = "Single-header LLM inference engine with KV cache compression (7× compression at fp32 parity)"
 readme = "README.md"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 authors = [
     { name = "quantumaikr", email = "noreply@quantumaikr.com" },
