@@ -33,8 +33,9 @@ jobs:
             arch: aarch64
           - os: macos-14      # Apple Silicon (M-series). Intel macs deferred.
             arch: arm64
-          - os: windows-latest
-            arch: AMD64
+          # Windows mingw64 wheel is deferred — quant.h's clock_gettime shim
+          # conflicts with mingw's native one. Windows users install via sdist
+          # with MSVC for now. Tracked for v0.8.x.
 
     steps:
       - name: Checkout
