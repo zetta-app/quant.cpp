@@ -1152,9 +1152,19 @@ int tq_encode(const tq_tokenizer_t* tok, const char* text,
     if (*text == '\0') return n_tokens;
 
     /* Detect tokenizer style: Gemma uses ▁ (U+2581) for spaces in vocab,
-     * GPT2/Qwen uses byte-level BPE with Ġ/ĉ encoding.
-     * Check if '▁' exists in vocab as a simple heuristic. */
-    int is_sentencepiece = (str_lookup(tok, "\xe2\x96\x81") >= 0); /* ▁ = U+2581 = 0xE2 0x96 0x81 */
+     * GPT2/Qwen/Llama3 uses byte-level BPE with Ġ/ĉ encoding.
+     * Heuristic: ▁ in vocab AND vocab_size < 100K → SentencePiece.
+     * Llama 3.x (128K vocab) has ▁ from the base model but uses tiktoken
+     * (GPT-style BPE). Using the sentencepiece path for these models drops
+     * most characters and produces far too few tokens. */
+    int has_spm_marker = (str_lookup(tok, "\xe2\x96\x81") >= 0);
+    int is_sentencepiece = has_spm_marker && tok->vocab_size < 100000;
+    static int dbg_once = 0;
+    if (!dbg_once) {
+        fprintf(stderr, "[tokenizer] vocab=%d, spm_marker=%d, is_sentencepiece=%d\n",
+                tok->vocab_size, has_spm_marker, is_sentencepiece);
+        dbg_once = 1;
+    }
 
     int text_len = (int)strlen(text);
 

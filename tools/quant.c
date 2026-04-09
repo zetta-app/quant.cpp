@@ -417,7 +417,13 @@ int main(int argc, char** argv) {
         text[nread] = '\0';
         fclose(fp);
 
-        /* Tokenize */
+        /* Tokenize.
+         * NOTE: BPE merge is O(n²) on the initial token count. For GPT2-style
+         * tokenizers, initial count ≈ text_len (one per byte). A 17KB text
+         * produces ~17K initial tokens → O(289M) merge operations → minutes.
+         * We cap max_tok at max_seq_len to limit this. The eval thus covers
+         * only the first max_seq_len bytes worth of text, not the full file.
+         * TODO: implement priority-queue BPE merge (O(n log n)) to remove cap. */
         int max_tok = (int)(nread + 256);
         if (max_tok > c->max_seq_len) max_tok = c->max_seq_len;
         int* tokens = (int*)malloc((size_t)max_tok * sizeof(int));
