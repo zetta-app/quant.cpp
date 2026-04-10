@@ -3,12 +3,12 @@
 </p>
 
 <h3 align="center">quant.cpp</h3>
-<p align="center"><b>AI를 내 앱에 넣는 가장 작은 방법</b></p>
+<p align="center"><b>Beyond RAG: 문서 전체를 노트북에 통째로 로드하세요.</b></p>
 
 <p align="center">
-  C 파일 하나(16K줄)로 AI 추론을 추가할 수 있습니다.<br>
-  설치할 것도, GPU도, 외부 의존성도 없습니다.<br>
-  메모리를 3배 덜 쓰면서 품질은 그대로 유지합니다.
+  Chunking은 작은 컨텍스트 윈도우를 위한 임시방편이었습니다. 우리는 그것을 불필요하게 만들었습니다.<br>
+  6.4× KV 압축으로 16GB Mac에서 전체 문서 이해가 가능합니다.<br>
+  C 파일 하나(16K줄), 외부 의존성 0.
 </p>
 
 <p align="center">

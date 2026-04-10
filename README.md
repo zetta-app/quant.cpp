@@ -3,17 +3,18 @@
 </p>
 
 <h3 align="center">quant.cpp</h3>
-<p align="center"><b>The smallest way to add AI to your app.</b></p>
+<p align="center"><b>Beyond RAG: load the whole document. On your laptop.</b></p>
 
 <p align="center">
-  One C file (16K lines). Zero dependencies. Runs everywhere.<br>
-  <code>pip install quantcpp</code> — or <code>#include "quant.h"</code> and compile.
+  Chunking was a workaround for small context windows. We just made it unnecessary.<br>
+  6.4× KV compression brings full-document understanding to consumer hardware.<br>
+  <code>pip install quantcpp</code> — 16K lines of C, zero dependencies.
 </p>
 
 <table align="center">
 <tr>
+<td align="center"><b>7/7 vs 0/7</b><br>Beyond RAG measured</td>
 <td align="center"><b>6.4x compression</b><br>+3% PPL</td>
-<td align="center"><b>7/7 vs 0/7</b><br>Doc-QA vs chunk-RAG</td>
 <td align="center"><b>128K context</b><br>on 16GB Mac</td>
 <td align="center"><b>16K LOC</b><br>zero deps</td>
 </tr>
@@ -101,24 +102,54 @@ m = Model("llama-3b.gguf", aggressive=True, context_length=131072)  # 128K in 9.
 
 ---
 
-## Document QA: 7/7 vs Chunk-RAG 0/7 — Measured
+## Beyond RAG: 7/7 vs 0/7 — Measured
 
-A direct comparison of three approaches to document question-answering with **Llama 3.2 3B Q8_0**:
+> **Chunking RAG was a workaround for small context windows. The workaround became dogma.**
+> **Now context windows are big enough that we don't need the workaround.**
 
-| Method | Accuracy | Hallucinations |
+A direct comparison on **Llama 3.2 3B Q8_0**, 5-section synthetic document, 7 questions (4 single-hop, 3 multi-hop):
+
+| Method | Accuracy | Behavior on failure |
 |---|---:|---|
-| Chunk-RAG (wrong chunk retrieved) | **0/7** | All 7 questions |
-| Full Document (FP32 KV) | **7/7** | None |
-| **Full Document (6.4x compressed KV)** | **7/7** | **None — zero quality loss** |
+| **Chunk-RAG** (wrong section retrieved) | **0/7** | **Hallucinated all answers** |
+| Full Document (FP32 KV) | **7/7** | Correct |
+| **Full Document (6.4× compressed KV)** | **7/7** | **Correct — zero quality loss** |
+
+### The hidden failure mode of chunk-RAG
 
 When chunk-RAG retrieves the wrong section, the model **doesn't say "I don't know"** — it generates plausible-sounding lies:
-- "Who is the CTO?" → **"John Smith"** (truth: Maria Santos)
-- "Revenue?" → **"$1,000,000"** (truth: 847 million)
-- "R&D %?" → **"15% of net income"** (truth: 14% of revenue)
 
-With the full document loaded via 6.4x KV compression, the model correctly answers all 7 questions including **multi-hop reasoning** that requires connecting information across sections (e.g., "What risk affects the growth region?" → currency fluctuations, requiring linking Section 3 + Section 5).
+| Question | Chunk-RAG (wrong section) | Truth |
+|---|---|---|
+| "Who is the CTO?" | "John Smith" ❌ | Maria Santos |
+| "What is the revenue?" | "$1,000,000" ❌ | 847 million |
+| "R&D %?" | "15% of net income" ❌ | 14% of revenue |
+| "Who proposed?" | "John Smith, EVP" ❌ | James Park |
 
-**The takeaway:** KV compression isn't just memory savings — it enables a **fundamentally different RAG approach**. RAG decides *which documents* to look at; long-context decides *how deeply* to understand them. See [bench/results/document_level_rag_breakthrough.md](bench/results/document_level_rag_breakthrough.md) for the full benchmark.
+This is the production risk no one measures: **silent hallucination on retrieval failure**. Your monitoring shows 100% uptime. Your users get wrong answers.
+
+### Beyond RAG: load the whole document instead
+
+With **6.4× KV compression**, a full 5-section document fits in context on a 16GB Mac. The model answers all 7 questions correctly, including multi-hop reasoning that requires linking information across sections:
+
+> **"What risk affects the growth region?"** → currency fluctuations
+> *(requires linking Section 3 "Asia growth" with Section 5 "Asia currency risk")*
+
+Chunk-RAG cannot do this — each chunk is retrieved independently.
+
+### RAG isn't dead. RAG is one tool.
+
+This isn't "RAG is dead." RAG is still the only way to handle 100K+ document corpora. But:
+- **RAG decides *which documents* to look at** (search problem)
+- **Long-context decides *how deeply* to understand them** (reasoning problem)
+
+The bug was using the same tool for both. The fix is using each for what it's good at.
+
+**Reproduce in 5 minutes:** [bench/document_level_rag_test.sh](bench/document_level_rag_test.sh)
+**Full benchmark report:** [bench/results/document_level_rag_breakthrough.md](bench/results/document_level_rag_breakthrough.md)
+**Manifesto:** [docs/beyond-rag-manifesto.md](docs/beyond-rag-manifesto.md)
+
+> **Honest disclaimer:** v1 is a synthetic 5-section document with 7 questions on a single 3B model. We're not claiming this is LongBench. We *are* claiming it's enough to start a conversation about the failure mode chunk-RAG has been hiding. v2 with real benchmarks is in progress.
 
 ---
 

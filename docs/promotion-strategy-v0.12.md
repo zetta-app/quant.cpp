@@ -1,10 +1,38 @@
-# Promotion Strategy: v0.12 Document-Level RAG Breakthrough
+# Promotion Strategy: v0.12 Beyond RAG
 
 ## Date: 2026-04-11
+
+## The Movement Frame
+
+> **"Chunking RAG was a workaround for small context windows. The workaround became dogma. Now context windows are big enough that we don't need the workaround. Welcome to Beyond RAG."**
 
 ## The Story (One Sentence)
 
 > **"Chunk-RAG hallucinated 7/7 questions. Loading the full document with 6.4x KV compression got 7/7 correct — on a 16GB Mac."**
+
+## Why "Beyond RAG" Works as a Slogan
+
+| Slogan candidate | Verdict |
+|---|---|
+| ~~"RAG is dead"~~ | Provocative but false. Backlash. |
+| ~~"Document-Level RAG"~~ | Accurate but academic, low energy. |
+| ~~"Long-context inference"~~ | Vague, technical, no narrative. |
+| **"Beyond RAG"** | **Evolution, not death. Curiosity-inducing. Movement-shaped.** |
+
+"Beyond" implies we respect what RAG did but we're moving past it. It's the same energy as "Beyond meat" (not "kill meat"), "Beyond Good and Evil" (not "destroy ethics"). The audience self-selects: RAG skeptics already in, RAG defenders curious enough to click.
+
+## The Movement, Not Just a Feature
+
+This isn't "buy our product." It's "join the movement away from a workaround that became dogma."
+
+**Movement structure:**
+1. **Origin myth**: Chunking was an engineering compromise for 2K context windows
+2. **Villain**: The compromise became dogma. Vector DB companies. Production hallucination.
+3. **Hero's tools**: KV compression. Big context windows. Local hardware.
+4. **Vision**: 5 years from now, "RAG" means "retrieve docs to load fully", not "chunk-and-pray"
+5. **Call to action**: Run the 5-minute benchmark on your data. See what your users see.
+
+This frame works because it's true. Don't manufacture it.
 
 ## Why This Story Resonates
 
@@ -20,12 +48,12 @@
 
 **Why first**: Our existing community, tech-savvy, RAG fatigue is high.
 
-**Title options** (A/B test mentally):
-- **A** (concrete): "We measured chunk-RAG vs full-document on a 3B model — 0/7 vs 7/7"
-- **B** (provocative): "Your RAG hallucinates when retrieval fails. Here's the data."
-- **C** (technical): "6.4x KV compression makes 'Document-Level RAG' practical on 16GB Macs"
+**Title options** (with Beyond RAG framing):
+- **A** (data + movement): "Beyond RAG: chunk-RAG hallucinated 7/7 questions in our test. Here's the data."
+- **B** (concrete): "We measured chunk-RAG vs full-document on a 3B model — 0/7 vs 7/7"
+- **C** (manifesto): "Beyond RAG: chunking was a workaround that became dogma. Time to move on."
 
-**Recommend A** — concrete data wins on r/LocalLLaMA.
+**Recommend A** — combines concrete data with movement framing. r/LocalLLaMA values both.
 
 **Post structure**:
 1. Hook: 7/7 vs 0/7 table
@@ -46,8 +74,8 @@
 
 **Why second**: Broader tech audience, RAG/AI is hot topic.
 
-**Title** (HN style — concrete + intriguing):
-- "Show HN: We compared chunk-RAG vs full-document QA — 0/7 vs 7/7"
+**Title** (HN style — concrete + movement):
+- "Show HN: Beyond RAG — chunk-RAG hallucinated 7/7 in our benchmark"
 
 **Post structure**:
 1. Lead with the benchmark table
@@ -65,42 +93,66 @@
 
 **Why third**: Amplification + screenshots.
 
-**Thread structure** (5-7 tweets):
+**Thread structure** (8 tweets — Beyond RAG manifesto):
 
 ```
-1/ Chunk-RAG: 0/7 ❌ (all hallucinated)
-   Full Document: 7/7 ✅
-   Same model. Same questions. Just different context approach.
+1/ Chunking RAG was a workaround for small context windows.
+   The workaround became dogma.
+   Now context windows are big enough that we don't need it.
    
-   We measured this on Llama 3.2 3B Q8_0:
+   Welcome to Beyond RAG. 🧵
+
+2/ We measured this on Llama 3.2 3B Q8_0:
+
+   Chunk-RAG (wrong section retrieved): 0/7 ❌
+   Full Document (FP32 KV):              7/7 ✅
+   Full Document (6.4x compressed KV):   7/7 ✅
+   
    [screenshot of benchmark table]
 
-2/ When chunk-RAG retrieves the wrong section, the model doesn't say "I don't know."
-   It generates plausible lies:
-   • "CTO?" → "John Smith" (actually: Maria Santos)  
-   • "Revenue?" → "$1M" (actually: $847M)
-   • "R&D?" → "15% of net income" (actually: 14% of revenue)
-
-3/ The fix isn't a smarter retriever. It's loading the full document.
-   But that needs context windows that don't fit on consumer hardware.
-   Until now.
-
-4/ quant.cpp's 6.4x KV compression makes 128K context fit in 9.5 GB on a 16GB Mac.
-   With Llama 3.2 3B, the full document fits → 7/7 accuracy → zero hallucinations.
+3/ When chunk-RAG retrieved the wrong section, the model didn't say
+   "I don't know." It generated plausible-sounding lies:
    
-   FP32 KV: 7/7
-   6.4x compressed KV: 7/7 (zero quality loss)
+   "Who is the CTO?" → "John Smith" (truth: Maria Santos)
+   "Revenue?" → "$1,000,000" (truth: $847M)
+   "R&D %?" → "15% of net income" (truth: 14% of revenue)
 
-5/ This isn't "RAG is dead." It's "chunking RAG is dangerous."
-   RAG decides which documents to look at.
-   Long-context decides how deeply to understand them.
-   They complement each other.
+4/ This is the failure mode no one is monitoring.
+   
+   Your dashboards show 100% uptime.
+   Your users get plausible-sounding lies.
+   
+   Silent hallucination on retrieval failure.
 
-6/ Open source, MIT-style: pip install quantcpp
-   Single C header, 16K LOC, runs anywhere.
+5/ The fix isn't a smarter retriever. It's loading the whole document.
    
-   Benchmark: github.com/quantumaikr/quant.cpp/blob/main/bench/results/document_level_rag_breakthrough.md
+   That used to need cloud-scale GPUs.
+   quant.cpp's 6.4x KV compression makes 128K context
+   fit in 9.5 GB on a 16GB Mac. Locally. For free.
+
+6/ This isn't "RAG is dead."
    
+   RAG is essential for 100K+ documents. We still need it.
+   But "RAG = chunk and pray" has to go.
+   
+   RAG decides WHICH documents to look at.
+   Beyond RAG decides HOW DEEPLY to understand them.
+
+7/ Open source. Reproduce in 5 minutes:
+   
+   pip install quantcpp
+   
+   Or run our benchmark on your data:
+   github.com/quantumaikr/quant.cpp
+   
+   Manifesto: docs/beyond-rag-manifesto.md
+
+8/ Honest disclaimer: this is v1.
+   5 sections, 7 questions, 1 model.
+   We're not claiming a paper.
+   We're starting a conversation.
+   
+   If your production RAG hallucinates, we'd love to hear about it.
    /end
 ```
 

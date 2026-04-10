@@ -1,6 +1,12 @@
 # Changelog
 
-## [0.12.0] — 2026-04-11 — Document-Level RAG Verified
+## [0.12.0] — 2026-04-11 — Beyond RAG
+
+> **Chunking RAG was a workaround for small context windows.**
+> **The workaround became dogma.**
+> **Now context windows are big enough that we don't need the workaround.**
+>
+> See: [docs/beyond-rag-manifesto.md](docs/beyond-rag-manifesto.md)
 
 ### Headline: 7/7 vs 0/7
 
