@@ -18,6 +18,18 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdbool.h>
+
+/* Forward decl: defined in src/engine/tq_generate.c.
+ * Not yet exposed in turboquant.h since it's a chat-mode helper. */
+extern int tq_generate_continue(tq_model_t* model,
+                                 tq_tokenizer_t* tokenizer,
+                                 tq_state_t* state,
+                                 const char* prompt,
+                                 tq_gen_config_t* config,
+                                 int** cached_tokens_io,
+                                 int*  n_cached_io,
+                                 int*  cached_capacity_io,
+                                 char* output, int output_size);
 #if defined(_MSC_VER)
 #include <intrin.h>
 typedef volatile long atomic_int;
@@ -61,13 +73,85 @@ typedef volatile long atomic_int;
  * Server state
  * ============================================================ */
 
+/* ============================================================
+ * Per-session KV cache for multi-client chat reuse
+ *
+ * Each client identifies itself with X-Session-Id header (or the
+ * "user" field in the request body, OpenAI-compatible). Sessions are
+ * stored in a small LRU table; the least recently used is evicted
+ * when MAX_SESSIONS is reached.
+ *
+ * Without this, two concurrent chat clients would corrupt each
+ * other's KV cache. The inference_mutex still serializes per-token
+ * forward passes (single model weights), but the cache state is
+ * now per-session.
+ * ============================================================ */
+#define MAX_SESSIONS 16
+#define SESSION_ID_MAX 64
+
+typedef struct {
+    char        id[SESSION_ID_MAX];   /* "" = unused slot */
+    tq_state_t* kv_state;
+    int*        cached_tokens;
+    int         n_cached;
+    int         cached_capacity;
+    long        last_used;            /* monotonic counter for LRU */
+} kv_session_t;
+
 struct tq_server {
     tq_server_config_t config;
     int                listen_fd;
     atomic_int         running;
     atomic_int         active_connections;  /* track concurrent threads */
     pthread_mutex_t    inference_mutex;     /* serialize inference (single model state) */
+
+    kv_session_t       sessions[MAX_SESSIONS];
+    long               session_clock;
 };
+
+/* Find or allocate a session by id. Caller holds inference_mutex.
+ * Returns a pointer into server->sessions. Never NULL (LRU evicts). */
+static kv_session_t* get_or_create_session(tq_server_t* server,
+                                            const char* sid,
+                                            tq_type kv_type,
+                                            int value_quant_bits) {
+    if (!sid || !sid[0]) sid = "default";
+    server->session_clock++;
+
+    int empty_slot = -1;
+    int lru_slot = 0;
+    long lru_time = server->sessions[0].last_used;
+
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (server->sessions[i].id[0] == '\0') {
+            if (empty_slot < 0) empty_slot = i;
+            continue;
+        }
+        if (strncmp(server->sessions[i].id, sid, SESSION_ID_MAX) == 0) {
+            server->sessions[i].last_used = server->session_clock;
+            return &server->sessions[i];
+        }
+        if (server->sessions[i].last_used < lru_time) {
+            lru_time = server->sessions[i].last_used;
+            lru_slot = i;
+        }
+    }
+
+    /* Not found — pick empty slot or evict LRU */
+    int slot = empty_slot >= 0 ? empty_slot : lru_slot;
+    kv_session_t* s = &server->sessions[slot];
+
+    /* Free old session contents (if any) */
+    if (s->kv_state) tq_free_state(s->kv_state);
+    if (s->cached_tokens) free(s->cached_tokens);
+
+    memset(s, 0, sizeof(*s));
+    strncpy(s->id, sid, SESSION_ID_MAX - 1);
+    s->kv_state = tq_create_state_ex(
+        &server->config.model->config, kv_type, value_quant_bits);
+    s->last_used = server->session_clock;
+    return s;
+}
 
 /* Global server pointer for signal handler */
 static tq_server_t* g_server = NULL;
@@ -207,6 +291,10 @@ typedef struct {
 
     /* Built prompt */
     char*          prompt;    /* heap-allocated */
+
+    /* Session id for KV cache reuse (OpenAI 'user' field).
+     * Empty = "default" session. */
+    char           session_id[64];
 } chat_request_t;
 
 static void free_chat_request(chat_request_t* req) {
@@ -354,6 +442,13 @@ static int parse_chat_request(const char* body, chat_request_t* req) {
 
     v = json_find_key(body, "delta_kv");
     if (v) req->delta_kv = json_extract_bool(v);
+
+    /* OpenAI-compatible 'user' field doubles as our session id for KV
+     * cache reuse. Clients that pass the same user across turns get
+     * O(delta) prefill cost; clients that don't share the "default"
+     * slot (still works for single-user demos). */
+    v = json_find_key(body, "user");
+    if (v) json_extract_string(v, req->session_id, sizeof(req->session_id));
 
     /* Parse messages */
     v = json_find_key(body, "messages");
@@ -653,9 +748,21 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
         gen_cfg.on_token = sse_token_callback;
         gen_cfg.user_data = &sse_ctx;
 
-        char output[1]; /* tq_generate writes to output, but we use callback */
-        tq_generate(server->config.model, server->config.tokenizer,
-                    req.prompt, &gen_cfg, output, sizeof(output));
+        char output[1]; /* writes via callback, output buffer unused */
+        /* Per-session KV cache reuse:
+         * - Sessions are keyed by req.session_id (OpenAI 'user' field).
+         * - Each session has its own kv_state + cached_tokens.
+         * - LRU evicts the least recently used when the table is full.
+         * - The longest common prefix between cached tokens and the new
+         *   prompt is reused; only the suffix is prefilled. */
+        kv_session_t* sess = get_or_create_session(server, req.session_id,
+                                                    gen_cfg.kv_type,
+                                                    gen_cfg.value_quant_bits);
+        tq_generate_continue(server->config.model, server->config.tokenizer,
+                              sess->kv_state, req.prompt, &gen_cfg,
+                              &sess->cached_tokens, &sess->n_cached,
+                              &sess->cached_capacity,
+                              output, sizeof(output));
 
         /* Send final chunk with finish_reason */
         char final_chunk[SSE_CHUNK_SIZE];
@@ -685,8 +792,14 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
         gen_cfg.user_data = &collect;
 
         char output[1];
-        tq_generate(server->config.model, server->config.tokenizer,
-                    req.prompt, &gen_cfg, output, sizeof(output));
+        kv_session_t* sess = get_or_create_session(server, req.session_id,
+                                                    gen_cfg.kv_type,
+                                                    gen_cfg.value_quant_bits);
+        tq_generate_continue(server->config.model, server->config.tokenizer,
+                              sess->kv_state, req.prompt, &gen_cfg,
+                              &sess->cached_tokens, &sess->n_cached,
+                              &sess->cached_capacity,
+                              output, sizeof(output));
 
         const char* content = collect.buf ? collect.buf : "";
 
@@ -1143,6 +1256,11 @@ void tq_server_stop(tq_server_t* server) {
 void tq_server_free(tq_server_t* server) {
     if (!server) return;
     pthread_mutex_destroy(&server->inference_mutex);
+    /* Free all session KV caches */
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (server->sessions[i].kv_state) tq_free_state(server->sessions[i].kv_state);
+        if (server->sessions[i].cached_tokens) free(server->sessions[i].cached_tokens);
+    }
     if (g_server == server) g_server = NULL;
     free(server);
 }

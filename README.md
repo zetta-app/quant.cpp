@@ -37,27 +37,32 @@
 
 ## Quick Start
 
-**Terminal (one command):**
+**Ollama-style CLI (v0.12.0+):**
 ```bash
 pip install quantcpp
-quantcpp "What is gravity?"
+
+quantcpp pull llama3.2:1b               # download from HuggingFace
+quantcpp run llama3.2:1b                # interactive chat
+quantcpp serve llama3.2:1b -p 8080      # OpenAI-compatible HTTP server (SSE streaming)
+quantcpp client "Hi"                    # streaming client → server on :8080
+quantcpp list                           # show cached models
 ```
 
-**Python (3 lines):**
+Short aliases: `smollm2:135m`, `qwen3.5:0.8b`, `llama3.2:1b`. Auto-pulls on first `run`/`serve`. The `serve` subcommand exposes `POST /v1/chat/completions` (OpenAI-compatible) on port 8080 — clients pass `"stream": true` for SSE streaming, or omit it for a single JSON response. Built-in `quantcpp client` supports both modes (default: streaming, `--no-stream` for single response).
+
+**One-shot question:**
+```bash
+quantcpp run llama3.2:1b "What is gravity?"
+```
+
+**Python API (3 lines):**
 ```python
 from quantcpp import Model
 m = Model.from_pretrained("Llama-3.2-1B")
 print(m.ask("What is gravity?"))
 ```
 
-**Interactive chat:**
-```bash
-quantcpp
-# You: What is gravity?
-# AI: Gravity is a fundamental force...
-```
-
-Downloads Llama-3.2-1B (~750 MB) on first use, cached locally. No API key, no GPU. [Try in browser →](https://quantumaikr.github.io/quant.cpp/) · [**How it works — Interactive Guide →**](https://quantumaikr.github.io/quant.cpp/guide/)
+Downloads on first use, cached at `~/.cache/quantcpp/`. No API key, no GPU. [Try in browser →](https://quantumaikr.github.io/quant.cpp/) · [**Interactive Guide →**](https://quantumaikr.github.io/quant.cpp/guide/)
 
 ---
 
@@ -149,7 +154,9 @@ The bug was using the same tool for both. The fix is using each for what it's go
 **Full benchmark report:** [bench/results/document_level_rag_breakthrough.md](bench/results/document_level_rag_breakthrough.md)
 **Manifesto:** [docs/beyond-rag-manifesto.md](docs/beyond-rag-manifesto.md)
 
-> **Honest disclaimer:** v1 is a synthetic 5-section document with 7 questions on a single 3B model. We're not claiming this is LongBench. We *are* claiming it's enough to start a conversation about the failure mode chunk-RAG has been hiding. v2 with real benchmarks is in progress.
+> **Honest disclaimer:** v1 is a synthetic 5-section document with 7 questions on a single 3B model. We're not claiming this is LongBench. We *are* claiming it's enough to start a conversation about the failure mode chunk-RAG has been hiding.
+
+> **v2 update — the Working Memory Cliff (2026-04-11):** We followed up the v1 result with 204 NIAH trials across 1B and 3B at context lengths 256–2048, plus a 6-trial FP32-weights control. Both models hit a sharp cliff at **less than 1% of their nominal 128K context window** (1B Q8 at 512–1024, 3B Q4 at 1024–1280 *as a step function*). The 6.4× KV compression is bit-for-bit identical to FP32 baseline in 18 of 20 cells, so the cliff is a model property — not a KV property and not a weight-quantization artifact. The honest reframing: Beyond RAG works for documents that fit in the model's *effective* working memory, which is 2–3 orders of magnitude smaller than the nominal context window. Full tech report: [`docs/paper/working-memory-cliff.md`](docs/paper/working-memory-cliff.md). HF blog post draft: [`docs/paper/hf-blog-draft.md`](docs/paper/hf-blog-draft.md).
 
 ---
 

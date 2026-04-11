@@ -22,20 +22,34 @@
 
 ---
 
-## 3줄로 시작하기
+## 빠른 시작
 
+**Ollama 스타일 CLI (v0.12.0+):**
 ```bash
 pip install quantcpp
+
+quantcpp pull llama3.2:1b               # HuggingFace에서 다운로드
+quantcpp run llama3.2:1b                # 대화형 채팅
+quantcpp serve llama3.2:1b -p 8080      # OpenAI 호환 HTTP 서버 (SSE 스트리밍)
+quantcpp client "안녕"                   # 스트리밍 클라이언트 → :8080 서버
+quantcpp list                           # 캐시된 모델 목록
 ```
 
+짧은 별칭: `smollm2:135m`, `qwen3.5:0.8b`, `llama3.2:1b`. `run`/`serve` 첫 실행 시 자동 다운로드. `serve`는 OpenAI 호환 `POST /v1/chat/completions` 엔드포인트를 8080 포트에 제공합니다 — 클라이언트가 `"stream": true`를 보내면 SSE 토큰 단위 스트리밍, 생략하면 단일 JSON 응답. 내장 `quantcpp client`는 두 모드 모두 지원 (기본: 스트리밍, `--no-stream`: 단일 응답).
+
+**한 줄 질문:**
+```bash
+quantcpp run llama3.2:1b "중력이란 무엇인가요?"
+```
+
+**Python API (3줄):**
 ```python
 from quantcpp import Model
-
-m = Model.from_pretrained("Llama-3.2-1B")  # 모델 자동 다운로드 (~750 MB)
+m = Model.from_pretrained("Llama-3.2-1B")
 print(m.ask("중력이란 무엇인가요?"))
 ```
 
-API 키 없음. GPU 없음. 설정 없음. [브라우저에서 바로 체험 →](https://quantumaikr.github.io/quant.cpp/) · [**작동 원리 가이드 →**](https://quantumaikr.github.io/quant.cpp/guide/)
+API 키 없음. GPU 없음. 설정 없음. 모델은 `~/.cache/quantcpp/`에 캐시됩니다. [브라우저에서 바로 체험 →](https://quantumaikr.github.io/quant.cpp/) · [**작동 원리 가이드 →**](https://quantumaikr.github.io/quant.cpp/guide/)
 
 ---
 
@@ -57,6 +71,8 @@ Chunk-RAG가 잘못된 섹션을 검색하면, 모델은 **"모른다"고 하지
 6.4x KV 압축으로 전체 문서를 한 번에 로드하면, 모델은 **multi-hop 추론**까지 정확히 답합니다 (예: "성장 지역에 영향을 주는 위험은?" → 환율 변동, Section 3 + Section 5 정보 연결 필요).
 
 **핵심**: KV 압축은 단순한 메모리 절감이 아니라 **근본적으로 다른 RAG 접근**을 가능하게 합니다. RAG는 "어떤 문서를 볼지" 결정하고, long-context는 "그 문서를 얼마나 깊이 이해할지" 결정합니다. 전체 결과: [bench/results/document_level_rag_breakthrough.md](bench/results/document_level_rag_breakthrough.md)
+
+> **v2 후속 — Working Memory Cliff (2026-04-11)**: v1 결과를 더 큰 grid로 확장 측정했습니다 (1B/3B 모델, ctx 256-2048, 204 NIAH trials + FP32-weights 통제 실험). 두 모델 모두 명목 128K context window의 **1% 미만**에서 sharp cliff가 존재합니다 (1B Q8 cliff 512-1024, 3B Q4 cliff 1024-1280을 **step function**으로). 6.4× KV 압축은 20개 cell 중 18개에서 fp32 baseline과 bit-for-bit 일치 — cliff는 model property이지 KV/weight quantization artifact가 아닙니다. 정직한 재해석: Beyond RAG는 *유효* working memory 안에 들어가는 문서에 대해서만 동작하며, 그 크기는 명목 context window의 100분의 1에서 1000분의 1입니다. 전체 tech report: [`docs/paper/working-memory-cliff.md`](docs/paper/working-memory-cliff.md). HuggingFace blog post draft: [`docs/paper/hf-blog-draft.md`](docs/paper/hf-blog-draft.md).
 
 ---
 
