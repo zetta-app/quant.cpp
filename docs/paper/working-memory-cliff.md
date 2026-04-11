@@ -204,11 +204,19 @@ All measurements use English wikitext (biographical and encyclopedic prose). Cro
 
 We iterated five formats but finalized on one. A systematic prompt-sensitivity study (template-robustness-as-ceiling-measurement) would strengthen the contribution substantially.
 
-### 5.6 Sampling-noise estimation requires CLI fix
+### 5.6 Sampling-noise estimation: CLI bug discovered and fixed mid-round
 
-We initially planned a 60-trial random-seed sweep at the cliff cells (1B Q8 ctx=1024 and 3B Q4 ctx=1280) at temperature 0.7 to estimate sampling noise around the apparent 22 pp delta between FP32 and 6.4× compressed at the 1B cliff. The sweep was blocked by a CLI bug we surfaced during this Karpathy round: `tools/quant.c` documents a `-s <seed>` flag in its `--help` output but **does not implement it** — there is no parser case for `-s`, no `rng_seed` field in the generate config, and the underlying `tq_sample_topp` call hardcodes `rng_state = 42` per CLI invocation. As a result, all 60 sampled trials degenerated to "model path = 42", and we could not vary the sampling seed.
+We initially planned a 60-trial random-seed sweep at the cliff cells (1B Q8 ctx=1024 and 3B Q4 ctx=1280) at temperature 0.7 to estimate sampling noise around the apparent 22 pp delta between FP32 and 6.4× compressed at the 1B cliff. The first attempt produced a striking failure: all 60 trials returned `Loading model from <seed>... cannot open '<seed>'`. The cause was a CLI bug we surfaced during this round — `tools/quant.c` advertised a `-s <seed>` flag in its `--help` output but the parser had no case for it. The seed argument was silently dropped, and the *next* positional argument (the seed value, e.g. `42`) was bound to the model-path slot. The downstream sampler in `tq_generate` was hardcoded to `rng_state = 42` per CLI invocation, so even if the parser had worked, sampled outputs would have been identical across "different" seeds.
 
-This is independent of the cliff finding (the FP32-weights control in §4.5 is the much stronger result anyway), but it does mean the 1B cliff cell's apparent 22 pp gap between baseline and compressed remains unverified by per-cell sampling noise. With T=0 greedy decoding, all trials are deterministic and the gap reflects only per-(needle, depth) prompt-level variation, not stochastic sampling noise. We file the CLI fix as a separate quant.cpp issue and leave the seed-controlled sampling sweep to v2 of this report.
+We fixed both halves of the bug in a separate commit (`a8f6d8a`):
+- Added `unsigned long long rng_seed` to `tq_gen_config_t` in `include/turboquant/tq_engine.h` and the single-header `quant.h`.
+- Initialised `rng_seed = 42ULL` in `tq_default_gen_config` (back-compat preserving).
+- Wired `rng_state = config->rng_seed ? config->rng_seed : 42ULL` in both `src/engine/tq_generate.c` and `quant.h`.
+- Added the `-s` parser case in `tools/quant.c`.
+
+After the fix, `-s 42` and `-s 1337` produce demonstrably different outputs at `-T 0.7` (verified manually), and the no-`-s` default is bit-for-bit identical to `-s 42` (verified for backwards compatibility). All 35 build_metal/ tests still pass.
+
+The seed-controlled sampling sweep itself is still pending — running it post-fix is straightforward but was outside the time budget for this round. The 1B cliff cell's apparent 22 pp gap between baseline and compressed therefore remains unverified by per-seed sampling noise. With the CLI fix in place, a v2 of this report can simply re-run `bench/niah_seed_sweep.sh` (the script already exists, just bug-hit at the time of v1 submission).
 
 ## 6. Discussion: What "Long-Context Replaces RAG" Actually Means at the Edge
 

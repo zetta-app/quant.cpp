@@ -388,13 +388,26 @@ All measurements use English wikitext (biographical and encyclopedic prose). Cro
 We iterated five formats but finalized on one. A systematic prompt-sensitivity study (template-robustness-as-ceiling-measurement) would strengthen the contribution substantially.
 
 
-\subsection*{5.6 Sampling-noise estimation requires CLI fix}
+\subsection*{5.6 Sampling-noise estimation: CLI bug discovered and fixed mid-round}
 
 
-We initially planned a 60-trial random-seed sweep at the cliff cells (1B Q8 ctx=1024 and 3B Q4 ctx=1280) at temperature 0.7 to estimate sampling noise around the apparent 22 pp delta between FP32 and 6.4× compressed at the 1B cliff. The sweep was blocked by a CLI bug we surfaced during this Karpathy round: \texttt{tools/quant.c} documents a \texttt{-s <seed>} flag in its \texttt{--help} output but \textbf{does not implement it} — there is no parser case for \texttt{-s}, no \texttt{rng\_seed} field in the generate config, and the underlying \texttt{tq\_sample\_topp} call hardcodes \texttt{rng\_state = 42} per CLI invocation. As a result, all 60 sampled trials degenerated to "model path = 42", and we could not vary the sampling seed.
+We initially planned a 60-trial random-seed sweep at the cliff cells (1B Q8 ctx=1024 and 3B Q4 ctx=1280) at temperature 0.7 to estimate sampling noise around the apparent 22 pp delta between FP32 and 6.4× compressed at the 1B cliff. The first attempt produced a striking failure: all 60 trials returned \texttt{Loading model from <seed>... cannot open '<seed>'}. The cause was a CLI bug we surfaced during this round — \texttt{tools/quant.c} advertised a \texttt{-s <seed>} flag in its \texttt{--help} output but the parser had no case for it. The seed argument was silently dropped, and the \textit{next} positional argument (the seed value, e.g. \texttt{42}) was bound to the model-path slot. The downstream sampler in \texttt{tq\_generate} was hardcoded to \texttt{rng\_state = 42} per CLI invocation, so even if the parser had worked, sampled outputs would have been identical across "different" seeds.
 
 
-This is independent of the cliff finding (the FP32-weights control in §4.5 is the much stronger result anyway), but it does mean the 1B cliff cell's apparent 22 pp gap between baseline and compressed remains unverified by per-cell sampling noise. With T=0 greedy decoding, all trials are deterministic and the gap reflects only per-(needle, depth) prompt-level variation, not stochastic sampling noise. We file the CLI fix as a separate quant.cpp issue and leave the seed-controlled sampling sweep to v2 of this report.
+We fixed both halves of the bug in a separate commit (\texttt{a8f6d8a}):
+
+\begin{itemize}
+\item Added \texttt{unsigned long long rng\_seed} to \texttt{tq\_gen\_config\_t} in \texttt{include/turboquant/tq\_engine.h} and the single-header \texttt{quant.h}.
+\item Initialised \texttt{rng\_seed = 42ULL} in \texttt{tq\_default\_gen\_config} (back-compat preserving).
+\item Wired \texttt{rng\_state = config->rng\_seed ? config->rng\_seed : 42ULL} in both \texttt{src/engine/tq\_generate.c} and \texttt{quant.h}.
+\item Added the \texttt{-s} parser case in \texttt{tools/quant.c}.
+\end{itemize}
+
+
+After the fix, \texttt{-s 42} and \texttt{-s 1337} produce demonstrably different outputs at \texttt{-T 0.7} (verified manually), and the no-\texttt{-s} default is bit-for-bit identical to \texttt{-s 42} (verified for backwards compatibility). All 35 build\_metal/ tests still pass.
+
+
+The seed-controlled sampling sweep itself is still pending — running it post-fix is straightforward but was outside the time budget for this round. The 1B cliff cell's apparent 22 pp gap between baseline and compressed therefore remains unverified by per-seed sampling noise. With the CLI fix in place, a v2 of this report can simply re-run \texttt{bench/niah\_seed\_sweep.sh} (the script already exists, just bug-hit at the time of v1 submission).
 
 
 \section*{6. Discussion: What "Long-Context Replaces RAG" Actually Means at the Edge}
