@@ -132,6 +132,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --ctx <N>        Override max context length (default: 4096)\n");
     fprintf(stderr, "  --delta, -D      Enable delta KV compression (store key deltas)\n");
     fprintf(stderr, "  --k-window <N>   Age-based K: recent N tokens FP32, rest quantized\n");
+    fprintf(stderr, "  --save-kv <file> Save KV cache after generation (read once, query forever)\n");
+    fprintf(stderr, "  --load-kv <file> Load pre-computed KV cache (skip prefill)\n");
     fprintf(stderr, "  --version        Print version and exit\n");
     fprintf(stderr, "  --json           JSON output for --ppl (machine-parseable)\n");
     fprintf(stderr, "  --save-logits <f> Save per-token softmax (fp16) to file during --ppl\n");
@@ -195,6 +197,8 @@ int main(int argc, char** argv) {
     int chat_mode = 0;       /* 1 = auto-wrap prompt with chat template */
     const char* save_logits_file = NULL;
     const char* kl_baseline_file = NULL;
+    const char* save_kv_file = NULL;   /* --save-kv: save KV cache after generation */
+    const char* load_kv_file = NULL;   /* --load-kv: load pre-computed KV cache */
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -282,6 +286,10 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--version") == 0) {
             print_version();
             return 0;
+        } else if (strcmp(argv[i], "--save-kv") == 0 && i + 1 < argc) {
+            save_kv_file = argv[++i];
+        } else if (strcmp(argv[i], "--load-kv") == 0 && i + 1 < argc) {
+            load_kv_file = argv[++i];
         } else if (strcmp(argv[i], "--save-logits") == 0 && i + 1 < argc) {
             save_logits_file = argv[++i];
         } else if (strcmp(argv[i], "--kl-baseline") == 0 && i + 1 < argc) {
@@ -417,9 +425,9 @@ int main(int argc, char** argv) {
         text[nread] = '\0';
         fclose(fp);
 
-        /* Tokenize */
+        /* Tokenize. BPE merge now uses O(n log n) heap-based algorithm,
+         * so we can allocate a buffer large enough for the full text. */
         int max_tok = (int)(nread + 256);
-        if (max_tok > c->max_seq_len) max_tok = c->max_seq_len;
         int* tokens = (int*)malloc((size_t)max_tok * sizeof(int));
         if (!tokens) {
             free(text);
@@ -429,6 +437,8 @@ int main(int argc, char** argv) {
         }
         int n_tokens = tq_encode(tok, text, tokens, max_tok, 1);
         free(text);
+        /* Truncate to model's context window for eval */
+        if (n_tokens > c->max_seq_len) n_tokens = c->max_seq_len;
         fprintf(stderr, "PPL evaluation: %d tokens from %s\n", n_tokens, ppl_file);
 
         if (n_tokens < 2) {
@@ -1253,6 +1263,8 @@ int main(int argc, char** argv) {
     config.delta_kv = delta_kv;
     config.delta_iframe_interval = delta_iframe_int;
     config.k_highres_window = k_highres_window;
+    config.save_kv_path = save_kv_file;
+    config.load_kv_path = load_kv_file;
     config.on_token = print_token;
     config.user_data = NULL;
 

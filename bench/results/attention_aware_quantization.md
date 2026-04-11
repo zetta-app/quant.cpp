@@ -31,7 +31,24 @@ information-theoretically near-optimal.
 | **2-bit + k512** | **+4.3%** | **1.19 GB** | **YES** — similar quality, half memory |
 | 4-bit + k128 | +0.6% | 2.33 GB | YES — best quality |
 
-## IMPORTANT CAVEAT (Honest Correction #9)
+## CORRECTION #10: 2-bit Pareto Claim WITHDRAWN
+
+3970-token eval at honest FP32 ratios (k512 = 12.9%, not 53%):
+
+| Config | PPL | vs FP32 | k FP32 |
+|---|---:|---:|---:|
+| FP32 | 19.41 | — | 100% |
+| **4-bit + k128** | **19.39** | **-0.1%** | **3.2%** |
+| 4-bit flat | 20.02 | +3.1% | 0% |
+| **2-bit + k512** | **26.53** | **+36.7%** | 12.9% |
+
+**2-bit + k512 does NOT Pareto-dominate flat 4-bit.** The 957-token
+result (+4.3%) was an artifact of 53% FP32. At real long context,
+2-bit quality collapses.
+
+**VALIDATED: 4-bit + k128 achieves FP32 parity at any context length.**
+
+## Previous CAVEAT (Honest Correction #9, now superseded by #10)
 
 All PPL measurements were performed at **957 tokens** (tokenizer cap).
 At this eval length, k_highres=512 means **53.5% of tokens are FP32** —

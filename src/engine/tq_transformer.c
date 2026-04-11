@@ -1440,8 +1440,16 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                     traits->quantize(delta_buf, quant_dst, head_dim);
                 }
             } else {
-                /* Non-delta mode: quantize absolute key */
-                traits->quantize(key_src, quant_dst, head_dim);
+                /* Non-delta mode: quantize absolute key.
+                 * For head_dim > TQ_BK (e.g. Qwen3.5 head_dim=256),
+                 * process multiple TQ_BK-sized blocks per head. */
+                for (int blk = 0; blk < head_dim; blk += TQ_BK) {
+                    int blen = head_dim - blk;
+                    if (blen > TQ_BK) blen = TQ_BK;
+                    traits->quantize(key_src + blk,
+                                     quant_dst + (blk / TQ_BK) * traits->type_size,
+                                     blen);
+                }
             }
         }
     }
@@ -1508,7 +1516,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         float* atth = s->att + (size_t)h * c->max_seq_len;
         int kv_h = h / kv_mul;
 
-        if (use_int_attn && seq_len > int_attn_threshold) {
+        if (use_int_attn && seq_len > int_attn_threshold && head_dim <= TQ_BK) {
             /* Integer Q4xQ8 attention path.
              * Gather quantized key blocks for this KV head across all positions
              * into a contiguous buffer, then call the traits attention function.
@@ -1578,7 +1586,13 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                             + (size_t)l * s->quant_kv_stride
                             + (size_t)t * cache_n_kv_heads * s->quant_head_stride
                             + (size_t)kv_h * s->quant_head_stride;
-                        traits->dequantize(quant_src, dequant_buf, head_dim);
+                        /* Multi-block dequant for head_dim > TQ_BK */
+                        for (int blk = 0; blk < head_dim; blk += TQ_BK) {
+                            int blen = head_dim - blk;
+                            if (blen > TQ_BK) blen = TQ_BK;
+                            traits->dequantize(quant_src + (blk / TQ_BK) * traits->type_size,
+                                               dequant_buf + blk, blen);
+                        }
                         for (int d = 0; d < head_dim; d++) {
                             recon_key[d] += dequant_buf[d];
                         }
@@ -1659,7 +1673,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
              * contiguous block, which is cache-efficient.
              */
             if (!needs_post_norm && !k_hr_active && traits->attention != NULL
-                && attn_start == 0) {
+                && attn_start == 0 && head_dim <= TQ_BK) {
                 size_t head_block_bytes = s->quant_head_stride;
                 size_t pos_stride_bytes = (size_t)cache_n_kv_heads * head_block_bytes;
                 uint8_t* layer_base = (uint8_t*)s->quant_key_cache
@@ -1695,7 +1709,13 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                             + (size_t)l * s->quant_kv_stride
                             + (size_t)t * cache_n_kv_heads * s->quant_head_stride
                             + (size_t)kv_h * s->quant_head_stride;
-                        traits->dequantize(quant_src, dequant_buf, head_dim);
+                        /* Multi-block dequant for head_dim > TQ_BK */
+                        for (int blk = 0; blk < head_dim; blk += TQ_BK) {
+                            int blen = head_dim - blk;
+                            if (blen > TQ_BK) blen = TQ_BK;
+                            traits->dequantize(quant_src + (blk / TQ_BK) * traits->type_size,
+                                               dequant_buf + blk, blen);
+                        }
                         if (needs_post_norm) {
                             tq_rmsnorm(dequant_buf, dequant_buf, layer->k_norm,
                                        head_dim, c->rms_norm_eps);

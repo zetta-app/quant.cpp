@@ -2,15 +2,23 @@
   <img src="docs/assets/hero.png" alt="quant.cpp" width="600">
 </p>
 
-<h3 align="center">The SQLite of LLMs</h3>
-<p align="center"><b>Add AI to any C project with a single 16K-line file. Zero dependencies.</b></p>
+<h3 align="center">quant.cpp</h3>
+<p align="center"><b>Beyond RAG: load the whole document. On your laptop.</b></p>
 
 <p align="center">
-  Drop <a href="#-single-header-mode"><code>quant.h</code></a> (one file, 646 KB) into your project and get LLM inference.<br>
-  No CMake, no submodules, no package managers. Just <code>cc app.c -lm</code>.<br>
-  Runs everywhere a C compiler does: <b>iOS, Android, WASM, microcontrollers, MSVC</b>.<br>
-  Built-in <a href="#kv-cache-compression">KV cache compression</a>: 7x memory reduction at fp32-parity speed.
+  Chunking was a workaround for small context windows. We just made it unnecessary.<br>
+  6.4× KV compression brings full-document understanding to consumer hardware.<br>
+  <code>pip install quantcpp</code> — 16K lines of C, zero dependencies.
 </p>
+
+<table align="center">
+<tr>
+<td align="center"><b>7/7 vs 0/7</b><br>Beyond RAG measured</td>
+<td align="center"><b>6.4x compression</b><br>+3% PPL</td>
+<td align="center"><b>128K context</b><br>on 16GB Mac</td>
+<td align="center"><b>16K LOC</b><br>zero deps</td>
+</tr>
+</table>
 
 <p align="center">
   <a href="https://pypi.org/project/quantcpp/"><img src="https://img.shields.io/pypi/v/quantcpp.svg?label=PyPI&color=blue" alt="PyPI"></a>
@@ -21,55 +29,211 @@
   <br>
   <a href="#"><img src="https://img.shields.io/badge/models-7%20verified-blue" alt="Models"></a>
   <a href="https://quantumaikr.github.io/quant.cpp/"><img src="https://img.shields.io/badge/WASM_demo-192KB-purple" alt="WASM"></a>
+  <a href="https://quantumaikr.github.io/quant.cpp/guide/"><img src="https://img.shields.io/badge/guide-How_it_Works-blueviolet" alt="Guide"></a>
   <a href="#"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20WASM-orange" alt="Platforms"></a>
 </p>
 
 ---
 
-## Quick Start (30 seconds)
+## Quick Start
 
+**Terminal (one command):**
 ```bash
 pip install quantcpp
+quantcpp "What is gravity?"
 ```
 
+**Python (3 lines):**
 ```python
 from quantcpp import Model
-
-# Downloads a model automatically (one-time, cached)
-m = Model.from_pretrained("Llama-3.2-1B")   # ~750 MB, good quality
-# m = Model.from_pretrained("SmolLM2-135M") # ~135 MB, fastest download
+m = Model.from_pretrained("Llama-3.2-1B")
 print(m.ask("What is gravity?"))
 ```
 
-That's it. No API key, no GPU, no configuration. The model downloads once and is cached at `~/.cache/quantcpp/`.
+**Interactive chat:**
+```bash
+quantcpp
+# You: What is gravity?
+# AI: Gravity is a fundamental force...
+```
 
-**Bring your own model:**
+Downloads Llama-3.2-1B (~750 MB) on first use, cached locally. No API key, no GPU. [Try in browser →](https://quantumaikr.github.io/quant.cpp/) · [**How it works — Interactive Guide →**](https://quantumaikr.github.io/quant.cpp/guide/)
+
+---
+
+## Key Result: FP32 Quality at 3x Compression
+
+> **128 FP32 tokens + 4-bit everything else = FP32 quality, regardless of context length.**
+
+Measured on **Llama 3.2 3B, 3970 tokens** (k128 = 3.2% FP32):
+
+| Configuration | PPL | vs FP32 | KV Memory (32K) | Speed |
+|---|---:|---:|---:|---:|
+| FP32 (baseline) | 19.41 | — | 7.17 GB | baseline |
+| **4-bit + progressive** | **19.39** | **-0.1%** | **2.33 GB** | **+13%** |
+| 4-bit flat | 20.02 | +3.1% | 2.30 GB | +13% |
+
 ```python
-m = Model("path/to/any-model.gguf")  # any GGUF file works
+m = Model("model.gguf", progressive=True)  # ← FP32 quality, 3x less memory, 13% faster
+```
+
+**Why it works:** Transformer attention concentrates ~70% of weight on the last ~128 tokens. Keeping those at full precision while compressing everything else aligns storage precision with information value — near-optimal by rate-distortion theory.
+
+**Context-length invariant:** the same 128-token window works at 4K, 32K, or 128K. At 128K context, only 0.1% of tokens are FP32 — effectively all-4-bit with FP32 quality.
+
+---
+
+## 128K Context on 16GB Mac — Measured
+
+Llama 3.2 3B with 6.4x KV compression. **Real RSS measured on M1 Pro 16GB:**
+
+| Context | FP32 KV | **quant.cpp 6.4x** | Savings | Speed |
+|---:|---:|---:|---:|---:|
+| 16K | 8.5 GB | **6.5 GB** | **-2.0 GB** | 6.6 tok/s |
+| 32K | 9.6 GB | **8.2 GB** | **-1.4 GB** | 4.9 tok/s |
+| 65K | — | **8.5 GB** | — | 1.6 tok/s |
+| **128K** | **OOM** | **9.5 GB** | — | 0.8 tok/s |
+
+128K context with a 3B model in 9.5 GB. Generation speed is the same as FP32 (6.6 vs 6.5 tok/s at 16K).
+
+```python
+m = Model("llama-3b.gguf", aggressive=True, context_length=131072)  # 128K in 9.5 GB
+```
+
+---
+
+## Beyond RAG: 7/7 vs 0/7 — Measured
+
+> **Chunking RAG was a workaround for small context windows. The workaround became dogma.**
+> **Now context windows are big enough that we don't need the workaround.**
+
+A direct comparison on **Llama 3.2 3B Q8_0**, 5-section synthetic document, 7 questions (4 single-hop, 3 multi-hop):
+
+| Method | Accuracy | Behavior on failure |
+|---|---:|---|
+| **Chunk-RAG** (wrong section retrieved) | **0/7** | **Hallucinated all answers** |
+| Full Document (FP32 KV) | **7/7** | Correct |
+| **Full Document (6.4× compressed KV)** | **7/7** | **Correct — zero quality loss** |
+
+### The hidden failure mode of chunk-RAG
+
+When chunk-RAG retrieves the wrong section, the model **doesn't say "I don't know"** — it generates plausible-sounding lies:
+
+| Question | Chunk-RAG (wrong section) | Truth |
+|---|---|---|
+| "Who is the CTO?" | "John Smith" ❌ | Maria Santos |
+| "What is the revenue?" | "$1,000,000" ❌ | 847 million |
+| "R&D %?" | "15% of net income" ❌ | 14% of revenue |
+| "Who proposed?" | "John Smith, EVP" ❌ | James Park |
+
+This is the production risk no one measures: **silent hallucination on retrieval failure**. Your monitoring shows 100% uptime. Your users get wrong answers.
+
+### Beyond RAG: load the whole document instead
+
+With **6.4× KV compression**, a full 5-section document fits in context on a 16GB Mac. The model answers all 7 questions correctly, including multi-hop reasoning that requires linking information across sections:
+
+> **"What risk affects the growth region?"** → currency fluctuations
+> *(requires linking Section 3 "Asia growth" with Section 5 "Asia currency risk")*
+
+Chunk-RAG cannot do this — each chunk is retrieved independently.
+
+### RAG isn't dead. RAG is one tool.
+
+This isn't "RAG is dead." RAG is still the only way to handle 100K+ document corpora. But:
+- **RAG decides *which documents* to look at** (search problem)
+- **Long-context decides *how deeply* to understand them** (reasoning problem)
+
+The bug was using the same tool for both. The fix is using each for what it's good at.
+
+**Reproduce in 5 minutes:** [bench/document_level_rag_test.sh](bench/document_level_rag_test.sh)
+**Full benchmark report:** [bench/results/document_level_rag_breakthrough.md](bench/results/document_level_rag_breakthrough.md)
+**Manifesto:** [docs/beyond-rag-manifesto.md](docs/beyond-rag-manifesto.md)
+
+> **Honest disclaimer:** v1 is a synthetic 5-section document with 7 questions on a single 3B model. We're not claiming this is LongBench. We *are* claiming it's enough to start a conversation about the failure mode chunk-RAG has been hiding. v2 with real benchmarks is in progress.
+
+---
+
+## More Features
+
+**Bring your own model** — any GGUF file works:
+```python
+m = Model("path/to/any-model.gguf")
 for tok in m.generate("Once upon a time"):
     print(tok, end="", flush=True)
 ```
 
-**Your 8GB Mac just got 32K context:**
+**Save & restore context** — read a document once, query it forever:
 ```python
-# KV compression is ON by default — 3x less cache memory, 13% faster attention.
-m = Model("llama-3b.gguf", context_length=32768)  # fits in 8GB; FP32 would OOM
+m.ask("Read this long document: ...")
+m.save_context("document.kv")    # compressed KV → disk
+
+m2 = Model("model.gguf")
+m2.load_context("document.kv")   # instant restore, no re-processing
+m2.ask("What was on page 37?")
 ```
 
-| Context | FP32 KV (8GB Mac) | With KV compression | Speedup |
-|---:|---|---|---:|
-| 4K | OK | OK | +13% |
-| 16K | borderline | **OK** | +13% |
-| **32K** | **OOM** | **OK (5.5 GB)** | **+13%** |
-| 64K | OOM | 16GB Mac OK | +13% |
+**Infinite scrollback** — context never overflows, old tokens are shifted (not deleted):
+```python
+# Chat for hours — no "context window exceeded" error
+for tok in m.generate("Tell me an extremely long story"):
+    print(tok, end="", flush=True)
+```
 
-Pre-built wheels for Linux x86_64/aarch64, macOS arm64 (Python 3.9-3.13). Other platforms compile from source automatically.
+**Browser demo** — 193 KB WASM, one-click: [quantumaikr.github.io/quant.cpp](https://quantumaikr.github.io/quant.cpp/)
 
-**Try in your browser (no install):** [WASM Demo](https://quantumaikr.github.io/quant.cpp/) — 189 KB engine, click "Try Demo" to auto-load a model.
+Pre-built wheels: Linux x86_64/aarch64, macOS arm64 (Python 3.9–3.13). Others compile from source automatically.
 
 ---
 
-## The Problem
+## Why quant.cpp?
+
+When AI models have long conversations, they need memory called the **KV cache**. This memory grows with every message and often exceeds the model itself. quant.cpp compresses it **6.4x** and prunes unimportant tokens — so the same laptop can handle **6x longer conversations at 59% lower attention cost**.
+
+---
+
+## Beyond RAG: Document-Level Context
+
+Traditional RAG splits documents into small chunks (512 tokens), embeds them, and retrieves fragments. This works for large corpora but has fundamental limitations:
+
+- **Chunking destroys relationships** — information spanning pages 3, 47, and 103 can't be found by any single chunk search
+- **Retrieval can fail** — if the question uses different words than the document ("employee retention" vs "turnover rate")
+- **No multi-hop reasoning** — connecting A → B → C across chunks is impossible when each is retrieved independently
+
+**Long-context KV compression offers a complementary approach:**
+
+```
+Chunk-Level RAG:    100K docs → chunk(512) → embed → search → 5 chunks → LLM(4K)
+                                 ↑ information loss here
+
+Document-Level RAG: 100K docs → doc-level index → search → 2-3 full docs → LLM(64K-128K)
+                                                              ↑ KV compression makes this fit
+```
+
+RAG decides **which documents** to look at. Long-context decides **how deeply** to understand them. Each does what it's best at.
+
+| | Chunk-RAG alone | Long-Context alone | **RAG + Long-Context** |
+|--|----------------|-------------------|----------------------|
+| 100K documents | only option | impossible | **RAG selects** |
+| Cross-page reasoning | fails | works | **works** |
+| Multi-hop Q&A | limited | works | **works** |
+| Exact recall | depends on retrieval | depends on model size | **best of both** |
+| Infrastructure | vector DB + 4 systems | LLM + .kv file | **practical hybrid** |
+
+**Pre-computed KV library** — process once, query forever:
+```python
+# Overnight (GPU or batch): process each document once
+m.ask(open("operations_manual.txt").read())
+m.save_context("ops_manual.kv")       # 1.5 GB, compressed
+
+# Anytime (laptop, offline): instant load + unlimited questions
+m.load_context("ops_manual.kv")       # 0.5 seconds
+m.ask("What's the expense reimbursement process?")  # instant
+```
+
+Without 6.4x KV compression, loading a full 50K-token document into a 3B model needs ~17 GB of KV memory (impossible on 16GB Mac). With compression: ~2.7 GB (fits easily).
+
+<details>
+<summary><b>Technical detail: The KV cache problem</b></summary>
 
 LLM memory is dominated by the **KV cache**, not model weights. At 32K context, a 8B model's KV cache consumes **4GB** — more than the model itself. Every existing engine stores KV in FP16. We compress it.
 
@@ -83,6 +247,11 @@ LLM memory is dominated by the **KV cache**, not model weights. At 32K context, 
   |            |      6.9x smaller             |
   +------------+-------------------------------+
 ```
+
+</details>
+
+<details>
+<summary><b>Detailed benchmark tables</b></summary>
 
 ## The Result
 
@@ -197,6 +366,11 @@ On a 16GB Mac with Llama 3.2 3B: llama.cpp maxes out at ~50K tokens (FP16 KV). q
 
 ---
 
+</details>
+
+<details>
+<summary><b>How it compares to other engines</b></summary>
+
 ## How It Compares
 
 ### vs llama.cpp: Quality at same bit budget
@@ -232,18 +406,47 @@ Both are per-block methods. The quality gap comes from block size (128 vs 32), m
 | GGUF model loading | **✅ 7 architectures** | ❌ | ❌ | research only |
 | End-to-end inference | **✅** | kernel only | kernel only | kernel only |
 
+### "Why not just use llama.cpp?"
+
+You absolutely can. llama.cpp is excellent. The difference is **integration scope**, not capability:
+
+**llama.cpp = compiled library** (250K+ LOC). You link `libllama`, which pulls in GGML tensor graphs, Metal/CUDA backends, sampling, tokenizer. Great if your build system handles it — but it's a _library_ with a build step.
+
+**quant.cpp = one file** (16K LOC). `#include "quant.h"`, compile with `cc app.c -lm`. No CMake, no linker flags beyond libc. One translation unit.
+
+Where this difference matters in practice:
+
+```
+# quant.cpp — add LLM to any C project in 2 lines
+cc -O2 my_app.c -lm -lpthread -o my_app    # that's it
+
+# llama.cpp — requires building the library first
+cmake -B build && cmake --build build       # build libllama
+cc my_app.c -Ibuild/include -Lbuild -lllama -lm -lstdc++ -o my_app
+```
+
+| Scenario | quant.cpp | llama.cpp |
+|:---------|:---------:|:---------:|
+| **WASM browser demo** | 192 KB binary | GGML tensor graph too large |
+| **Microcontroller / RTOS** | `#include` only option (no FS, no linker) | Needs build system |
+| **Game engine plugin** (Unity/Unreal/Godot) | Drop one `.h` | Integrate 250K LOC build |
+| **Teaching / research** | Read in an afternoon | Excellent but large codebase |
+| **Quick prototype** | `pip install quantcpp` or 2-line C | More setup needed |
+| **GPU speed** | Basic | **Full Metal/CUDA** |
+| **Model coverage** | 7 architectures | **100+** |
+| **Production hardening** | Early stage | **Battle-tested** |
+
+> **Use llama.cpp** for speed on a workstation. **Use vLLM** for batch serving.
+> **Use quant.cpp** when you need to ship LLM inference _inside_ something — an app, a game, a browser tab, an embedded device — and integration simplicity matters more than GPU throughput.
+
 ### vs production inference engines
 
 |  | quant.cpp | llama.cpp | vLLM | MLX |
 |:--|:---------:|:---------:|:----:|:---:|
-| KV quantization | **TurboQuant + 6 schemes** | Q8_0/Q5_0 (2x) | -- | -- |
+| KV quantization | **7 schemes (3-7x)** | Q8_0/Q5_0 (2x) | -- | -- |
 | Code size | **72K LOC** | 250K+ | 100K+ | 50K+ |
 | Embeddable | **single header** | library | library | framework |
-| Read in an afternoon | **✅** | ❌ | ❌ | ❌ |
 | GPU throughput | basic | full | **best** | Metal |
-
-> **Use llama.cpp** for speed on a workstation. **Use vLLM** for batch serving.
-> **Use quant.cpp** when you need to ship LLM inference inside something — an app, a game, a website, a device.
 
 ---
 
@@ -571,10 +774,51 @@ quant.cpp is an independent implementation of published research. The Variant F 
 
 **Honest attribution**: Variant F's structure (RHT + scalar grid quantization) is closest to HIGGS in spirit, applied to KV cache like TurboQuant, with both the QJL residual and the outlier channel split removed through ablation. If you use quant.cpp in academic work, please cite all three (HIGGS, TurboQuant, PolarQuant) and this repository.
 
+</details>
+
+---
+
+## Transparency & Trust
+
+We believe trust is built by being honest about what we got wrong.
+
+<details>
+<summary><b>10 self-corrections — all found before any external report</b></summary>
+
+| # | Version | What we claimed wrong | What we corrected |
+|---|---|---|---|
+| 1 | v0.6.3 | "Lossless 7× compression" | Re-measured; not lossless |
+| 2 | v0.6.x | "Beats FP32 speed" | FP32 baseline was unoptimized scalar |
+| 3 | v0.7.x | "With Metal default" | CMake default is Metal=OFF |
+| 4 | v0.7.x | Interpreted a general comment as directed at us | Updated attribution |
+| 5 | v0.8.0 | kv_compress=1 caused abort | Fixed in v0.8.1 |
+| 6 | v0.8.0 | libc.free() cross-heap crash | Fixed with quant_free_string |
+| 7 | v0.8.1 | 65 KB memory leak per ask() | Fixed in v0.8.2 |
+| 8 | v0.9.0 | Disabled a working feature by mistake | Re-enabled with verification |
+| 9 | v0.10 | 957-token eval with 53% FP32 window | Documented caveat, fixed tokenizer |
+| 10 | v0.10 | "2-bit Pareto-dominates 4-bit" | Withdrawn — PPL +36.7% at long context |
+
+Every claim in this README is backed by reproducible benchmark data in `bench/results/`.
+</details>
+
+<details>
+<summary><b>Benchmark artifacts</b></summary>
+
+| File | What it measures |
+|---|---|
+| [`progressive_kv_compression.md`](bench/results/progressive_kv_compression.md) | 128-token FP32 window = FP32 quality at 3x compression |
+| [`attention_aware_quantization.md`](bench/results/attention_aware_quantization.md) | Full Pareto curve (including withdrawn 2-bit claim) |
+| [`long_context_kv_compression.md`](bench/results/long_context_kv_compression.md) | 32K context memory + speed measurements |
+| [`layer_adaptive_analysis.md`](bench/results/layer_adaptive_analysis.md) | Per-layer adaptation is unnecessary after RHT (negative result) |
+</details>
+
 ---
 
 <p align="center">
-  <b><a href="https://quantumai.kr">QuantumAI</a></b> · <a href="https://github.com/quantumaikr/quant.cpp">GitHub</a>
+  <a href="https://pypi.org/project/quantcpp/">PyPI</a> ·
+  <a href="https://quantumaikr.github.io/quant.cpp/">WASM Demo</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/quantumaikr/quant.cpp/issues">Issues</a>
 </p>
 
 <p align="center">

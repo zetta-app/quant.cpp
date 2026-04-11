@@ -245,22 +245,101 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         fprintf(stderr, "\n");
     }
 
-    /* Prefill: process all prompt tokens */
+    /* Load pre-computed KV cache if available (skip prefill) */
+    int pos_after_prefill = n_prompt;
+    if (config->load_kv_path) {
+        FILE* kv_fp = fopen(config->load_kv_path, "rb");
+        if (kv_fp) {
+            int32_t saved_pos = 0;
+            size_t kv_dim_save = 0;
+            fread(&saved_pos, sizeof(int32_t), 1, kv_fp);
+            fread(&kv_dim_save, sizeof(size_t), 1, kv_fp);
+            size_t kv_dim = (size_t)model->config.n_kv_heads * model->config.head_dim;
+            int max_seq = model->config.max_seq_len;
+            size_t layer_stride = (size_t)max_seq * kv_dim;
+            /* Read per-layer, respecting stride */
+            for (int l = 0; l < model->config.n_layers; l++) {
+                if (state->key_cache)
+                    fread(state->key_cache + l * layer_stride, sizeof(float), (size_t)saved_pos * kv_dim, kv_fp);
+                if (state->value_cache_fp16)
+                    fread(state->value_cache_fp16 + l * layer_stride, sizeof(uint16_t), (size_t)saved_pos * kv_dim, kv_fp);
+                else if (state->value_cache)
+                    fread(state->value_cache + l * layer_stride, sizeof(float), (size_t)saved_pos * kv_dim, kv_fp);
+            }
+            fclose(kv_fp);
+            pos_after_prefill = saved_pos;
+            size_t total_bytes = (size_t)model->config.n_layers * saved_pos * kv_dim * (sizeof(float) + (state->value_cache_fp16 ? sizeof(uint16_t) : sizeof(float)));
+            fprintf(stderr, "[load-kv] Loaded %d tokens from %s (%.1f MB)\n",
+                    saved_pos, config->load_kv_path,
+                    (double)total_bytes / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "[load-kv] Cannot open %s, running normal prefill\n", config->load_kv_path);
+        }
+    }
+
+    /* Prefill: process prompt tokens.
+     * If KV was loaded, the loaded context occupies positions [0..pos_after_prefill).
+     * The new prompt is appended starting at pos_after_prefill. */
+    int prefill_start = 0;
+    if (config->load_kv_path && pos_after_prefill > 0) {
+        prefill_start = pos_after_prefill;
+    }
     for (int i = 0; i < n_prompt; i++) {
-        tq_forward(model, state, prompt_tokens[i], i);
+        tq_forward(model, state, prompt_tokens[i], prefill_start + i);
+    }
+    pos_after_prefill = prefill_start + n_prompt;
+
+    /* Save KV cache after prefill if requested */
+    if (config->save_kv_path && pos_after_prefill > 0) {
+        FILE* kv_fp = fopen(config->save_kv_path, "wb");
+        if (kv_fp) {
+            int32_t save_pos = (int32_t)pos_after_prefill;
+            size_t kv_dim = (size_t)model->config.n_kv_heads * model->config.head_dim;
+            int max_seq = model->config.max_seq_len;
+            size_t layer_stride = (size_t)max_seq * kv_dim;
+            fwrite(&save_pos, sizeof(int32_t), 1, kv_fp);
+            fwrite(&kv_dim, sizeof(size_t), 1, kv_fp);
+            /* Write per-layer, only saved_pos positions */
+            size_t total = 0;
+            for (int l = 0; l < model->config.n_layers; l++) {
+                if (state->key_cache) {
+                    fwrite(state->key_cache + l * layer_stride, sizeof(float), (size_t)save_pos * kv_dim, kv_fp);
+                    total += (size_t)save_pos * kv_dim * sizeof(float);
+                }
+                if (state->value_cache_fp16) {
+                    fwrite(state->value_cache_fp16 + l * layer_stride, sizeof(uint16_t), (size_t)save_pos * kv_dim, kv_fp);
+                    total += (size_t)save_pos * kv_dim * sizeof(uint16_t);
+                } else if (state->value_cache) {
+                    fwrite(state->value_cache + l * layer_stride, sizeof(float), (size_t)save_pos * kv_dim, kv_fp);
+                    total += (size_t)save_pos * kv_dim * sizeof(float);
+                }
+            }
+            fclose(kv_fp);
+            fprintf(stderr, "[save-kv] Saved %d tokens to %s (%.1f MB)\n",
+                    save_pos, config->save_kv_path, (double)total / (1024.0 * 1024.0));
+        }
     }
 
     /* Repetition penalty setup */
     int vocab_size = model->config.vocab_size;
     float rep_penalty = config->rep_penalty;
     int rep_window = config->rep_window;
-    if (rep_window > 64) rep_window = 64;
-    int recent_tokens[64];
+    if (rep_window > 128) rep_window = 128;
+    int recent_tokens[128];
     int recent_count = 0;
+
+    /* N-gram loop detection: track recent 4-grams to detect infinite loops.
+     * Small models with T=0 greedy decoding enter repetition loops where
+     * the same ~30-token pattern repeats endlessly. KV quantization error
+     * compounds through these repetitions, eventually collapsing output
+     * into garbage. Detecting loops early prevents wasted compute. */
+    uint32_t ngram_hashes[64];
+    int ngram_hash_count = 0;
+    int loop_detected = 0;
 
     /* Seed recent tokens with tail of prompt for better penalty coverage */
     for (int i = (n_prompt > rep_window ? n_prompt - rep_window : 0); i < n_prompt; i++) {
-        recent_tokens[recent_count % 64] = prompt_tokens[i];
+        recent_tokens[recent_count % 128] = prompt_tokens[i];
         recent_count++;
     }
 
@@ -268,8 +347,8 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     if (rep_penalty > 1.0f) {
         int window = recent_count < rep_window ? recent_count : rep_window;
         for (int r = 0; r < window; r++) {
-            int idx = (recent_count - 1 - r) % 64;
-            if (idx < 0) idx += 64;
+            int idx = (recent_count - 1 - r) % 128;
+            if (idx < 0) idx += 128;
             int tok = recent_tokens[idx];
             if (tok >= 0 && tok < vocab_size) {
                 if (state->logits[tok] > 0)
@@ -281,14 +360,14 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     }
 
     /* Sample first generated token */
-    int pos = n_prompt;
+    int pos = pos_after_prefill;
     unsigned long long rng_state = 42;
     int next_token = tq_sample_topp(state->logits, vocab_size,
                                      config->temperature, config->top_p,
                                      &rng_state);
 
     /* Record first sampled token */
-    recent_tokens[recent_count % 64] = next_token;
+    recent_tokens[recent_count % 128] = next_token;
     recent_count++;
 
     int generated = 0;
@@ -483,8 +562,32 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
                                      &rng_state);
 
         /* Record sampled token for repetition penalty */
-        recent_tokens[recent_count % 64] = next_token;
+        recent_tokens[recent_count % 128] = next_token;
         recent_count++;
+
+        /* N-gram loop detection: hash recent 4-gram and check for repeats */
+        if (recent_count >= 4) {
+            uint32_t h = 0;
+            for (int r = 0; r < 4; r++) {
+                int gi = (recent_count - 4 + r) % 128;
+                h = h * 31 + (uint32_t)recent_tokens[gi];
+            }
+            int matches = 0;
+            int ring_len = ngram_hash_count < 64 ? ngram_hash_count : 64;
+            for (int r = 0; r < ring_len; r++) {
+                if (ngram_hashes[r] == h) matches++;
+            }
+            ngram_hashes[ngram_hash_count % 64] = h;
+            ngram_hash_count++;
+            if (matches >= 3) {
+                loop_detected = 1;
+                break;
+            }
+        }
+    }
+
+    if (loop_detected) {
+        fprintf(stderr, "[generate] repetition loop detected after %d tokens, stopping\n", generated);
     }
 
     /* Null-terminate output */

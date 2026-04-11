@@ -63,3 +63,6 @@ tq_run.dSYM/
 docs/assets/hero_backup.png
 build_nomt/
 build_nometal/
+
+.env
+
