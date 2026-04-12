@@ -427,12 +427,16 @@ static void handle_request(server_t* srv, int fd) {
 
             quant_generate(srv->ctx, prompt, collect_on_token, &cc);
 
-            char* escaped = (char*)malloc(cc.len * 2 + 64);
-            json_escape(cc.buf, escaped, cc.len * 2 + 64);
+            size_t escaped_cap = cc.len * 2 + 64;
+            char* escaped = (char*)malloc(escaped_cap);
+            if (!escaped) { free(cc.buf); pthread_mutex_unlock(&srv->mutex); return; }
+            json_escape(cc.buf, escaped, escaped_cap);
 
             int prompt_tokens = (int)(strlen(prompt) / 4);
-            char* resp = (char*)malloc(strlen(escaped) + 1024);
-            snprintf(resp, strlen(escaped) + 1024,
+            size_t resp_cap = strlen(escaped) + 2048;  /* generous: headers + JSON envelope */
+            char* resp = (char*)malloc(resp_cap);
+            if (!resp) { free(escaped); free(cc.buf); pthread_mutex_unlock(&srv->mutex); return; }
+            snprintf(resp, resp_cap,
                 "{\"id\":\"%s\",\"object\":\"chat.completion\","
                 "\"created\":%ld,\"model\":\"%s\","
                 "\"choices\":[{\"index\":0,"

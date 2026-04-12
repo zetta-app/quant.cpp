@@ -11,9 +11,11 @@ question (server, model loaded once).
 Enforces the cliff invariant: every prompt must be smaller than the
 model's effective working memory (see docs/phase3_rlv_challenge.md §3.2).
 """
+import atexit
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -88,6 +90,7 @@ class BudgetExceededError(Exception):
 _server_proc: subprocess.Popen | None = None
 _server_url: str | None = None
 _server_model: str | None = None
+_atexit_registered = False
 
 
 def _port_in_use(host: str, port: int) -> bool:
@@ -114,12 +117,23 @@ def start_server(
     verbose: bool = True,
 ) -> str:
     """Start a long-running quant-server. Returns the base URL."""
-    global _server_proc, _server_url, _server_model
+    global _server_proc, _server_url, _server_model, _atexit_registered
 
     if _server_proc is not None and _server_proc.poll() is None:
         if verbose:
             print(f"[server] already running at {_server_url}")
         return _server_url
+
+    # Validate model and binary exist before starting
+    if not Path(model).exists():
+        raise FileNotFoundError(f"Model not found: {model}")
+    if not Path(binary).exists():
+        raise FileNotFoundError(f"Server binary not found: {binary}")
+
+    # Register atexit handler to clean up server process on exit
+    if not _atexit_registered:
+        atexit.register(stop_server)
+        _atexit_registered = True
 
     # Pick an unused port
     while _port_in_use(host, port):
