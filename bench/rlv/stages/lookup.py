@@ -54,14 +54,34 @@ class LookupResult:
     method: str = ""  # "select" | "quote" | "select-fallback"
 
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+# Common abbreviations that end with a period but aren't sentence endings.
+_ABBREVIATIONS = {"dr", "mr", "mrs", "ms", "jr", "sr", "st", "vs", "etc",
+                  "prof", "rev", "gen", "corp", "inc", "ltd", "vol", "no",
+                  "approx", "dept", "est", "govt"}
 
 
 def _split_into_sentences(text: str) -> List[str]:
-    """Split text into sentences. Conservative: snap on period/!? followed
-    by whitespace. Filters out tiny fragments that aren't real sentences."""
-    parts = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
-    return [p for p in parts if len(p) >= 8]
+    """Split text into sentences. Snaps on period/!?/whitespace but avoids
+    splitting on common abbreviations (Dr., Mr., etc.) and single-letter
+    initials (J. K. Rowling).
+    Filters out tiny fragments (< 8 chars) that aren't real sentences."""
+    # Strategy: split on `. ` / `! ` / `? `, then re-join fragments that
+    # ended with an abbreviation or single letter.
+    raw = re.split(r"(?<=[.!?])\s+", text)
+    merged: List[str] = []
+    for frag in raw:
+        frag = frag.strip()
+        if not frag:
+            continue
+        if merged:
+            prev = merged[-1]
+            # Check if prev ended with an abbreviation or single initial
+            last_word = prev.rsplit(None, 1)[-1].rstrip(".").lower() if prev else ""
+            if last_word in _ABBREVIATIONS or (len(last_word) == 1 and last_word.isalpha()):
+                merged[-1] = prev + " " + frag
+                continue
+        merged.append(frag)
+    return [s for s in merged if len(s) >= 8]
 
 
 def _parse_sentence_index(text: str, n_sentences: int) -> int:
@@ -170,7 +190,7 @@ def lookup(
             window.append(sentences[i])
     answer = " ".join(window)
     if verbose:
-        print(f"[lookup] selected sentence {idx}/{len(sentences)}: {selected[:80]!r}")
+        print(f"[lookup] selected sentence {idx}/{len(sentences)}: {sentences[idx-1][:80]!r}")
     return LookupResult(
         answer=answer,
         region_text=region_text,

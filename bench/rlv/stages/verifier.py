@@ -78,7 +78,8 @@ def _extract_answer_key_terms(answer: str) -> tuple[list[str], list[str]]:
         key = term.lower()
         if key in seen:
             continue
-        if any(noise in key for noise in ANSWER_NOISE_TOKENS):
+        # Exact word match (not substring) — "text" must not filter "context"
+        if key in ANSWER_NOISE_TOKENS:
             continue
         seen.add(key)
         word_terms.append(term)

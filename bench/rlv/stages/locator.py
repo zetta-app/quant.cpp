@@ -343,9 +343,11 @@ def _llm_locate(
     result = _llm.llm_call(prompt, max_tokens=8)
     if verbose:
         print(f"[locator-llm] response: {result.text!r}")
+    # Parser accepts [0, n_max). Choices are 1-indexed, so n_max = N+1.
+    # Post-filter: reject 0 (not a valid choice) and > N (out of bounds).
     choice = _parse_locator_response(result.text, len(available) + 1)
     if choice < 1 or choice > len(available):
-        return -1
+        return -1  # parse failure or out-of-range → caller falls back to keyword winner
     return available[choice - 1]
 
 
@@ -368,6 +370,12 @@ def locate(
 
     available = [c for c in gist.chunks if c.chunk_id not in excluded]
     if not available:
+        if not gist.chunks:
+            # Empty document — return a dummy pointer
+            return RegionPointer(
+                chunk_id=0, confidence="low", method="fallback",
+                char_start=0, char_end=0, score=0.0,
+            )
         chunk = gist.chunks[0]
         return RegionPointer(
             chunk_id=0, confidence="low", method="fallback",

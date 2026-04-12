@@ -43,6 +43,7 @@ CLIFF_BUDGET = {
     "models/Llama-3.2-3B-Instruct-Q8_0.gguf": 1024,
     "models/Llama-3.2-1B-Instruct-Q8_0.gguf": 512,
     "models/Phi-3.5-mini-instruct-Q8_0.gguf": 1024,
+    "models/Phi-3.5-mini-instruct-Q4_K_M.gguf": 1024,
 }
 
 
@@ -124,7 +125,7 @@ def start_server(
         port += 1
 
     # Build command — unified server only supports -p and -j (no -k/-v/-H)
-    is_unified = "unified" in str(binary)
+    is_unified = str(Path(binary).name).startswith("quant-server-unified")
     if is_unified:
         cmd = [str(binary), str(model), "-p", str(port), "-j", str(threads)]
     else:
