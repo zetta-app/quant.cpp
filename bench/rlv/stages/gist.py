@@ -211,6 +211,12 @@ def build_gist(
     a richer index for cases where the chunk head text isn't
     representative of the section.
     """
+    # Guard: empty or whitespace-only documents produce no chunks
+    if not doc_text or not doc_text.strip():
+        if verbose:
+            print(f"[gist] doc_id={doc_id} — empty document, returning empty gist")
+        return Gist(doc_id=doc_id, n_chars=len(doc_text or ""), chunks=[])
+
     chunks_raw = chunk_document(doc_text, chunk_chars=chunk_chars)
     if verbose:
         print(f"[gist] doc_id={doc_id} len={len(doc_text)} chars, {len(chunks_raw)} chunks "

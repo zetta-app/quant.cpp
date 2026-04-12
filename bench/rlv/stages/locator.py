@@ -286,7 +286,8 @@ def _bm25_score_chunks(question: str, gist: Gist, excluded: List[int],
                       w[:min(4, len(w))] == term[:min(4, len(term))]))
             n = df.get(term, 0)
             idf = math.log((N - n + 0.5) / (n + 0.5) + 1.0) if n < N else 0.0
-            tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / max(avg_dl, 1)))
+            denom = tf + k1 * (1 - b + b * dl / max(avg_dl, 1))
+            tf_norm = (tf * (k1 + 1)) / max(denom, 1e-9)
             score += idf * tf_norm
         scores.append((chunk.chunk_id, score))
 
@@ -330,6 +331,8 @@ def _llm_locate(
 
     lines = []
     for choice_num, cid in enumerate(available, start=1):
+        if cid >= len(gist.chunks):
+            continue  # skip invalid chunk_id
         chunk = gist.chunks[cid]
         text = (chunk.full_text or chunk.head_text).replace("\n", " ").strip()
         # Show first 2 sentences (more context than just head)
@@ -405,10 +408,20 @@ def locate(
         rrf[cid] = rrf.get(cid, 0) + 1.0 / (rrf_k + rank)
     for rank, (cid, _) in enumerate(bm25_scores):
         rrf[cid] = rrf.get(cid, 0) + 1.0 / (rrf_k + rank)
-    rrf_ranked = sorted(rrf.items(), key=lambda x: x[1], reverse=True)
+    # Sort by (score DESC, chunk_id ASC) for deterministic tie-breaking
+    rrf_ranked = sorted(rrf.items(), key=lambda x: (-x[1], x[0]))
 
     if verbose:
         print(f"[locator] rrf    top3: {rrf_ranked[:3]}")
+
+    # Guard: if no chunks survived scoring, return first available
+    if not rrf_ranked:
+        chunk = available[0]
+        return RegionPointer(
+            chunk_id=chunk.chunk_id, confidence="low", method="fallback",
+            candidates=[], char_start=chunk.char_start, char_end=chunk.char_end,
+            score=0.0,
+        )
 
     # --- Step 4: LLM classification on top candidates ---
     # Always run LLM on the top 5 RRF candidates (not just when ambiguous)

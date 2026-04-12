@@ -53,6 +53,7 @@ class LLMResult:
     raw: str           # the full CLI stdout+stderr
     n_tokens: int      # generated token count
     elapsed: float     # wall seconds
+    is_error: bool = False  # True if the call failed (text contains error message)
 
 
 def estimate_tokens(text: str) -> int:
@@ -252,9 +253,11 @@ def llm_call(
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, ConnectionResetError,
+            TimeoutError, OSError) as e:
         elapsed = time.time() - t0
-        return LLMResult(text=f"[ERROR: {e}]", raw=str(e), n_tokens=0, elapsed=elapsed)
+        return LLMResult(text=f"[ERROR: {e}]", raw=str(e), n_tokens=0,
+                         elapsed=elapsed, is_error=True)
     elapsed = time.time() - t0
 
     text = ""

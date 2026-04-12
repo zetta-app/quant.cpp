@@ -133,6 +133,11 @@ def lookup(
             print(f"[lookup] chunk {region.chunk_id} ({len(region_text)} chars), "
                   f"{len(sentences)} sentences -> {mode}")
         result = _llm.llm_call(prompt, max_tokens=64)
+        if result.is_error:
+            return LookupResult(
+                answer=result.text, region_text=region_text,
+                chunk_id=region.chunk_id, raw_llm_output=result.text, method="error",
+            )
         return LookupResult(
             answer=result.text.strip(),
             region_text=region_text,
@@ -156,6 +161,11 @@ def lookup(
 
     # Only need a single digit — minimize tokens for slow CPU models
     result = _llm.llm_call(prompt, max_tokens=8)
+    if result.is_error:
+        return LookupResult(
+            answer=result.text, region_text=region_text,
+            chunk_id=region.chunk_id, raw_llm_output=result.text, method="error",
+        )
     idx = _parse_sentence_index(result.text, len(sentences))
 
     if idx < 1:
