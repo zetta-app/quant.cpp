@@ -1035,33 +1035,35 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             tq_matmul(s->q, s->xb, layer->wq, n_heads * head_dim, dim);
         }
     }
-    if (layer->wk_q2) {
-        TQ_MATMUL_Q2_OR_1BIT(s->k, s->xb, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
-    } else if (layer->wk_q4) {
-        tq_matmul_q4q2_preq(s->k, layer->wk_q4, layer->wk_q4s, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
-    } else if (layer->wk_q8) {
-        tq_matmul_q8(s->k, s->xb, layer->wk_q8, layer->wk_q8s, kv_dim, dim);
-    } else if (has_gguf) {
-        tq_matmul_gguf(s->k, s->xb, layer->gguf_wk, layer->gguf_wk_type, kv_dim, dim);
-    } else {
-        tq_matmul(s->k, s->xb, layer->wk, kv_dim, dim);
-    }
-    /* V projection: if V weights are absent (Gemma 4 K=V), copy K to V */
+    /* Check V weight presence early — needed by Gemma 4 V-norm below */
     int has_v_weights = (layer->wv_q2 || layer->wv_q4 || layer->wv_q8 ||
                          layer->gguf_wv || layer->wv);
-    if (!has_v_weights) {
-        /* K=V: value is same as key (attention_k_eq_v) */
-        memcpy(s->v, s->k, kv_dim * sizeof(float));
-    } else if (layer->wv_q2) {
-        TQ_MATMUL_Q2_OR_1BIT(s->v, s->xb, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
-    } else if (layer->wv_q4) {
-        tq_matmul_q4q2_preq(s->v, layer->wv_q4, layer->wv_q4s, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
-    } else if (layer->wv_q8) {
-        tq_matmul_q8(s->v, s->xb, layer->wv_q8, layer->wv_q8s, kv_dim, dim);
-    } else if (has_gguf) {
-        tq_matmul_gguf(s->v, s->xb, layer->gguf_wv, layer->gguf_wv_type, kv_dim, dim);
-    } else {
-        tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
+    if (!has_fused_qkv_layer) {
+        if (layer->wk_q2) {
+            TQ_MATMUL_Q2_OR_1BIT(s->k, s->xb, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
+        } else if (layer->wk_q4) {
+            tq_matmul_q4q2_preq(s->k, layer->wk_q4, layer->wk_q4s, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
+        } else if (layer->wk_q8) {
+            tq_matmul_q8(s->k, s->xb, layer->wk_q8, layer->wk_q8s, kv_dim, dim);
+        } else if (has_gguf) {
+            tq_matmul_gguf(s->k, s->xb, layer->gguf_wk, layer->gguf_wk_type, kv_dim, dim);
+        } else {
+            tq_matmul(s->k, s->xb, layer->wk, kv_dim, dim);
+        }
+        if (!has_v_weights) {
+            /* K=V: value is same as key (attention_k_eq_v) */
+            memcpy(s->v, s->k, kv_dim * sizeof(float));
+        } else if (layer->wv_q2) {
+            TQ_MATMUL_Q2_OR_1BIT(s->v, s->xb, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
+        } else if (layer->wv_q4) {
+            tq_matmul_q4q2_preq(s->v, layer->wv_q4, layer->wv_q4s, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
+        } else if (layer->wv_q8) {
+            tq_matmul_q8(s->v, s->xb, layer->wv_q8, layer->wv_q8s, kv_dim, dim);
+        } else if (has_gguf) {
+            tq_matmul_gguf(s->v, s->xb, layer->gguf_wv, layer->gguf_wv_type, kv_dim, dim);
+        } else {
+            tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
+        }
     }
 
     /* Flush batched Q+K+V GPU dispatches before CPU-side RoPE/attention */

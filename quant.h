@@ -12942,6 +12942,43 @@ void tq_free_model(tq_model_t* model) {
         }
     }
     free(model->moe_config);
+
+    /* Free dequantized norm/embedding buffers (GGUF path only).
+     * In the GGUF path, dequant_tensor_fp32() individually malloc's each
+     * norm weight. In the SafeTensor path, these point into _converted_data
+     * (freed above), so we must NOT free them again. */
+    if (model->gguf_ctx && model->layers) {
+        for (int l = 0; l < model->config.n_layers; l++) {
+            tq_layer_weights_t* layer = &model->layers[l];
+            free(layer->attn_norm);
+            free(layer->ffn_norm);
+            free(layer->q_norm);
+            free(layer->k_norm);
+            free(layer->post_attn_norm);
+            free(layer->post_ffn_norm);
+            free(layer->pre_ffn_norm);
+            free(layer->post_ffn_norm_1);
+            free(layer->pre_ffn_norm_2);
+            free(layer->post_ffn_norm_2);
+            free(layer->ple_norm);
+            free(layer->delta_a_log);
+            free(layer->delta_conv1d);
+            free(layer->delta_dt_bias);
+            free(layer->delta_in_proj_qkv);
+            free(layer->delta_in_proj_z);
+            free(layer->delta_norm);
+            free(layer->delta_in_proj_a);
+            free(layer->delta_in_proj_b);
+            free(layer->delta_out_proj);
+        }
+        free(model->token_embedding);
+        free(model->output_weight);
+        free(model->output_norm);
+        free(model->rope_freqs);
+        free(model->ple_proj);
+        free(model->ple_proj_norm);
+    }
+
     free(model->layers);
 
     /* Free GGUF context (handles munmap internally) */

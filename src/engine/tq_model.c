@@ -3739,6 +3739,21 @@ tq_model_t* tq_load_gguf(const char* path) {
             c->is_moe ? ", MoE" : "",
             c->hidden_dim, c->n_heads, c->n_kv_heads, c->vocab_size);
 
+    /* Hard-fail when no attention layers were detected. Without this,
+     * the forward pass runs against zero-initialized weights → garbage.
+     * This was the root cause of the Phi-3 first-time experience bug:
+     * "loaded 32 layers (0 self_attn)" looked like success. */
+    if (n_attn_layers == 0 && c->delta_n_heads == 0) {
+        fprintf(stderr,
+            "tq_load_gguf: ERROR — model architecture '%s' is not supported.\n"
+            "  Detected 0 self_attn layers and no DeltaNet weights.\n"
+            "  This usually means the model uses an unsupported attention\n"
+            "  tensor layout. See docs/supported_models.md.\n",
+            gguf->arch[0] ? gguf->arch : "unknown");
+        tq_free_model(model);
+        return NULL;
+    }
+
     /* ============================================================
      * Load-time weight conversion: GGUF -> Q4
      *
