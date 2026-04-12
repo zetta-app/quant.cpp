@@ -124,6 +124,7 @@ def answer_question(
     ver = verifier_stage.verify(
         question, look.answer, gist,
         region_text=look.region_text,
+        chunk_id=look.chunk_id,
         verbose=verbose,
     )
     timings["stage4_verifier"] = time.time() - t0

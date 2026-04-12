@@ -51,7 +51,8 @@ class GistChunk:
     chunk_id: int
     char_start: int
     char_end: int
-    head_text: str = ""           # first ~200 chars of the chunk's actual text — locator's primary signal
+    head_text: str = ""           # first ~200 chars (used by LLM-fallback outline)
+    full_text: str = ""           # complete chunk text (used by Day 3 non-LLM keyword scoring)
     entities: List[str] = field(default_factory=list)
     summary: str = ""             # optional LLM-generated summary
 
@@ -104,22 +105,92 @@ def _extract_entities(text: str) -> List[str]:
     return out
 
 
+MIN_CHUNK_CHARS = 100
+MAX_CHUNK_CHARS = 800
+
+# Day 4: char-based fallback uses larger chunks than paragraph-aware mode.
+# For continuous narrative docs (no \\n\\n breaks) like wikitext, smaller
+# chunks (~500 chars) made the locator's job too hard — 60+ chunks with
+# overlapping topic words. Larger chunks (~1500 chars / ~500 tokens, well
+# within the 1024-token cliff) give the locator fewer, more topically
+# distinct candidates AND give the lookup model more cross-sentence
+# context for pronoun resolution.
+NARRATIVE_CHUNK_CHARS = 1500
+NARRATIVE_MAX_CHUNK_CHARS = 2000
+
+
 def chunk_document(doc_text: str, chunk_chars: int = CHUNK_CHARS) -> List[tuple]:
-    """Split a document into chunks at sentence boundaries.
-    Returns a list of (start, end, text) tuples."""
-    chunks = []
-    pos = 0
+    """Day 3-4: paragraph-aware + char-based chunker.
+
+    Strategy:
+      1. If the doc has paragraph breaks (`\\n\\n`), use them as the
+         primary split — preserves section structure (e.g., "Section 3:
+         Growth Strategy" stays in one chunk). Default chunk_chars=500.
+      2. Merge tiny adjacent paragraphs (< MIN_CHUNK_CHARS).
+      3. Split any oversized chunk (> MAX_CHUNK_CHARS) at sentence boundaries.
+      4. If there are no paragraph breaks, use the *narrative* path with
+         larger chunks (NARRATIVE_CHUNK_CHARS=1500). The narrative path
+         is for unstructured wikitext-style content where many small
+         chunks would dilute the locator's discrimination power.
+
+    Returns a list of (start, end, text) tuples.
+    """
     n = len(doc_text)
+
+    if "\n\n" in doc_text:
+        raw_parts: List[tuple] = []
+        pos = 0
+        while pos < n:
+            nxt = doc_text.find("\n\n", pos)
+            if nxt < 0:
+                raw_parts.append((pos, n))
+                break
+            raw_parts.append((pos, nxt))
+            pos = nxt + 2
+
+        merged: List[tuple] = []
+        for start, end in raw_parts:
+            if not merged:
+                merged.append((start, end))
+                continue
+            prev_start, prev_end = merged[-1]
+            if (prev_end - prev_start) < MIN_CHUNK_CHARS:
+                merged[-1] = (prev_start, end)
+            else:
+                merged.append((start, end))
+
+        out: List[tuple] = []
+        for start, end in merged:
+            length = end - start
+            if length <= MAX_CHUNK_CHARS:
+                out.append((start, end, doc_text[start:end]))
+                continue
+            sub_start = start
+            while sub_start < end:
+                sub_end = min(sub_start + chunk_chars, end)
+                if sub_end < end:
+                    sb = doc_text.find(". ", sub_end)
+                    if sb > 0 and sb < end and sb - sub_end < 300:
+                        sub_end = sb + 2
+                out.append((sub_start, sub_end, doc_text[sub_start:sub_end]))
+                sub_start = sub_end
+        return out
+
+    # Char-based narrative fallback (no paragraph structure) — uses
+    # larger chunks for unstructured wikitext-style content.
+    target = max(chunk_chars, NARRATIVE_CHUNK_CHARS)
+    max_size = NARRATIVE_MAX_CHUNK_CHARS
+    out = []
+    pos = 0
     while pos < n:
-        end = min(pos + chunk_chars, n)
-        # Snap to next sentence boundary so chunks aren't cut mid-sentence
+        end = min(pos + target, n)
         if end < n:
             sb_next = doc_text.find(". ", end)
-            if sb_next > 0 and sb_next - end < 300:
+            if sb_next > 0 and sb_next - end < 400 and sb_next + 2 - pos <= max_size:
                 end = sb_next + 2
-        chunks.append((pos, end, doc_text[pos:end]))
+        out.append((pos, end, doc_text[pos:end]))
         pos = end
-    return chunks
+    return out
 
 
 def build_gist(
@@ -148,6 +219,7 @@ def build_gist(
     out_chunks = []
     for i, (start, end, chunk_text) in enumerate(chunks_raw):
         head_text = chunk_text[:HEAD_TEXT_CHARS].strip()
+        full_text = chunk_text.strip()
         entities = _extract_entities(chunk_text)
 
         summary = ""
@@ -161,6 +233,7 @@ def build_gist(
             char_start=start,
             char_end=end,
             head_text=head_text,
+            full_text=full_text,
             entities=entities,
             summary=summary,
         )

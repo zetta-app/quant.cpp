@@ -68,6 +68,7 @@ def research(
         new_verify = verifier.verify(
             question, new_lookup.answer, gist,
             region_text=new_lookup.region_text,
+            chunk_id=new_lookup.chunk_id,
             verbose=verbose,
         )
 

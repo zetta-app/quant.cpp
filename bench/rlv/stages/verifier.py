@@ -26,6 +26,16 @@ from dataclasses import dataclass
 from . import _llm
 from .gist import Gist
 from .lookup import LookupResult
+from .locator import _question_keywords, _term_in_text, _keyword_locate, _normalize as _loc_normalize
+
+
+# Day 3: model-side preamble tokens that show up in answer text but
+# aren't content. Filter so they don't get extracted as "key terms".
+ANSWER_NOISE_TOKENS = {
+    "quote", "quotte", "quoted", "quotation", "citation", "citing",
+    "section", "sentence", "answer", "below", "above", "following",
+    "according", "context", "based", "text", "passage", "paragraph",
+}
 
 
 VERIFY_LLM_PROMPT_TEMPLATE = """{region_text}
@@ -53,48 +63,57 @@ def _normalize(s: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", s.lower())
 
 
-def _extract_answer_key_terms(answer: str) -> list[str]:
-    """Pull out the candidate "fact tokens" from an answer that we expect
-    to find in the region text. Capitalized words, multi-word names,
-    numbers."""
-    # Names like "John Williams" or "Maria Santos"
+def _extract_answer_key_terms(answer: str) -> tuple[list[str], list[str]]:
+    """Day 3: returns (word_terms, number_terms) so the matcher can apply
+    different rules — words use fuzzy matching for Q4 jitter, numbers
+    use exact match (2002 must NOT fuzzy-match 2023). Filters
+    ANSWER_NOISE_TOKENS so model preambles don't get extracted as facts."""
     multi_cap = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", answer)
-    # Single capitalized words (in case the model only said "Williams")
     single_cap = re.findall(r"\b[A-Z][a-z]{3,}\b", answer)
-    # Numbers (years, amounts)
     nums = re.findall(r"\b\d{2,5}\b", answer)
-    # Combine, dedupe, prefer multi-word over single
+
     seen = set()
-    out = []
-    for term in multi_cap + single_cap + nums:
+    word_terms: list[str] = []
+    for term in multi_cap + single_cap:
         key = term.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(term)
-    return out[:8]
+        if key in seen:
+            continue
+        if any(noise in key for noise in ANSWER_NOISE_TOKENS):
+            continue
+        seen.add(key)
+        word_terms.append(term)
+
+    seen_n = set()
+    number_terms: list[str] = []
+    for n in nums:
+        if n in seen_n:
+            continue
+        seen_n.add(n)
+        number_terms.append(n)
+
+    return word_terms[:8], number_terms[:4]
 
 
 def _fuzzy_word_in_region(word: str, region_norm: str) -> bool:
-    """Return True if a single word appears in the normalized region,
-    tolerant of Q4 jitter that inserts/duplicates characters mid-word.
-
-    Strategy: try the full word, then progressively shorter prefixes
-    down to 4 chars. This handles:
-      - "Williams" → "williams" (exact)
-      - "Williams" → "williamlims" (model output) where the first 5 chars
-        ("willi") still match the region's "williams" via prefix
-      - "Williamlims" → "williams" via reverse prefix (the answer prefix
-        is in the region prefix)
-    """
+    """Day 3: word-boundary-aware fuzzy match. Iterates region words and
+    checks shared-prefix similarity. Avoids cross-word substring traps
+    like "event" matching "revenue" via "even"."""
     if not word or len(word) < 3:
         return False
-    if word in region_norm:
-        return True
-    # Forward prefix matching: any prefix of `word` (≥4 chars) found in region
-    for length in range(len(word), 3, -1):
-        if length < 4:
-            break
-        if word[:length] in region_norm:
+    w = word.lower()
+    min_prefix = 4 if len(w) > 6 else 3
+    for rw in region_norm.split():
+        if not rw:
+            continue
+        if rw == w:
+            return True
+        shared = 0
+        for a, b in zip(w, rw):
+            if a == b:
+                shared += 1
+            else:
+                break
+        if shared >= min_prefix and shared >= min(len(w), len(rw)) - 2:
             return True
     return False
 
@@ -119,30 +138,83 @@ def _fuzzy_in_region(term: str, region_norm: str) -> bool:
     return matched >= max(1, len(words) // 2 + (len(words) % 2))
 
 
-def _literal_verify(answer: str, region_text: str) -> tuple[str, str]:
-    """Fast non-LLM citation check. Returns (verdict, reason)."""
+def _question_grounded_via_locator(
+    question: str,
+    chunk_id: int | None,
+    gist: Gist | None,
+) -> tuple[bool, float, float, str]:
+    """Day 3 architectural fix: re-use the locator's keyword scoring to
+    confirm the chunk being verified is a near-top match for the question.
+
+    Citation-grounding alone catches hallucination but NOT locator errors:
+    if the locator picked the wrong chunk, the model dutifully extracts
+    a sentence from it, and the answer's terms trivially match the region.
+    Re-running the locator scoring asks the right question: "is this
+    chunk really the best match for the question?"
+
+    Returns (is_grounded, chunk_score, best_other_score, reason).
+    """
+    if gist is None or chunk_id is None or not gist.chunks:
+        return True, 0.0, 0.0, "no gist; trust answer-grounding"
+    best_id, best_score, all_scores = _keyword_locate(question, gist, [])
+    chunk_score = next((s for c, s in all_scores if c == chunk_id), 0.0)
+    if best_score < 1.0:
+        return True, chunk_score, best_score, "weak signal; defer to answer check"
+    if chunk_score >= 0.6 * best_score and chunk_score >= 1.0:
+        return True, chunk_score, best_score, f"chunk_score={chunk_score:.1f}/best={best_score:.1f}"
+    return False, chunk_score, best_score, (
+        f"chunk_score={chunk_score:.1f} << best={best_score:.1f}"
+    )
+
+
+def _literal_verify(
+    question: str,
+    answer: str,
+    region_text: str,
+    *,
+    chunk_id: int | None = None,
+    gist: Gist | None = None,
+) -> tuple[str, str]:
+    """Fast non-LLM citation check. Day 3: two checks must both pass.
+      1. Question-grounded (via locator scoring) — catches locator errors
+      2. Answer-grounded — catches hallucination
+    """
     if not answer.strip() or not region_text.strip():
         return "UNSURE", "empty answer or region"
 
     region_norm = _normalize(region_text)
-    answer_norm = _normalize(answer)
-    key_terms = _extract_answer_key_terms(answer)
 
-    if not key_terms:
-        # Answer has no extractable entities — can't do literal check
-        return "UNSURE", "no entity terms in answer"
+    q_ok, q_score, q_best, q_reason = _question_grounded_via_locator(
+        question, chunk_id, gist,
+    )
+    if not q_ok:
+        return "CONTRADICTED", f"question not grounded ({q_reason}) — likely wrong chunk"
 
-    found = [t for t in key_terms if _fuzzy_in_region(t, region_norm)]
-    not_found = [t for t in key_terms if t not in found]
+    word_terms, number_terms = _extract_answer_key_terms(answer)
+    if not word_terms and not number_terms:
+        return "CONFIDENT", f"q-grounded ({q_reason}); no extractable answer entities"
 
-    # Decision rule: if at least one key term is found and the found
-    # ratio is at least 50%, the answer is grounded in the region.
-    if len(found) >= 1 and len(found) / len(key_terms) >= 0.5:
-        return "CONFIDENT", f"found {len(found)}/{len(key_terms)} key terms in region: {found[:3]}"
-    elif len(found) >= 1:
-        return "UNSURE", f"only {len(found)}/{len(key_terms)} key terms found, ambiguous"
+    word_found = [t for t in word_terms if _fuzzy_in_region(t, region_norm)]
+    num_found = [n for n in number_terms if n in region_norm]
+
+    total_terms = len(word_terms) + len(number_terms)
+    total_found = len(word_found) + len(num_found)
+
+    if total_found >= 1 and total_found / total_terms >= 0.5:
+        return "CONFIDENT", (
+            f"q-grounded ({q_reason}); "
+            f"a-matched={total_found}/{total_terms} ({(word_found + num_found)[:3]})"
+        )
+    elif total_found >= 1:
+        return "UNSURE", (
+            f"q-grounded ({q_reason}); "
+            f"only {total_found}/{total_terms} answer terms found"
+        )
     else:
-        return "CONTRADICTED", f"none of {key_terms[:3]} appear in the region — likely fabricated"
+        return "CONTRADICTED", (
+            f"q-grounded ({q_reason}); "
+            f"none of {(word_terms + number_terms)[:3]} in region — likely fabricated"
+        )
 
 
 def _parse_llm_verify_response(text: str) -> tuple[str, str]:
@@ -170,6 +242,7 @@ def verify(
     gist: Gist,
     *,
     region_text: str = "",
+    chunk_id: int | None = None,
     use_llm_fallback: bool = True,
     verbose: bool = False,
 ) -> VerifyResult:
@@ -185,7 +258,10 @@ def verify(
     """
     method = "literal"
     if region_text:
-        verdict, reason = _literal_verify(answer, region_text)
+        verdict, reason = _literal_verify(
+            question, answer, region_text,
+            chunk_id=chunk_id, gist=gist,
+        )
         if verdict != "UNSURE" or not use_llm_fallback:
             if verbose:
                 print(f"[verifier] literal -> {verdict} ({reason})")

@@ -437,31 +437,65 @@ static int parse_messages(const char* p, chat_request_t* req) {
     return 0;
 }
 
-/* Build a ChatML-formatted prompt from messages */
-static char* build_prompt(const chat_request_t* req) {
-    /* Calculate total size needed */
-    size_t total = 1; /* null terminator */
-    for (int i = 0; i < req->n_messages; i++) {
-        /* <|im_start|>role\ncontent<|im_end|>\n */
-        total += 14 + strlen(req->messages[i].role) + 1 +
-                 (req->messages[i].content ? strlen(req->messages[i].content) : 0) +
-                 12 + 1;
+/* Chat template types — detected from model config */
+typedef enum {
+    CHAT_TEMPLATE_CHATML,    /* <|im_start|>role\n...<|im_end|>\n (Llama, Qwen, default) */
+    CHAT_TEMPLATE_PHI3,      /* <|system|>\n...<|end|>\n / <|user|>\n...<|end|>\n<|assistant|>\n */
+} chat_template_t;
+
+static chat_template_t detect_chat_template(const tq_model_config_t* config) {
+    if (config && config->has_fused_qkv) {
+        return CHAT_TEMPLATE_PHI3;
     }
-    /* Add assistant prompt at end */
-    total += 14 + 9 + 1; /* <|im_start|>assistant\n */
+    return CHAT_TEMPLATE_CHATML;
+}
+
+/* Build a formatted prompt from messages — template selected by model architecture */
+static char* build_prompt(const chat_request_t* req, chat_template_t tmpl) {
+    /* Calculate total size needed (generous upper bound) */
+    size_t total = 256; /* headers + null */
+    for (int i = 0; i < req->n_messages; i++) {
+        total += 64 + strlen(req->messages[i].role) +
+                 (req->messages[i].content ? strlen(req->messages[i].content) : 0);
+    }
 
     char* prompt = (char*)malloc(total);
     if (!prompt) return NULL;
 
     char* w = prompt;
     size_t remaining = total;
-    for (int i = 0; i < req->n_messages; i++) {
-        int n = snprintf(w, remaining, "<|im_start|>%s\n%s<|im_end|>\n",
-                         req->messages[i].role,
-                         req->messages[i].content ? req->messages[i].content : "");
-        if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
+
+    if (tmpl == CHAT_TEMPLATE_PHI3) {
+        /* Phi-3 / Phi-3.5 template:
+         *   <|system|>\ncontent<|end|>\n
+         *   <|user|>\ncontent<|end|>\n
+         *   <|assistant|>\n
+         */
+        for (int i = 0; i < req->n_messages; i++) {
+            const char* content = req->messages[i].content ? req->messages[i].content : "";
+            int n;
+            if (strcmp(req->messages[i].role, "system") == 0) {
+                n = snprintf(w, remaining, "<|system|>\n%s<|end|>\n", content);
+            } else if (strcmp(req->messages[i].role, "user") == 0) {
+                n = snprintf(w, remaining, "<|user|>\n%s<|end|>\n", content);
+            } else if (strcmp(req->messages[i].role, "assistant") == 0) {
+                n = snprintf(w, remaining, "<|assistant|>\n%s<|end|>\n", content);
+            } else {
+                n = snprintf(w, remaining, "<|user|>\n%s<|end|>\n", content);
+            }
+            if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
+        }
+        snprintf(w, remaining, "<|assistant|>\n");
+    } else {
+        /* ChatML (default): <|im_start|>role\ncontent<|im_end|>\n */
+        for (int i = 0; i < req->n_messages; i++) {
+            int n = snprintf(w, remaining, "<|im_start|>%s\n%s<|im_end|>\n",
+                             req->messages[i].role,
+                             req->messages[i].content ? req->messages[i].content : "");
+            if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
+        }
+        snprintf(w, remaining, "<|im_start|>assistant\n");
     }
-    snprintf(w, remaining, "<|im_start|>assistant\n");
 
     return prompt;
 }
@@ -533,13 +567,9 @@ static int parse_chat_request(const char* body, chat_request_t* req) {
         return -1;
     }
 
-    /* Build prompt */
-    req->prompt = build_prompt(req);
-    if (!req->prompt) {
-        LOG_ERROR("Failed to build prompt");
-        return -1;
-    }
-
+    /* NOTE: build_prompt is called separately after parse returns,
+     * because it needs the model config to detect the chat template.
+     * See handle_chat_completion(). */
     return 0;
 }
 
@@ -742,8 +772,20 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
         return;
     }
 
-    LOG_INFO("Chat request: model=%s, stream=%s, max_tokens=%d, messages=%d",
-             req.model, req.stream ? "true" : "false", req.max_tokens, req.n_messages);
+    /* Build prompt — needs model config for architecture-aware template */
+    chat_template_t tmpl = detect_chat_template(&server->config.model->config);
+    req.prompt = build_prompt(&req, tmpl);
+    if (!req.prompt) {
+        send_json(fd, 500, "Internal Server Error",
+            "{\"error\":{\"message\":\"Failed to build prompt\","
+            "\"type\":\"server_error\",\"code\":\"internal\"}}");
+        free_chat_request(&req);
+        return;
+    }
+
+    LOG_INFO("Chat request: model=%s, stream=%s, max_tokens=%d, messages=%d, template=%s",
+             req.model, req.stream ? "true" : "false", req.max_tokens, req.n_messages,
+             tmpl == CHAT_TEMPLATE_PHI3 ? "phi3" : "chatml");
 
     /* Resolve inference parameters */
     tq_type kv_type = server->config.kv_type;

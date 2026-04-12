@@ -984,13 +984,18 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
 
     float* gate_q = NULL;
     if (has_fused_qkv_layer) {
-        /* Phi-3 fused QKV: one matmul produces [Q | K | V] */
+        /* Phi-3 fused QKV: one matmul produces [Q | K | V].
+         * Force CPU path — Metal has a buffer sizing bug with the large
+         * output dim (total_out = 3*dim for Phi-3.5, much larger than
+         * typical single-projection matmuls). */
+        extern void tq_matmul_gguf_cpu(float*, const float*, const void*,
+                                        int, int, int);
         int q_out  = n_heads * head_dim;
         int kv_out = kv_dim;
         int total_out = q_out + 2 * kv_out;
-        tq_matmul_gguf(s->xb2, s->xb,
-                       layer->gguf_w_qkv, layer->gguf_w_qkv_type,
-                       total_out, dim);
+        tq_matmul_gguf_cpu(s->xb2, s->xb,
+                           layer->gguf_w_qkv, layer->gguf_w_qkv_type,
+                           total_out, dim);
         memcpy(s->q, s->xb2,                       (size_t)q_out  * sizeof(float));
         memcpy(s->k, s->xb2 + q_out,               (size_t)kv_out * sizeof(float));
         memcpy(s->v, s->xb2 + q_out + kv_out,      (size_t)kv_out * sizeof(float));
@@ -2174,6 +2179,16 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     tq_model_config_t* c = &model->config;
     int dim = c->hidden_dim;
 
+    /* Phi-3: force all GGUF matmuls to CPU for the entire forward pass.
+     * Metal kernels produce garbage for Phi-3.5's architecture (fused QKV,
+     * head_dim=96, LongRoPE). CPU NEON path is correct and fast enough
+     * on Apple Silicon. Restored at function exit. */
+    int _phi3_force_cpu = c->has_fused_qkv;
+    if (_phi3_force_cpu) {
+        extern _Thread_local int tq_matmul_force_cpu;
+        tq_matmul_force_cpu = 1;
+    }
+
     /* Step 1: Token embedding */
     if (model->embed_bf16) {
         /* Streaming BF16->FP32 conversion: convert only this token's row */
@@ -2380,8 +2395,18 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         /* Metal batch mode: GGUF on-the-fly path only (Gemma 4 MoE).
          * Q4 converted weights: CPU NEON Q4×Q8 is faster than Metal GPU
          * due to per-dispatch overhead exceeding compute time on small matrices.
-         * Benchmarked: Metal Q4 batch → 38 tok/s vs CPU Q4 → 95 tok/s (SmolLM2). */
-        if (layer_has_gguf) tq_metal_batch_begin_if_available();
+         * Benchmarked: Metal Q4 batch → 38 tok/s vs CPU Q4 → 95 tok/s (SmolLM2).
+         *
+         * Skip Metal batch for Phi-3 fused layers: mixing CPU fallback
+         * (fused QKV/FFN) with GPU matmuls (wo, down) in the same batch
+         * causes buffer synchronization issues. All matmuls fall through
+         * to CPU NEON path instead — still fast on Apple Silicon. */
+        /* Phi-3 fused layers: force ALL GGUF matmuls to CPU for this layer.
+         * Metal immediate-mode matmul also produces garbage for Phi-3.5's
+         * dimensions (hidden=3072, inter=8192) — root cause TBD. CPU NEON
+         * path works correctly and is fast enough on Apple Silicon. */
+        int skip_metal_batch = (layer->gguf_w_qkv != NULL);
+        if (layer_has_gguf && !skip_metal_batch) tq_metal_batch_begin_if_available();
 
         if (layer->delta_a_log) {
             /* DeltaNet layer */
@@ -2624,10 +2649,12 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 tq_matmul_q4_preq(s->hb2, layer->w_up_q4, layer->w_up_q4s,
                                    s->xb_q8, s->xb_q8s, inter, dim);
             } else if (layer->gguf_w_up_gate) {
-                /* Phi-3 fused gate||up */
-                tq_matmul_gguf(s->hb, s->xb,
-                               layer->gguf_w_up_gate, layer->gguf_w_up_gate_type,
-                               2 * inter, dim);
+                /* Phi-3 fused gate||up — force CPU (same Metal issue as fused QKV) */
+                extern void tq_matmul_gguf_cpu(float*, const float*, const void*,
+                                                int, int, int);
+                tq_matmul_gguf_cpu(s->hb, s->xb,
+                                   layer->gguf_w_up_gate, layer->gguf_w_up_gate_type,
+                                   2 * inter, dim);
                 memcpy(s->hb2, s->hb + inter, (size_t)inter * sizeof(float));
             } else if (layer->gguf_w_gate) {
                 /* Gate+up GPU dispatches batched by layer-level batch scope */
@@ -2740,7 +2767,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
 
         /* End layer-level GPU batch scope */
-        if (layer_has_gguf) tq_metal_batch_end_if_available();
+        if (layer_has_gguf && !skip_metal_batch) tq_metal_batch_end_if_available();
 
         /* Gemma 4: layer_output_scale is a simple scalar multiply on the entire hidden state.
          * Reference: refs/llama.cpp/src/models/gemma4-iswa.cpp line 216-218
@@ -2882,5 +2909,10 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
     }
 
+    /* Restore Metal dispatch for non-Phi3 models */
+    if (_phi3_force_cpu) {
+        extern _Thread_local int tq_matmul_force_cpu;
+        tq_matmul_force_cpu = 0;
+    }
     return s->logits;
 }

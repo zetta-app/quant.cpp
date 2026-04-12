@@ -2116,6 +2116,20 @@ void* q8_int_dot_worker(void* arg) {
 }
 #endif
 
+/* Force-CPU variant: skips Metal dispatch entirely. Used for fused QKV
+ * matmuls (Phi-3) where the Metal buffer management has a bug with the
+ * large output dimension (out_dim = 3 * hidden_dim). The CPU NEON path
+ * handles it correctly. */
+void tq_matmul_gguf_cpu(float* out, const float* x,
+                         const void* weight, tq_ggml_dtype weight_type,
+                         int out_dim, int in_dim);
+
+/* Thread-local flag to force CPU path in tq_matmul_gguf. Set to 1
+ * before calling tq_matmul_gguf to skip Metal dispatch. Used for
+ * Phi-3 fused QKV/FFN matmuls where Metal has a buffer sizing bug
+ * with the unusually large output dimensions. */
+_Thread_local int tq_matmul_force_cpu = 0;
+
 void tq_matmul_gguf(float* out, const float* x,
                     const void* weight, tq_ggml_dtype weight_type,
                     int out_dim, int in_dim)
@@ -2139,7 +2153,7 @@ void tq_matmul_gguf(float* out, const float* x,
                                         tq_ggml_dtype, int, int);
         extern int tq_metal_batch_active(void);
 
-        if (tq_metal_available()) {
+        if (tq_metal_available() && !tq_matmul_force_cpu) {
             /* In batch mode, always dispatch to GPU (overhead is amortized).
              * In immediate mode, only for types that have Metal pipelines
              * AND large matrices where GPU wins. */
@@ -2391,6 +2405,15 @@ void tq_matmul_gguf(float* out, const float* x,
     }
 
     tq_tp_run(gguf_matmul_worker, ptrs, n_threads);
+}
+
+void tq_matmul_gguf_cpu(float* out, const float* x,
+                         const void* weight, tq_ggml_dtype weight_type,
+                         int out_dim, int in_dim)
+{
+    tq_matmul_force_cpu = 1;
+    tq_matmul_gguf(out, x, weight, weight_type, out_dim, in_dim);
+    tq_matmul_force_cpu = 0;
 }
 
 /* ============================================================

@@ -23,15 +23,29 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent.parent
-DEFAULT_MODEL = REPO / "models" / "Llama-3.2-3B-Instruct-Q8_0.gguf"
+# Day 4: Phi-3.5-mini (3.8B, vocab 32K) replaces Llama-3.2-3B-Q8.
+# Significantly better instruction-following + faster lm_head (smallest vocab).
+# NOTE: Metal backend broken for Phi-3.5 (fused QKV + attention head_dim=96
+# not handled by Metal kernels). Must use CPU-only build until Metal is fixed.
+DEFAULT_MODEL = REPO / "models" / "Phi-3.5-mini-instruct-Q4_K_M.gguf"
+# Use fp32 KV cache since Phi-3.5 + turbo_kv_4b hasn't been validated yet
+DEFAULT_KV_TYPE = "fp32"
+# Day 4: Metal build with TQ_NO_METAL=1 for Phi-3.5 — Metal GPU init
+# corrupts Phi-3.5 inference. The binary is still the Metal build (faster
+# due to framework optimizations), but GPU compute is disabled at runtime.
 DEFAULT_SERVER_BINARY = REPO / "build_metal" / "quant-server"
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8421  # arbitrary, avoid conflicts with 8080
 
 # Phase 1B cliff measurements. NEVER set a stage prompt larger than this.
+# Phi-3.5-mini has LongRoPE (128K nominal context) and is Q4_K_M with
+# turbo_kv_4b compression — its cliff should be at least as large as
+# Llama-3.2-3B's (1024 tokens). Conservative estimate: keep 1024 until
+# we measure it directly on Phi-3.5.
 CLIFF_BUDGET = {
     "models/Llama-3.2-3B-Instruct-Q8_0.gguf": 1024,
     "models/Llama-3.2-1B-Instruct-Q8_0.gguf": 512,
+    "models/Phi-3.5-mini-instruct-Q4_K_M.gguf": 1024,
 }
 
 
@@ -95,8 +109,8 @@ def start_server(
     host: str = DEFAULT_SERVER_HOST,
     port: int = DEFAULT_SERVER_PORT,
     threads: int = 8,
-    kv_type: str = "turbo_kv_4b",
-    v_quant: str = "q4",
+    kv_type: str = "fp32",
+    v_quant: str = "fp32",
     startup_timeout: float = 120.0,
     verbose: bool = True,
 ) -> str:
@@ -126,6 +140,10 @@ def start_server(
     env = os.environ.copy()
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
+    # Day 4: disable Metal GPU for Phi-3.5 (Metal init corrupts inference).
+    # The model name check is a heuristic — any Phi-3 model needs this.
+    if "phi" in str(model).lower() or "Phi" in str(model):
+        env["TQ_NO_METAL"] = "1"
 
     _server_proc = subprocess.Popen(
         cmd,
@@ -233,8 +251,10 @@ def llm_call(
     )
 
     t0 = time.time()
+    # Day 4: increased from 300s to 600s for CPU-only Phi-3.5 which
+    # generates ~10s/token. A 24-token response needs ~4 minutes.
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError) as e:
         elapsed = time.time() - t0

@@ -1,24 +1,44 @@
 """Stage 3: LOOKUP.
 
-Given a region pointer (Stage 2 output), the original document, and a
-question, run a single LLM call with ONLY that region as context. The
-region must be sized below the cliff budget.
+Day 3 v3 architecture: SELECT-BY-INDEX lookup.
 
-Output: a tentative answer string.
+  Day 2 framing was "Quote the single sentence". This works for
+  single-hop but breaks under Q4 KV jitter for multi-hop:
+    - Q6: model paraphrased "...proposed by EVP James Park during the
+      2023 strategic planning retreat in Kyoto" → "...proposed by EVP
+      in 2002" (dropped James Park and Kyoto entirely)
+    - Q7: model picked the wrong sentence inside the right chunk
+      ("Supply chain disruptions" instead of "Currency fluctuations")
+
+  Day 3 redesign: numbered-sentence selection. We split the chunk into
+  sentences, present them as a numbered list, and ask the model to pick
+  a single integer (the sentence index that contains the answer). Then
+  we return the *verbatim* sentence from the original text — the model
+  never has to QUOTE, only SELECT. Selection is something the 3B Q4
+  model is good at (the locator showed this); quoting under Q4 jitter
+  is what's broken.
 """
+import re
 from dataclasses import dataclass
+from typing import List
 
 from . import _llm
 from .locator import RegionPointer
 
 
-# Day 2 redesign: reframe lookup as EXTRACTIVE ("find and quote the
-# sentence that contains the answer") rather than GENERATIVE ("answer
-# the question"). The extractive framing forces the model to do span
-# selection, which sidesteps primacy bias — instead of summarising the
-# region (which picks the first-mentioned entity) the model has to
-# identify the specific sentence that matches the question's keywords.
-LOOKUP_PROMPT_TEMPLATE = """{region_text}
+# Day 3 v3: numbered-sentence selection prompt. The model picks an
+# integer; we map it back to a verbatim sentence.
+LOOKUP_PROMPT_TEMPLATE = """Sentences from the document:
+
+{numbered_sentences}
+
+Question: {question}
+
+Which sentence number contains the answer? Reply with only one digit: the sentence number."""
+
+# Fallback "quote" prompt for chunks with very few sentences (≤1) where
+# selection is trivial and we can ask the model directly.
+LOOKUP_QUOTE_FALLBACK_TEMPLATE = """{region_text}
 
 Quote the single sentence from the text above that answers this question. Reply with only that sentence, no explanation.
 
@@ -31,6 +51,30 @@ class LookupResult:
     region_text: str
     chunk_id: int
     raw_llm_output: str = ""
+    method: str = ""  # "select" | "quote" | "select-fallback"
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences. Conservative: snap on period/!? followed
+    by whitespace. Filters out tiny fragments that aren't real sentences."""
+    parts = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    return [p for p in parts if len(p) >= 8]
+
+
+def _parse_sentence_index(text: str, n_sentences: int) -> int:
+    """Find the first integer 1..n_sentences in the model's reply.
+    Returns -1 on parse failure."""
+    text = text.strip()
+    if "## Step" in text:
+        text = " ".join(l for l in text.split("\n") if not l.strip().startswith("##"))
+    for m in re.finditer(r"\b(\d+)\b", text):
+        n = int(m.group(1))
+        if 1 <= n <= n_sentences:
+            return n
+    return -1
 
 
 def lookup(
@@ -40,24 +84,93 @@ def lookup(
     *,
     verbose: bool = False,
 ) -> LookupResult:
-    """Stage 3: read the targeted region and answer the question."""
-    region_text = doc_text[region.char_start:region.char_end]
+    """Stage 3: read the targeted region and answer the question.
 
+    Day 3 v3: select-by-index. Split the chunk into numbered sentences,
+    let the model pick an index, return the verbatim sentence from the
+    original text. The model never has to QUOTE — only SELECT.
+    """
+    region_text = doc_text[region.char_start:region.char_end]
+    sentences = _split_into_sentences(region_text)
+
+    # Day 4 adaptive lookup: select-by-index for small chunks (≤8 sentences,
+    # typical of structured docs with section headers — Acme regime), and
+    # direct-answer for large chunks (>8 sentences, typical of continuous
+    # narrative — wikitext regime). Select-by-index is perfect for Acme
+    # (the model's quoting under Q4 jitter is broken, but integer selection
+    # works); direct-answer is better for wikitext (the model needs full
+    # chunk context for cross-sentence pronoun resolution, and select fails
+    # to pick the right sentence when there are 15+ candidates).
+    MAX_SENTENCES_FOR_SELECT = 8
+
+    if len(sentences) < 2 or len(sentences) > MAX_SENTENCES_FOR_SELECT:
+        # Direct-answer mode: feed the chunk text + question to the model
+        prompt = LOOKUP_QUOTE_FALLBACK_TEMPLATE.format(
+            region_text=region_text, question=question,
+        )
+        if verbose:
+            mode = "direct-answer" if len(sentences) > MAX_SENTENCES_FOR_SELECT else "single-sentence"
+            print(f"[lookup] chunk {region.chunk_id} ({len(region_text)} chars), "
+                  f"{len(sentences)} sentences -> {mode}")
+        result = _llm.llm_call(prompt, max_tokens=64)
+        return LookupResult(
+            answer=result.text.strip(),
+            region_text=region_text,
+            chunk_id=region.chunk_id,
+            raw_llm_output=result.text,
+            method="direct",
+        )
+
+    # Select-by-index mode: chunks with 2-8 sentences (structured docs)
+    numbered = "\n".join(f"[{i+1}] {s}" for i, s in enumerate(sentences))
     prompt = LOOKUP_PROMPT_TEMPLATE.format(
-        region_text=region_text,
+        numbered_sentences=numbered,
         question=question,
     )
 
     if verbose:
         within, est, budget = _llm.check_cliff_budget(prompt)
         print(f"[lookup] chunk {region.chunk_id} ({len(region_text)} chars), "
-              f"prompt ~{est} tokens (budget {budget}), within={within}")
+              f"{len(sentences)} sentences, prompt ~{est} tokens "
+              f"(budget {budget}), within={within}")
 
-    result = _llm.llm_call(prompt, max_tokens=64)
+    # Only need a single digit — minimize tokens for slow CPU models
+    result = _llm.llm_call(prompt, max_tokens=8)
+    idx = _parse_sentence_index(result.text, len(sentences))
 
+    if idx < 1:
+        if verbose:
+            print(f"[lookup] index parse failed: {result.text!r} -> quote fallback")
+        prompt = LOOKUP_QUOTE_FALLBACK_TEMPLATE.format(
+            region_text=region_text, question=question,
+        )
+        result2 = _llm.llm_call(prompt, max_tokens=64)
+        return LookupResult(
+            answer=result2.text.strip(),
+            region_text=region_text,
+            chunk_id=region.chunk_id,
+            raw_llm_output=result2.text,
+            method="select-fallback",
+        )
+
+    # Day 4: return a 2-sentence window (selected sentence + previous
+    # sentence). For continuous-narrative wikitext, the answer often
+    # requires pronoun resolution across adjacent sentences ("He was cast
+    # in Mercury Fur. He was directed by John Tiffany." — picking either
+    # sentence alone loses the connection). For Acme-style structured
+    # docs, the previous sentence is benign extra context.
+    selected = sentences[idx - 1]
+    if idx >= 2:
+        prev = sentences[idx - 2]
+        answer = f"{prev} {selected}"
+    else:
+        answer = selected
+    if verbose:
+        print(f"[lookup] selected sentence {idx}/{len(sentences)}: {selected[:80]!r}")
     return LookupResult(
-        answer=result.text.strip(),
+        answer=answer,
         region_text=region_text,
         chunk_id=region.chunk_id,
         raw_llm_output=result.text,
+        method="select",
     )
