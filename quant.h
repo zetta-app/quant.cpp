@@ -538,6 +538,7 @@ typedef struct {
     int model_type;          /* 0=qwen35, 1=gemma3, 2=qwen2moe */
     int is_gemma4;           /* 1 if Gemma 4 (STEP35): uses SwiGLU, no post-norms */
     int sliding_window;      /* sliding window size (512 for gemma3, 0 for unlimited) */
+    int n_kv_shared_layers;  /* Gemma 4: last N layers share KV from earlier same-type layers (0=disabled) */
     float rope_local_base_freq; /* RoPE base freq for local/sliding layers (10000.0 for gemma3) */
     int n_norms_per_block;   /* 2 for qwen35, 4 for gemma3 */
     float query_pre_attn_scalar; /* attention scaling: 1/sqrt(this) instead of 1/sqrt(head_dim), 0=use head_dim */
@@ -11456,6 +11457,11 @@ tq_model_t* tq_load_gguf(const char* path) {
 
     /* Sliding window + local RoPE base */
     c->sliding_window = (int)tq_gguf_get_u32(gguf, GGUF_KEY("attention.sliding_window"), 0);
+    c->n_kv_shared_layers = (int)tq_gguf_get_u32(gguf, GGUF_KEY("attention.shared_kv_layers"), 0);
+    if (c->n_kv_shared_layers > 0) {
+        fprintf(stderr, "tq_load_gguf: KV sharing enabled — last %d layers reuse KV from earlier same-type layers\n",
+                c->n_kv_shared_layers);
+    }
     /* Local/sliding RoPE base: try Gemma4 naming first, then generic */
     c->rope_local_base_freq = tq_gguf_get_f32(gguf, GGUF_KEY("rope.freq_base_swa"),
                                tq_gguf_get_f32(gguf, GGUF_KEY("rope.local.freq_base"),
@@ -14084,6 +14090,29 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         tq_quantize_row_q8(s->xb, s->xb_q8, s->xb_q8s, dim);
     }
 
+    /* Gemma 4 KV sharing: last n_kv_shared_layers layers skip K/V projection
+     * and reuse the KV cache from the last non-shared layer of the same
+     * attention type (sliding or full). Only Q is computed fresh. */
+    int kv_shared_skip = 0;
+    int kv_shared_ref_layer = -1;
+    /* KV sharing: disabled by default until segfault in value_cache
+     * FP16 stride is fixed. Enable with TQ_KV_SHARE=1 for testing. */
+    if (c->n_kv_shared_layers > 0 && getenv("TQ_KV_SHARE")) {
+        int shared_start = c->n_layers - c->n_kv_shared_layers;
+        if (l >= shared_start) {
+            kv_shared_skip = 1;
+            /* Find reference layer: last non-shared layer of the same type */
+            int is_sliding_l = (model->layer_is_sliding && model->layer_is_sliding[l]);
+            for (int r = shared_start - 1; r >= 0; r--) {
+                int is_sliding_r = (model->layer_is_sliding && model->layer_is_sliding[r]);
+                if (is_sliding_l == is_sliding_r) {
+                    kv_shared_ref_layer = r;
+                    break;
+                }
+            }
+        }
+    }
+
     /* QKV projections (timed as matmul) */
     TQ_PROF_START(_tp);
     /* When attn_output_gate is enabled, wq has shape [2*n_heads*head_dim, dim]
@@ -14153,7 +14182,38 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             tq_matmul(s->q, s->xb, layer->wq, n_heads * head_dim, dim);
         }
     }
-    if (has_fused_qkv_layer) {
+    if (kv_shared_skip && kv_shared_ref_layer >= 0) {
+        /* KV sharing: skip K/V projection for shared layers.
+         * Read K from the reference layer's FP32 key cache.
+         * V: read from reference layer's value cache (FP32 or FP16).
+         * NOTE: we copy into s->k/s->v so the KV cache write below
+         * stores them into THIS layer's cache slot (for attention).
+         *
+         * IMPORTANT: kv_layer_stride is in FLOATS for key_cache (FP32).
+         * value_cache uses FP16 when use_fp16_values is set, but the
+         * stride is STILL in float-units because value_cache is cast
+         * to uint16_t* only at write/read time. The allocation uses
+         * sizeof(float) for FP32 and sizeof(uint16_t) for FP16 — but
+         * the STRIDE variable is in elements, not bytes. For FP16 values,
+         * the value_cache pointer is actually a uint16_t* in disguise.
+         */
+        float* ref_key_layer = s->key_cache + (size_t)kv_shared_ref_layer * kv_layer_stride;
+        memcpy(s->k, ref_key_layer + (size_t)pos * cache_kv_dim, (size_t)kv_dim * sizeof(float));
+
+        if (s->use_fp16_values) {
+            /* Value cache stores as FP16 (uint16_t). Stride is in FP16 elements. */
+            size_t v_stride = (size_t)c->max_seq_len * cache_kv_dim;  /* in uint16 elements */
+            const uint16_t* v16_cache = (const uint16_t*)s->value_cache;
+            const uint16_t* ref_v = v16_cache + (size_t)kv_shared_ref_layer * v_stride + (size_t)pos * cache_kv_dim;
+            for (int i = 0; i < kv_dim; i++) {
+                uint32_t bits = ((uint32_t)ref_v[i]) << 16;
+                memcpy(&s->v[i], &bits, 4);
+            }
+        } else {
+            float* ref_val_layer = s->value_cache + (size_t)kv_shared_ref_layer * kv_layer_stride;
+            memcpy(s->v, ref_val_layer + (size_t)pos * cache_kv_dim, (size_t)kv_dim * sizeof(float));
+        }
+    } else if (has_fused_qkv_layer) {
         /* Already populated s->q/s->k/s->v above — skip the standard
          * K and V projection blocks. */
     } else if (layer->wk_q2) {
