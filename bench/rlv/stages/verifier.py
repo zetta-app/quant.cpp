@@ -165,6 +165,37 @@ def _literal_verify(
     if len(answer) < 200 and any(p in answer_head for p in refusal_phrases):
         return "UNSURE", f"answer is a refusal ('{answer[:60]}...')"
 
+    # Phase A-2: Answer-Question alignment check.
+    # The answer must actually ADDRESS the question type. An answer that
+    # contains region-grounded facts but doesn't answer the specific
+    # question is "related but wrong" — the hardest hallucination to catch.
+    # This is RLV's core differentiator: detecting WRONG answers, not just
+    # fabricated ones.
+    q_lower = question.lower()
+    answer_norm = answer.lower()
+
+    # "When/what year/what date" → answer must contain a year or date
+    if re.search(r'\b(what year|in what year|when did|what date|on what date)\b', q_lower):
+        has_year = bool(re.search(r'\b(1[0-9]{3}|20[0-9]{2})\b', answer))
+        has_month = bool(re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\b', answer.lower()))
+        if not has_year and not has_month:
+            return "UNSURE", f"temporal question but answer has no year/date"
+
+    # "After/before which battle/event" → answer must name a specific event
+    # AND the answer must contain an event-type word (battle, war, etc.)
+    # "They were modernized in 1934" doesn't answer "after which battle?"
+    if re.search(r'\b(which battle|after which battle|what battle|which war|after which war)\b', q_lower):
+        event_words = ["battle", "war", "rebellion", "siege", "campaign", "invasion", "attack", "offensive"]
+        has_event_word = any(w in answer.lower() for w in event_words)
+        if not has_event_word:
+            return "UNSURE", f"battle/war question but answer names no battle/war"
+
+    # "What does X mean" → answer should contain a definition signal
+    if re.search(r'\b(what does|what is the meaning|what does the (?:name|word|term))\b', q_lower):
+        has_def = any(w in answer.lower() for w in ["means", "meaning", "refers to", "derived from", "to cut", "headed"])
+        if not has_def and len(answer) < 150:
+            return "UNSURE", f"definition question but answer lacks definition"
+
     word_terms, number_terms = _extract_answer_key_terms(answer)
     if not word_terms and not number_terms:
         return "UNSURE", f"q-grounded ({q_reason}); no extractable answer entities"
