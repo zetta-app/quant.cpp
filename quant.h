@@ -15668,11 +15668,16 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             tq_add(s->x, s->x, ple_proj_out, dim);
         }
 
-        /* Gemma 4: layer_output_scale — simple multiplication of entire output.
-         * llama.cpp reference (gemma4-iswa.cpp): cur = ggml_mul(cur, out_scale)
-         * Previous implementation incorrectly separated residual contribution.
-         * The correct approach is a straight elementwise multiply. */
-        if (layer->layer_output_scale != 0.0f) {
+        /* Gemma 4: layer_output_scale scales layer CONTRIBUTION only.
+         * x_next = x_input + los * (x_current - x_input)
+         * This preserves the residual signal. With los=0.0178, only
+         * the layer's attn+ffn+PLE contribution is scaled down.
+         *
+         * CRITICAL: "x *= los" was WRONG — it destroys the residual
+         * (los=0.0178 multiplied onto the accumulated residual = catastrophic).
+         * The residual-separation formula is the correct implementation.
+         * TQ_NO_LOS=1 disables for debugging. */
+        if (layer->layer_output_scale != 0.0f && !getenv("TQ_NO_LOS")) {
             float los = layer->layer_output_scale;
             if (pos == 0 && getenv("TQ_DEBUG") && l < 3) {
                 float maxv = 0, minv = 0;
@@ -15683,7 +15688,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 fprintf(stderr, "[DEBUG] layer%d pre_scale min=%.3f max=%.3f (los=%.4f)\n", l, minv, maxv, los);
             }
             for (int i = 0; i < dim; i++) {
-                s->x[i] *= los;
+                s->x[i] = layer_residual_buf[i] + los * (s->x[i] - layer_residual_buf[i]);
             }
         }
 
