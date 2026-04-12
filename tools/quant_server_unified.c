@@ -375,7 +375,17 @@ static void handle_request(server_t* srv, int fd) {
         fprintf(stderr, "[%s] POST /v1/chat/completions msgs=%d max_tokens=%d stream=%d\n",
                 comp_id, n_msgs, max_tokens, stream);
 
-        pthread_mutex_lock(&srv->mutex);
+        /* B11: use trylock to prevent blocking when another request is
+         * being processed. Return 429 immediately instead of hanging. */
+        if (pthread_mutex_trylock(&srv->mutex) != 0) {
+            send_json(fd, 429, "Too Many Requests",
+                "{\"error\":{\"message\":\"Server busy, retry in a moment\","
+                "\"type\":\"server_error\",\"code\":\"busy\"}}");
+            free(prompt);
+            for (int i = 0; i < n_msgs; i++) free(bufs[i]);
+            free(body);
+            return;
+        }
 
         /* Reuse context across requests — only update per-request config.
          * The old code called quant_free_ctx + quant_new per request,
@@ -570,11 +580,17 @@ int main(int argc, char** argv) {
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    /* H8: bind to localhost by default for security. Use -H 0.0.0.0
+     * to explicitly expose to network (not recommended without auth). */
+    const char* bind_host = "127.0.0.1";
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-H") == 0 && i + 1 < argc) bind_host = argv[++i];
+    }
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
         .sin_port = htons(port),
     };
+    inet_pton(AF_INET, bind_host, &addr.sin_addr);
 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "Error: port %d is already in use\n", port);

@@ -232,7 +232,13 @@ def build_gist(
         if use_llm:
             s_prompt = GIST_SUMMARY_PROMPT.format(chunk=chunk_text)
             s_result = _llm.llm_call(s_prompt, max_tokens=80)
-            summary = _parse_summary_response(s_result.text)
+            # B3: check for LLM errors before parsing summary
+            if s_result.is_error:
+                if verbose:
+                    print(f"[gist] LLM error on chunk {i}: {s_result.text[:80]}")
+                summary = ""  # fall back to no summary (head_text still available)
+            else:
+                summary = _parse_summary_response(s_result.text)
 
         gc = GistChunk(
             chunk_id=i,
