@@ -28,13 +28,13 @@ from .locator import RegionPointer
 
 # Day 3 v3: numbered-sentence selection prompt. The model picks an
 # integer; we map it back to a verbatim sentence.
-LOOKUP_PROMPT_TEMPLATE = """Sentences from the document:
+LOOKUP_PROMPT_TEMPLATE = """Read these sentences carefully:
 
 {numbered_sentences}
 
 Question: {question}
 
-Which sentence number contains the answer? Reply with only one digit: the sentence number."""
+Which sentence number DIRECTLY answers the question? Pick the sentence that contains the specific fact being asked about. Reply with ONLY the number."""
 
 # Fallback "quote" prompt for chunks with very few sentences (≤1) where
 # selection is trivial and we can ask the model directly.
@@ -159,12 +159,16 @@ def lookup(
     # in Mercury Fur. He was directed by John Tiffany." — picking either
     # sentence alone loses the connection). For Acme-style structured
     # docs, the previous sentence is benign extra context.
-    selected = sentences[idx - 1]
-    if idx >= 2:
-        prev = sentences[idx - 2]
-        answer = f"{prev} {selected}"
-    else:
-        answer = selected
+    # Return a 3-sentence window centered on the selected sentence.
+    # Multi-hop questions often require context from adjacent sentences
+    # (e.g., "strategy proposed at what event?" spans sentences about
+    # the strategy AND the event name in the next sentence).
+    window = []
+    for offset in range(-1, 2):  # prev, selected, next
+        i = idx - 1 + offset
+        if 0 <= i < len(sentences):
+            window.append(sentences[i])
+    answer = " ".join(window)
     if verbose:
         print(f"[lookup] selected sentence {idx}/{len(sentences)}: {selected[:80]!r}")
     return LookupResult(
