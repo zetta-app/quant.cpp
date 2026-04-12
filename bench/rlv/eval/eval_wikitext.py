@@ -106,6 +106,64 @@ QUESTIONS = [
         "question": "Who directed the Kiss You music video?",
         "fragments": ["vaughan arnell", "arnell"],
     },
+
+    # === Phase A expanded set: 10 more questions (Q11-Q20) ===
+
+    # Boulter — deeper facts
+    {
+        "id": 11, "topic": "boulter", "type": "single-hop",
+        "question": "What character did Boulter play in the TV series Casualty?",
+        "fragments": ["kieron fletcher", "kieron", "fletcher"],
+    },
+    {
+        "id": 12, "topic": "boulter", "type": "single-hop",
+        "question": "At which theatre was the play How to Curse performed?",
+        "fragments": ["bush theatre", "bush"],
+    },
+    {
+        "id": 13, "topic": "boulter", "type": "multi-hop",
+        "question": "What character did Boulter play in the film directed by Olly Blackburn?",
+        "fragments": ["sean"],
+    },
+
+    # Du Fu — deeper facts
+    {
+        "id": 14, "topic": "dufu", "type": "single-hop",
+        "question": "In what year was Du Fu born?",
+        "fragments": ["712"],
+    },
+    {
+        "id": 15, "topic": "dufu", "type": "single-hop",
+        "question": "How many children did Du Fu have by 757?",
+        "fragments": ["five", "5"],
+    },
+    {
+        "id": 16, "topic": "dufu", "type": "single-hop",
+        "question": "Which city did Du Fu move to in December, fleeing to Sichuan province?",
+        "fragments": ["chengdu"],
+    },
+    {
+        "id": 17, "topic": "dufu", "type": "single-hop",
+        "question": "Which famous haiku poet was strongly influenced by Du Fu?",
+        "fragments": ["matsuo basho", "basho", "bash"],
+    },
+    {
+        "id": 18, "topic": "dufu", "type": "multi-hop",
+        "question": "What two-word epithet meaning 'poet historian' did Chinese critics give Du Fu?",
+        "fragments": ["poet historian", "historian"],
+    },
+
+    # Kiss You — deeper facts
+    {
+        "id": 19, "topic": "kiss_you", "type": "single-hop",
+        "question": "At what number did Kiss You peak on the US Billboard Hot 100?",
+        "fragments": ["46"],
+    },
+    {
+        "id": 20, "topic": "kiss_you", "type": "multi-hop",
+        "question": "According to The Independent, who reported that Simon Cowell wanted Kiss You as the lead single?",
+        "fragments": ["independent"],
+    },
 ]
 
 
