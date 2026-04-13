@@ -11633,6 +11633,15 @@ tq_model_t* tq_load_gguf(const char* path) {
         c->model_type = 0; /* qwen35 */
     }
 
+    /* Compute partial_rotary_factor from rope.dimension_count / head_dim.
+     * Qwen3.5: rope_n_dims=64, head_dim=256 → factor=0.25 (25% of dims rotated).
+     * Most models: rope_n_dims=0 or == head_dim → factor=0.0 (full rotation). */
+    if (c->rope_n_dims > 0 && c->head_dim > 0 && c->rope_n_dims < c->head_dim) {
+        c->partial_rotary_factor = (float)c->rope_n_dims / (float)c->head_dim;
+        fprintf(stderr, "tq_load_gguf: partial RoPE — %d/%d dims (factor=%.2f)\n",
+                c->rope_n_dims, c->head_dim, c->partial_rotary_factor);
+    }
+
     fprintf(stderr, "tq_load_gguf: config — layers=%d, dim=%d, heads=%d/%d, head_dim=%d, vocab=%d\n",
             c->n_layers, c->hidden_dim, c->n_heads, c->n_kv_heads, c->head_dim, c->vocab_size);
 
@@ -11852,13 +11861,14 @@ tq_model_t* tq_load_gguf(const char* path) {
          * the rest of the loader and tq_forward treat it normally. */
         snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
         const tq_gguf_tensor_t* wqkv_t = find_gguf_tensor(gguf, tname);
-        if (wqkv_t) {
+        if (wqkv_t && !layer->delta_a_log) {
+            /* Phi-3 fused QKV (NOT DeltaNet). DeltaNet layers also have
+             * attn_qkv.weight but it's the conv1d input, not a fused
+             * attention projection. The delta_a_log check distinguishes. */
             layer->gguf_w_qkv = wqkv_t->data;
             layer->gguf_w_qkv_type = wqkv_t->type;
             c->has_fused_qkv = 1;
 
-            /* Pull O proj from the standard name — Phi-3 uses
-             * `blk.N.attn_output.weight` like everyone else. */
             snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_wo = t->data; layer->gguf_wo_type = t->type; }
@@ -14348,32 +14358,40 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
 
     /* Apply RoPE (partial or full) */
     if (c->partial_rotary_factor > 0.0f && c->partial_rotary_factor < 1.0f) {
-        /* Partial RoPE: only apply to first partial_rotary_factor * head_dim dims */
+        /* Partial RoPE: only apply to first rope_dim dims of each head.
+         * Qwen3.5: rope_dim=64 out of head_dim=256 → 25% rotation.
+         *
+         * When use_neox_rope is also set (n_heads*head_dim != hidden_dim),
+         * use NeoX pair layout (q[i], q[i+half]) instead of interleaved. */
         int rope_dim = (int)(c->partial_rotary_factor * head_dim);
+        int use_neox = c->use_neox_rope;
+        int half = rope_dim / 2;
         for (int h = 0; h < n_heads; h++) {
             float* qh = s->q + h * head_dim;
-            for (int i = 0; i < rope_dim / 2; i++) {
+            for (int i = 0; i < half; i++) {
                 float freq = 1.0f / powf(c->rope_freq_base, 2.0f * i / rope_dim);
                 float theta = pos * freq;
                 float cos_t = cosf(theta);
                 float sin_t = sinf(theta);
-                float q0 = qh[2 * i];
-                float q1 = qh[2 * i + 1];
-                qh[2 * i]     = q0 * cos_t - q1 * sin_t;
-                qh[2 * i + 1] = q0 * sin_t + q1 * cos_t;
+                int a = use_neox ? i        : 2 * i;
+                int b = use_neox ? i + half  : 2 * i + 1;
+                float q0 = qh[a], q1 = qh[b];
+                qh[a] = q0 * cos_t - q1 * sin_t;
+                qh[b] = q0 * sin_t + q1 * cos_t;
             }
         }
         for (int h = 0; h < n_kv_heads; h++) {
             float* kh = s->k + h * head_dim;
-            for (int i = 0; i < rope_dim / 2; i++) {
+            for (int i = 0; i < half; i++) {
                 float freq = 1.0f / powf(c->rope_freq_base, 2.0f * i / rope_dim);
                 float theta = pos * freq;
                 float cos_t = cosf(theta);
                 float sin_t = sinf(theta);
-                float k0 = kh[2 * i];
-                float k1 = kh[2 * i + 1];
-                kh[2 * i]     = k0 * cos_t - k1 * sin_t;
-                kh[2 * i + 1] = k0 * sin_t + k1 * cos_t;
+                int a = use_neox ? i        : 2 * i;
+                int b = use_neox ? i + half  : 2 * i + 1;
+                float k0 = kh[a], k1 = kh[b];
+                kh[a] = k0 * cos_t - k1 * sin_t;
+                kh[b] = k0 * sin_t + k1 * cos_t;
             }
         }
     } else if (model->rope_freqs && model->rope_freqs_len > 0 &&
