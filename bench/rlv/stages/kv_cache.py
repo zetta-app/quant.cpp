@@ -116,17 +116,21 @@ def build_kv_cache(
         cfg = _QuantConfig()
         cfg.temperature = 0.0
         cfg.top_p = 1.0
-        cfg.max_tokens = 1  # prefill only, generate 1 token
+        cfg.max_tokens = 1  # generate 1 token after prefill
         cfg.n_threads = n_threads
 
         ctx = _lib.quant_new(_model, ctypes.byref(cfg))
         if not ctx:
             continue
 
-        # Prefill: process chunk text through the model
-        _lib.quant_generate(ctx, text.encode("utf-8"), null_cb, None)
+        # Use quant_chat (NOT quant_generate) for prefill.
+        # quant_generate creates internal state and discards it.
+        # quant_chat preserves KV state in ctx → save_context works.
+        _lib.quant_chat.argtypes = [ctypes.c_void_p, ctypes.c_char_p, _ON_TOKEN, ctypes.c_void_p]
+        _lib.quant_chat.restype = ctypes.c_int
+        _lib.quant_chat(ctx, text.encode("utf-8"), null_cb, None)
 
-        # Save KV state
+        # Save KV state — now contains ALL prefill tokens
         rc = _lib.quant_save_context(ctx, cache_file.encode())
         _lib.quant_free_ctx(ctx)
 
@@ -182,9 +186,10 @@ def lookup_with_cache(
         _lib.quant_free_ctx(ctx)
         return None
 
-    # Use quant_chat to APPEND question to existing KV cache
-    # (quant_generate would RESET the cache)
-    prompt = f"\nQuestion: {question}\nIf the text above answers this question, reply ANSWER: <answer>. If not, reply NONE."
+    # Append question to existing KV context via quant_chat.
+    # The chunk text is already in the KV cache from prefill.
+    # We only send the question — no need to repeat the document.
+    prompt = f"\n\nBased on the text above, answer this question in one sentence.\nQuestion: {question}\nAnswer:"
     tokens = []
 
     def on_token(text_ptr, ud):
