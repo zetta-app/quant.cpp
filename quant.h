@@ -17362,6 +17362,17 @@ int quant_load_context(quant_ctx* ctx, const char* path) {
 
     /* Restore position */
     ctx->n_ctx_tokens = (int)nt;
+
+    /* Reset chat state so quant_chat() treats this as a fresh session
+     * with pre-filled KV cache. Without this, quant_chat's text-prefix
+     * matching sees stale cached_text and produces misaligned output.
+     * The next quant_chat() call will re-tokenize its prompt and prefill
+     * starting from position nt (where the loaded KV ends). */
+    if (ctx->cached_text) { free(ctx->cached_text); ctx->cached_text = NULL; }
+    if (ctx->cached_tokens) { free(ctx->cached_tokens); ctx->cached_tokens = NULL; }
+    ctx->n_cached = 0;
+    ctx->cached_capacity = 0;
+
     fclose(fp);
     fprintf(stderr, "quant_load_context: restored %u tokens (%u layers) from %s\n",
             nt, nl, path);
