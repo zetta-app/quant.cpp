@@ -209,7 +209,7 @@ def stop_server():
 # reasoning chains in chat mode. Verified with the Acme test doc:
 # without this, the model picks the first entity (primacy bias);
 # with this, it correctly identifies the requested role.
-DEFAULT_SYSTEM_PROMPT = "/no_think\nAnswer in one short sentence. No reasoning steps."
+DEFAULT_SYSTEM_PROMPT = "Answer in one short sentence. No reasoning steps."
 
 
 MAX_LLM_RETRIES = 2  # retry once on transient server errors

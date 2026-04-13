@@ -260,7 +260,8 @@ static void stream_on_token(const char* text, void* user_data) {
         strstr(text, "<|endoftext|>") ||
         strstr(text, "<start_of_turn>") || strstr(text, "<end_of_turn>") ||
         strstr(text, "<|turn>") || strstr(text, "<turn|>") ||
-        strstr(text, "<|think|>") || strstr(text, "<|channel>") ||
+        strstr(text, "<|think|>") || strstr(text, "<think>") ||
+        strstr(text, "</think>") || strstr(text, "<|channel>") ||
         strstr(text, "<eos>")) return;
 
     /* JSON-escape the token */
@@ -298,7 +299,8 @@ static void collect_on_token(const char* text, void* user_data) {
         strstr(text, "<|endoftext|>") ||
         strstr(text, "<start_of_turn>") || strstr(text, "<end_of_turn>") ||
         strstr(text, "<|turn>") || strstr(text, "<turn|>") ||
-        strstr(text, "<|think|>") || strstr(text, "<|channel>") ||
+        strstr(text, "<|think|>") || strstr(text, "<think>") ||
+        strstr(text, "</think>") || strstr(text, "<|channel>") ||
         strstr(text, "<eos>")) return;
 
     size_t tlen = strlen(text);
