@@ -14320,6 +14320,20 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         }
     }
 
+    /* Gemma 4: V also gets RMS norm (weight-free, just normalization).
+     * llama.cpp gemma4-iswa.cpp line 92: Vcur = ggml_rms_norm(Vcur, eps)
+     * This is applied when QK-norm is present (same condition). */
+    if (c->is_gemma4 && layer->k_norm) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            /* Weight-free RMS norm: pass NULL weight → just normalize */
+            float* vh = s->v + h * head_dim;
+            float ss = 0.0f;
+            for (int d = 0; d < head_dim; d++) ss += vh[d] * vh[d];
+            ss = 1.0f / sqrtf(ss / head_dim + c->rms_norm_eps);
+            for (int d = 0; d < head_dim; d++) vh[d] *= ss;
+        }
+    }
+
     /* Apply RoPE (partial or full) */
     if (c->partial_rotary_factor > 0.0f && c->partial_rotary_factor < 1.0f) {
         /* Partial RoPE: only apply to first partial_rotary_factor * head_dim dims */
@@ -15676,15 +15690,13 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             tq_add(s->x, s->x, ple_proj_out, dim);
         }
 
-        /* Gemma 4: layer_output_scale scales layer CONTRIBUTION only.
-         * x_next = x_input + los * (x_current - x_input)
-         * This preserves the residual signal. With los=0.0178, only
-         * the layer's attn+ffn+PLE contribution is scaled down.
-         *
-         * CRITICAL: "x *= los" was WRONG — it destroys the residual
-         * (los=0.0178 multiplied onto the accumulated residual = catastrophic).
-         * The residual-separation formula is the correct implementation.
-         * TQ_NO_LOS=1 disables for debugging. */
+        /* Gemma 4: layer_output_scale — simple elementwise multiply.
+         * llama.cpp gemma4-iswa.cpp line 228: cur = ggml_mul(cur, out_scale)
+         * This multiplies the ENTIRE layer output (including residual).
+         * Despite out_scale being small (e.g., 0.0178 for layer 0), this is
+         * correct — the model was trained with this scaling, and each layer
+         * learns to compensate. The alternative "residual-separation" formula
+         * was WRONG (it prevents proper gradient flow as trained). */
         if (layer->layer_output_scale != 0.0f && !getenv("TQ_NO_LOS")) {
             float los = layer->layer_output_scale;
             if (pos == 0 && getenv("TQ_DEBUG") && l < 3) {
@@ -15696,7 +15708,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 fprintf(stderr, "[DEBUG] layer%d pre_scale min=%.3f max=%.3f (los=%.4f)\n", l, minv, maxv, los);
             }
             for (int i = 0; i < dim; i++) {
-                s->x[i] = layer_residual_buf[i] + los * (s->x[i] - layer_residual_buf[i]);
+                s->x[i] *= los;
             }
         }
 
