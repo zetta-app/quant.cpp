@@ -17168,19 +17168,89 @@ int quant_generate(quant_ctx* ctx, const char* prompt,
     ctx->config.on_token = on_token;
     ctx->config.user_data = user_data;
 
-    /* Reset state for new generation */
-    tq_free_state(ctx->state);
-    ctx->state = tq_create_state_ex(&ctx->model->config,
-                                     ctx->config.kv_type,
-                                     ctx->config.value_quant_bits);
-    if (!ctx->state) return -1;
+    /* If KV cache was loaded via load_context, preserve it.
+     * The loaded state has valid KV at positions [0, n_ctx_tokens).
+     * New prompt tokens will be prefilled at positions [n_ctx_tokens, ...).
+     * This enables "read once, query forever": load a document's KV cache
+     * and generate answers without re-prefilling the document.
+     *
+     * If n_ctx_tokens == 0 (no loaded context), reset as before. */
+    int continue_from_loaded = (ctx->n_ctx_tokens > 0 && ctx->state != NULL);
 
-    if (ctx->model->config.is_moe && ctx->model->moe_config) {
+    if (!continue_from_loaded) {
+        /* Fresh state for new generation */
+        tq_free_state(ctx->state);
+        ctx->state = tq_create_state_ex(&ctx->model->config,
+                                         ctx->config.kv_type,
+                                         ctx->config.value_quant_bits);
+        if (!ctx->state) return -1;
+    }
+
+    if (!continue_from_loaded && ctx->model->config.is_moe && ctx->model->moe_config) {
         ctx->state->moe_state = tq_moe_create_state(
             (const tq_moe_config_t*)ctx->model->moe_config,
             ctx->model->config.hidden_dim);
     }
 
+    if (continue_from_loaded) {
+        /* Continue from loaded KV cache: prefill new prompt tokens
+         * at positions [n_ctx_tokens, ...], then generate. */
+        int start_pos = ctx->n_ctx_tokens;
+        int prompt_tokens[4096];
+        int n_prompt = 0;
+
+        if (ctx->tokenizer && prompt) {
+            n_prompt = tq_encode(ctx->tokenizer, prompt, prompt_tokens, 4096, 0);
+        }
+        if (n_prompt <= 0) return 0;
+
+        /* Prefill new tokens starting after loaded context */
+        for (int i = 0; i < n_prompt; i++) {
+            tq_forward(ctx->model, ctx->state, prompt_tokens[i], start_pos + i);
+        }
+        int pos = start_pos + n_prompt;
+
+        /* Generate loop */
+        int vocab_size = ctx->model->config.vocab_size;
+        unsigned long long rng_state = 42ULL;
+        int next_token = tq_sample_topp(ctx->state->logits, vocab_size,
+                                         ctx->config.temperature, ctx->config.top_p,
+                                         &rng_state);
+        int generated = 0;
+        int prev_token = (n_prompt > 0) ? prompt_tokens[n_prompt - 1] : 1;
+        int eos_tokens[] = { 1, 2, 106, 128001, 128009, 248044, 248046 };
+        int n_eos = sizeof(eos_tokens) / sizeof(eos_tokens[0]);
+
+        while (generated < ctx->config.max_tokens) {
+            int is_eos = 0;
+            for (int e = 0; e < n_eos; e++)
+                if (next_token == eos_tokens[e]) { is_eos = 1; break; }
+            if (is_eos) break;
+
+            if (ctx->tokenizer) {
+                const char* piece = tq_decode(ctx->tokenizer, prev_token, next_token);
+                if (piece && ctx->config.on_token) {
+                    /* Filter template tokens */
+                    if (!strstr(piece, "<|im_end|>") && !strstr(piece, "<|end|>") &&
+                        !strstr(piece, "<|im_start|>"))
+                        ctx->config.on_token(piece, ctx->config.user_data);
+                }
+            }
+
+            prev_token = next_token;
+            tq_forward(ctx->model, ctx->state, next_token, pos);
+            pos++;
+            generated++;
+
+            next_token = tq_sample_topp(ctx->state->logits, vocab_size,
+                                         ctx->config.temperature, ctx->config.top_p,
+                                         &rng_state);
+        }
+        ctx->n_ctx_tokens = pos;
+        return generated;
+    }
+
+    /* Standard path: create fresh state via tq_generate */
     char output[65536];
     int n = tq_generate(ctx->model, ctx->tokenizer, prompt,
                         &ctx->config, output, sizeof(output));
