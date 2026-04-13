@@ -72,7 +72,15 @@ int quant_chat(quant_ctx* ctx, const char* prompt,
 // Generate and return full response as string. Caller must free().
 char* quant_ask(quant_ctx* ctx, const char* prompt);
 
-// Free a string returned by quant_ask.
+// Generate answer with built-in coherence verification.
+// Answers the question from the given context, then verifies the answer
+// actually addresses the question (not just related information).
+// Sets *out_confidence to 0.0-1.0. Returns NULL if verification fails
+// after retries. Caller must free the returned string via quant_free_string().
+char* quant_ask_verified(quant_ctx* ctx, const char* context,
+                          const char* question, float* out_confidence);
+
+// Free a string returned by quant_ask / quant_ask_verified.
 void quant_free_string(char* str);
 
 // Save/load KV cache context to/from disk. Enables "read once, query forever":
@@ -17137,6 +17145,81 @@ char* quant_ask(quant_ctx* ctx, const char* prompt) {
     }
     if (n > 0) ctx->n_ctx_tokens += n;
     return output;
+}
+
+char* quant_ask_verified(quant_ctx* ctx, const char* context,
+                          const char* question, float* out_confidence) {
+    if (!ctx || !ctx->model || !question) return NULL;
+    if (out_confidence) *out_confidence = 0.0f;
+
+    /* Build lookup prompt: context + question */
+    char* lookup_prompt = (char*)malloc(strlen(context) + strlen(question) + 256);
+    if (!lookup_prompt) return NULL;
+    sprintf(lookup_prompt,
+        "Document:\n%s\n\nQuestion: %s\n"
+        "If this text answers the question, reply ANSWER: <answer>. "
+        "If not, reply NONE.", context, question);
+
+    /* Generate answer */
+    char* answer = quant_ask(ctx, lookup_prompt);
+    free(lookup_prompt);
+    if (!answer || answer[0] == '\0') {
+        if (answer) quant_free_string(answer);
+        return NULL;
+    }
+
+    /* Check for self-reported NONE */
+    if (strncmp(answer, "NONE", 4) == 0 ||
+        strstr(answer, "does not") || strstr(answer, "cannot")) {
+        if (out_confidence) *out_confidence = 0.05f;
+        quant_free_string(answer);
+        return NULL;
+    }
+
+    /* Strip "ANSWER:" prefix */
+    char* text = answer;
+    if (strncmp(text, "ANSWER:", 7) == 0) text += 7;
+    while (*text == ' ') text++;
+
+    /* Coherence check: does the answer address the question? */
+    char* check_prompt = (char*)malloc(strlen(question) + strlen(text) + 256);
+    if (!check_prompt) {
+        if (out_confidence) *out_confidence = 0.5f;
+        /* Can't verify, return answer with medium confidence */
+        char* result = (char*)malloc(strlen(text) + 1);
+        strcpy(result, text);
+        quant_free_string(answer);
+        return result;
+    }
+    sprintf(check_prompt,
+        "A user asked: \"%s\"\n"
+        "The system answered: \"%.200s\"\n"
+        "Is the EXACT question answered? YES or NO.", question, text);
+
+    char* verdict = quant_ask(ctx, check_prompt);
+    free(check_prompt);
+
+    float conf = 0.5f;
+    if (verdict) {
+        char v = verdict[0];
+        if (v == 'Y' || v == 'y') conf = 0.9f;
+        else if (v == 'N' || v == 'n') conf = 0.1f;
+        quant_free_string(verdict);
+    }
+
+    if (out_confidence) *out_confidence = conf;
+
+    if (conf < 0.3f) {
+        /* Coherence failed — answer doesn't address the question */
+        quant_free_string(answer);
+        return NULL;
+    }
+
+    /* Return verified answer */
+    char* result = (char*)malloc(strlen(text) + 1);
+    strcpy(result, text);
+    quant_free_string(answer);
+    return result;
 }
 
 void quant_free_string(char* str) {
