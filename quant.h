@@ -11851,20 +11851,20 @@ tq_model_t* tq_load_gguf(const char* path) {
             }
         }
 
-        /* Phi-3 fused QKV detection.
-         *
-         * Phi-3 ships `blk.N.attn_qkv.weight` with shape [hidden, 3*hidden]
-         * instead of three separate `attn_q/k/v.weight` tensors. We store
-         * the fused pointer in `gguf_w_qkv` and the forward path dispatches
-         * one matmul + split. The layer is marked as an attention layer
-         * via the same `is_attn_layer` flag the standard path uses, so
-         * the rest of the loader and tq_forward treat it normally. */
+        /* Early DeltaNet probe: check if this layer has SSM weights BEFORE
+         * the fused QKV detection. DeltaNet layers also have attn_qkv.weight
+         * (for conv1d input), and we must NOT treat it as a Phi-3 fused QKV. */
+        int layer_is_deltanet = 0;
+        {
+            char ssm_probe[128];
+            snprintf(ssm_probe, sizeof(ssm_probe), "blk.%d.ssm_a", l);
+            if (find_gguf_tensor(gguf, ssm_probe)) layer_is_deltanet = 1;
+        }
+
+        /* Phi-3 fused QKV detection (skip for DeltaNet layers). */
         snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
         const tq_gguf_tensor_t* wqkv_t = find_gguf_tensor(gguf, tname);
-        if (wqkv_t && !layer->delta_a_log) {
-            /* Phi-3 fused QKV (NOT DeltaNet). DeltaNet layers also have
-             * attn_qkv.weight but it's the conv1d input, not a fused
-             * attention projection. The delta_a_log check distinguishes. */
+        if (wqkv_t && !layer_is_deltanet) {
             layer->gguf_w_qkv = wqkv_t->data;
             layer->gguf_w_qkv_type = wqkv_t->type;
             c->has_fused_qkv = 1;
