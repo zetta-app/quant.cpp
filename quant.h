@@ -16035,6 +16035,23 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     int prompt_tokens[4096];
     int n_prompt = 0;
 
+    /* Debug: inject exact token IDs (bypass tokenizer) for comparison.
+     * TQ_INJECT_TOKENS="2,105,9731,107,..." */
+    {
+        const char* inject = getenv("TQ_INJECT_TOKENS");
+        if (inject) {
+            char buf[4096];
+            strncpy(buf, inject, sizeof(buf)-1); buf[sizeof(buf)-1] = 0;
+            char* tok = strtok(buf, ",");
+            while (tok && n_prompt < 4096) {
+                prompt_tokens[n_prompt++] = atoi(tok);
+                tok = strtok(NULL, ",");
+            }
+            fprintf(stderr, "[DEBUG] injected %d tokens\n", n_prompt);
+            goto tq_gen_skip_tokenize;
+        }
+    }
+
     if (tokenizer && prompt) {
         /* Decide whether to prepend BOS:
          *   - Gemma:           always (model_type == 1)
@@ -16068,6 +16085,7 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         n_prompt = 1;
     }
 
+tq_gen_skip_tokenize:
     if (n_prompt <= 0) {
         prompt_tokens[0] = (model->config.model_type == 1) ? 2 : 1;
         n_prompt = 1;
