@@ -1241,8 +1241,13 @@ int main(int argc, char** argv) {
     char chat_prompt[8192];
     if (chat_mode) {
         tq_model_config_t* mc = &model->config;
-        if (mc->model_type == 1) {
-            /* Gemma 3/4: <start_of_turn>user\n...\n<end_of_turn>\n<start_of_turn>model\n */
+        if (mc->model_type == 1 && mc->is_gemma4) {
+            /* Gemma 4: uses <|turn> tokens + thinking mode.
+             * Reference: llama.cpp apply-template output for gemma4. */
+            snprintf(chat_prompt, sizeof(chat_prompt),
+                "<|turn>system\n<|think|><turn|>\n<|turn>user\n%s<turn|>\n<|turn>model\n", prompt);
+        } else if (mc->model_type == 1) {
+            /* Gemma 2/3: <start_of_turn>user\n...\n<end_of_turn>\n<start_of_turn>model\n */
             snprintf(chat_prompt, sizeof(chat_prompt),
                 "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", prompt);
         } else if (strstr(prompt, "<|start_header_id|>") == NULL) {

@@ -64,6 +64,17 @@ static char* build_prompt(const char** roles, const char** contents,
     char* w = p;
     size_t rem = total;
 
+    /* Gemma 4: prepend system+think block if no system message present */
+    if (template_type == TMPL_GEMMA) {
+        int has_system = 0;
+        for (int i = 0; i < n_msgs; i++)
+            if (strcmp(roles[i], "system") == 0) { has_system = 1; break; }
+        if (!has_system) {
+            int n = snprintf(w, rem, "<|turn>system\n<|think|><turn|>\n");
+            if (n > 0 && (size_t)n < rem) { w += n; rem -= (size_t)n; }
+        }
+    }
+
     for (int i = 0; i < n_msgs; i++) {
         const char* c = contents[i] ? contents[i] : "";
         int n;
@@ -75,13 +86,15 @@ static char* build_prompt(const char** roles, const char** contents,
             else
                 n = snprintf(w, rem, "<|assistant|>\n%s<|end|>\n", c);
         } else if (template_type == TMPL_GEMMA) {
-            /* Gemma: <start_of_turn>user\n...<end_of_turn>\n */
+            /* Gemma 4: uses <|turn>role\n...<turn|> tokens (NOT <start_of_turn>).
+             * System prompt includes <|think|> to enable thinking mode.
+             * Reference: llama.cpp apply-template output for gemma4. */
             if (strcmp(roles[i], "system") == 0)
-                n = snprintf(w, rem, "<start_of_turn>user\n%s<end_of_turn>\n", c);
+                n = snprintf(w, rem, "<|turn>system\n%s<|think|><turn|>\n", c);
             else if (strcmp(roles[i], "user") == 0)
-                n = snprintf(w, rem, "<start_of_turn>user\n%s<end_of_turn>\n", c);
+                n = snprintf(w, rem, "<|turn>user\n%s<turn|>\n", c);
             else
-                n = snprintf(w, rem, "<start_of_turn>model\n%s<end_of_turn>\n", c);
+                n = snprintf(w, rem, "<|turn>model\n%s<turn|>\n", c);
         } else {
             /* ChatML: <|im_start|>role\n...<|im_end|>\n */
             n = snprintf(w, rem, "<|im_start|>%s\n%s<|im_end|>\n", roles[i], c);
@@ -91,7 +104,7 @@ static char* build_prompt(const char** roles, const char** contents,
     if (template_type == TMPL_PHI3)
         snprintf(w, rem, "<|assistant|>\n");
     else if (template_type == TMPL_GEMMA)
-        snprintf(w, rem, "<start_of_turn>model\n");
+        snprintf(w, rem, "<|turn>model\n");
     else
         snprintf(w, rem, "<|im_start|>assistant\n");
 
@@ -246,6 +259,8 @@ static void stream_on_token(const char* text, void* user_data) {
         strstr(text, "<|im_end|>") || strstr(text, "<|im_start|>") ||
         strstr(text, "<|endoftext|>") ||
         strstr(text, "<start_of_turn>") || strstr(text, "<end_of_turn>") ||
+        strstr(text, "<|turn>") || strstr(text, "<turn|>") ||
+        strstr(text, "<|think|>") || strstr(text, "<|channel>") ||
         strstr(text, "<eos>")) return;
 
     /* JSON-escape the token */
@@ -282,6 +297,8 @@ static void collect_on_token(const char* text, void* user_data) {
         strstr(text, "<|im_end|>") || strstr(text, "<|im_start|>") ||
         strstr(text, "<|endoftext|>") ||
         strstr(text, "<start_of_turn>") || strstr(text, "<end_of_turn>") ||
+        strstr(text, "<|turn>") || strstr(text, "<turn|>") ||
+        strstr(text, "<|think|>") || strstr(text, "<|channel>") ||
         strstr(text, "<eos>")) return;
 
     size_t tlen = strlen(text);
