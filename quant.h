@@ -14239,6 +14239,10 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         } else {
             tq_matmul(s->q, s->xb, layer->wq, n_heads * head_dim, dim);
         }
+        if (pos == 0 && l == 0 && getenv("TQ_DEBUG")) {
+            fprintf(stderr, "[DEBUG] layer0 Q[0:4] = %.4f %.4f %.4f %.4f  K[0:4] = ",
+                    s->q[0], s->q[1], s->q[2], s->q[3]);
+        }
     }
     if (kv_shared_skip && kv_shared_ref_layer >= 0) {
         /* KV sharing: skip K/V projection for shared layers.
@@ -14284,6 +14288,9 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         tq_matmul_gguf(s->k, s->xb, layer->gguf_wk, layer->gguf_wk_type, kv_dim, dim);
     } else {
         tq_matmul(s->k, s->xb, layer->wk, kv_dim, dim);
+    }
+    if (pos == 0 && l == 0 && getenv("TQ_DEBUG")) {
+        fprintf(stderr, "%.4f %.4f %.4f %.4f\n", s->k[0], s->k[1], s->k[2], s->k[3]);
     }
     if (has_fused_qkv_layer) {
         /* skip — handled by the fused branch */
@@ -15446,6 +15453,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
 
         /* Pre-attention/DeltaNet RMSNorm */
         tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
+
+        if (pos == 0 && l == 0 && getenv("TQ_DEBUG")) {
+            fprintf(stderr, "[DEBUG] layer0 attn_norm_out[0:4] = %.4f %.4f %.4f %.4f\n",
+                    s->xb[0], s->xb[1], s->xb[2], s->xb[3]);
+        }
 
         if (layer->delta_a_log) {
             /* DeltaNet layer */
