@@ -1040,15 +1040,6 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             tq_matmul(s->q, s->xb, layer->wq, n_heads * head_dim, dim);
         }
     }
-    /* Debug: compare Q projection with llama.cpp */
-    if (l == 0 && pos == 0 && getenv("TQ_CMP")) {
-        fprintf(stderr, "[CMP] L0 Q[0:8] = ");
-        for (int _d = 0; _d < 8; _d++) fprintf(stderr, "%.4f ", s->q[_d]);
-        fprintf(stderr, "... Q[2040:2048] = ");
-        for (int _d = 2040; _d < 2048 && _d < n_heads * head_dim; _d++) fprintf(stderr, "%.4f ", s->q[_d]);
-        fprintf(stderr, "\n");
-    }
-
     /* Check if this is a KV-shared layer (reuse KV cache from source layer).
      * KV-shared layers DO have K/V weights in GGUF but we skip them, matching
      * llama.cpp's has_kv(il) which returns false for l >= n_layer - n_kv_shared_layers. */
@@ -2248,13 +2239,6 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                 is_full_dbg ? "FULL" : "sliding");
     }
 
-    /* Debug: compare wo output (xb2) with llama.cpp reference */
-    if (l == 0 && pos == 0 && getenv("TQ_CMP")) {
-        fprintf(stderr, "[CMP] L0 wo_out[0:8] = ");
-        for (int _d = 0; _d < 8 && _d < dim; _d++) fprintf(stderr, "%.4f ", s->xb2[_d]);
-        fprintf(stderr, "\n");
-    }
-
     /* Residual */
     tq_add(s->x, s->x, s->xb2, dim);
 }
@@ -2483,15 +2467,6 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         /* Pre-attention/DeltaNet RMSNorm */
         tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
 
-        /* Debug: compare intermediate values with llama.cpp reference */
-        if (l == 0 && pos == 0 && getenv("TQ_CMP")) {
-            fprintf(stderr, "[CMP] L0 attn_norm[0:8] = ");
-            for (int _d = 0; _d < 8 && _d < dim; _d++) fprintf(stderr, "%.4f ", s->xb[_d]);
-            fprintf(stderr, "... [%d:%d] = ", dim-3, dim);
-            for (int _d = dim-3; _d < dim; _d++) fprintf(stderr, "%.4f ", s->xb[_d]);
-            fprintf(stderr, "\n");
-        }
-
         /* Begin layer-level GPU batch scope: all GGUF matmuls in this layer
          * (QKV, wo, gate, up, down) encode into shared command buffers.
          * Intermediate flushes synchronize where CPU needs GPU results.
@@ -2546,12 +2521,6 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 tq_rmsnorm(s->xb2, s->xb2, layer->post_attn_norm, dim, c->rms_norm_eps);
                 /* Re-add normalized output */
                 tq_add(s->x, s->x, s->xb2, dim);
-            }
-            /* Debug: compare attn_out (after post_attn_norm + residual) with llama.cpp */
-            if (l == 0 && pos == 0 && getenv("TQ_CMP")) {
-                fprintf(stderr, "[CMP] L0 attn_out[0:8] = ");
-                for (int _d = 0; _d < 8 && _d < dim; _d++) fprintf(stderr, "%.4f ", s->x[_d]);
-                fprintf(stderr, "\n");
             }
         }
         /* else: skip (should not happen for valid models) */
@@ -2901,7 +2870,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
 
         /* Debug: print layer output */
         if (pos == 0 && getenv("TQ_DEBUG")) {
-            if (l < 10 || l == c->n_layers - 1 || l % 10 == 0 || getenv("TQ_CMP")) {
+            if (l < 10 || l == c->n_layers - 1 || l % 10 == 0) {
                 float maxv = 0, minv = 0;
                 for (int i = 0; i < dim; i++) {
                     if (s->x[i] > maxv) maxv = s->x[i];
@@ -2942,7 +2911,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     }
     TQ_PROF_STOP(_tp, matmul_ns);
 
-    if ((pos <= 1 || getenv("TQ_CMP")) && getenv("TQ_DEBUG")) {
+    if (pos <= 1 && getenv("TQ_DEBUG")) {
         /* Print top-5 logits for debugging */
         fprintf(stderr, "[DEBUG] pos=%d logits[0:8] = ", pos);
         for (int i = 0; i < 8; i++) fprintf(stderr, "%.2f ", s->logits[i]);
