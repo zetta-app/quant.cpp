@@ -3246,10 +3246,16 @@ tq_model_t* tq_load_gguf(const char* path) {
          * the existing FP32 weight pointer fields. For GGUF models, we use a special
          * dispatch: if gguf_ctx is non-NULL, the forward pass uses tq_matmul_gguf. */
 
-        /* Fused QKV detection (Phi-3 etc.): attn_qkv.weight contains Q, K, V concatenated */
+        /* Fused QKV detection (Phi-3 etc.): attn_qkv.weight contains Q, K, V concatenated.
+         * NOTE: Qwen3.5 DeltaNet layers ALSO have attn_qkv.weight as their fused Q/K/V
+         * projection, but those are NOT self-attention. Distinguish by checking for
+         * DeltaNet marker tensor (ssm_a) at the same layer — if present, this is a
+         * DeltaNet layer and the attn_qkv will be loaded by the DeltaNet path below. */
+        snprintf(tname, sizeof(tname), "blk.%d.ssm_a", l);
+        const tq_gguf_tensor_t* ssm_probe = find_gguf_tensor(gguf, tname);
         snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
         const tq_gguf_tensor_t* wqkv_t = find_gguf_tensor(gguf, tname);
-        if (wqkv_t) {
+        if (wqkv_t && !ssm_probe) {
             layer->gguf_w_qkv = wqkv_t->data;
             layer->gguf_w_qkv_type = wqkv_t->type;
             c->has_fused_qkv = 1;
