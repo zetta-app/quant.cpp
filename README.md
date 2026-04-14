@@ -403,18 +403,26 @@ Both are per-block methods. The quality gap comes from block size (128 vs 32), m
 
 ### vs llama.cpp: Inference speed (honest numbers)
 
-Generation throughput, 50 tokens, 4 threads, CPU-only, Apple M1 Pro:
+Generation throughput, 30 tokens, 4 threads, CPU-only, Apple M1 Pro:
 
 | Model | quant.cpp | llama.cpp | Ratio |
 |:--|:-:|:-:|:-:|
-| Llama 3.2 3B Q8_0 | **13.3 tok/s** | 12.6 tok/s | **105%** ✅ |
-| Phi-3.5-mini Q8_0 | 4.0 tok/s | 7.7 tok/s | 52% |
-| Phi-3.5-mini Q4_K_M | 2.9 tok/s | 16.0 tok/s | 18% |
-| Llama 3.2 1B Q8_0 | 38.3 tok/s | 289.7 tok/s | 13% |
+| Llama 3.2 3B Q8_0 | **10.2 tok/s** | 13.5 tok/s | **75%** ✅ |
+| Phi-3.5-mini Q8_0 | 5.0 tok/s | 9.8 tok/s | 51% |
+| Phi-3.5-mini Q4_K_M | 2.7 tok/s | 17.5 tok/s | 15% |
+| Gemma 4 E2B Q8_0 | 16.3 tok/s | 175.8 tok/s | 9% |
+| Gemma 4 E4B Q8_0 | 4.8 tok/s | 34.8 tok/s | 14% |
+| Gemma 4 E4B Q4_0 | 4.8 tok/s | 50.5 tok/s | 10% |
 
-**Where we match**: Q8_0 on 3B-class models — our NEON int8×int8 fused dot is competitive with llama.cpp's hand-tuned assembly.
+**Where we're competitive**: Q8_0 on mid-size (3B-class) models — our NEON int8×int8 fused dot path approaches llama.cpp's hand-tuned assembly (75% on Llama 3.2 3B).
 
-**Where we lag**: Q4_K_M (mixed Q2_K/Q3_K/Q4_K) — llama.cpp has years of assembly tuning on these K-quant types. We have NEON for Q4_K and Q2_K but not Q3_K, and our implementations are ~2-5× slower than llama.cpp's tuned code.
+**Where we lag (2-10×)**:
+- **Q4_K_M** (mixed Q2_K/Q3_K/Q4_K) — llama.cpp has years of assembly tuning on K-quant types. We have NEON for Q4_K and Q2_K but not Q3_K.
+- **Large vocab models** (Gemma 4, 262K vocab) — the lm_head matmul alone is 2560×262144. llama.cpp's Q8_0 matmul benefits disproportionately from CPU-specific tiling we haven't implemented.
+- **Tiny models** (<1B) — llama.cpp's scheduling and batch overhead is optimized for cases where per-matmul work is small.
+
+**Known correctness issues**:
+- **Qwen3.5-4B** (`architecture = qwen35`, DeltaNet hybrid) — forward pass runs without errors but produces whitespace-only output. llama.cpp produces `<think>...` reasoning. Root cause unidentified.
 
 **Why we still exist**: llama.cpp is ~500K LOC (C++/CUDA/Metal/Vulkan). quant.cpp is ~17.6K LOC of C with zero dependencies. If you want the fastest inference, use llama.cpp. If you want something you can read end-to-end, embed in a single `.c` file, or use as a research platform for new KV compression methods — we're the alternative.
 
