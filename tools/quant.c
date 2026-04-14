@@ -62,9 +62,27 @@ static int clock_gettime(int id, struct timespec* ts) {
 /* Forward-pass profiling flag (defined in tq_transformer.c) */
 extern int g_tq_profile_enabled;
 
-/* Streaming token callback */
+/* Streaming token callback — filters chat-template control tokens that
+ * would otherwise leak into CLI output when --chat is active. */
 static void print_token(const char* text, void* user_data) {
     (void)user_data;
+    if (!text || !text[0]) return;
+
+    /* Skip thinking / template tokens (same list as server). Gemma 4 raw
+     * output contains <|think|>, Qwen3 uses <think>/</think>, chat-templated
+     * models may emit <|end|>/<|im_end|>/<|eot_id|> etc. */
+    if (strstr(text, "<|think|>") || strstr(text, "<think>") ||
+        strstr(text, "</think>") || strstr(text, "<|channel>") ||
+        strstr(text, "<|turn>") || strstr(text, "<turn|>") ||
+        strstr(text, "<|end|>") || strstr(text, "<|assistant|>") ||
+        strstr(text, "<|user|>") || strstr(text, "<|system|>") ||
+        strstr(text, "<|im_end|>") || strstr(text, "<|im_start|>") ||
+        strstr(text, "<start_of_turn>") || strstr(text, "<end_of_turn>") ||
+        strstr(text, "<|begin_of_text|>") || strstr(text, "<|end_of_text|>") ||
+        strstr(text, "<|start_header_id|>") || strstr(text, "<|end_header_id|>") ||
+        strstr(text, "<|eot_id|>"))
+        return;
+
     fputs(text, stdout);
     fflush(stdout);
 }
