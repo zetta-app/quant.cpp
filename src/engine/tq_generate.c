@@ -304,8 +304,28 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     if (config->load_kv_path && pos_after_prefill > 0) {
         prefill_start = pos_after_prefill;
     }
-    for (int i = 0; i < n_prompt; i++) {
-        tq_forward(model, state, prompt_tokens[i], prefill_start + i);
+    /* Batched prefill experimental path — disabled by default until
+     * the per-token equivalence is verified across all supported
+     * architectures. The matmul primitive (tq_batched_matmul_q4) is
+     * unit-tested correct; the integration in tq_forward_batch still
+     * has a numerical mismatch (under investigation). Opt-in via
+     * TQ_BATCH_PREFILL=1 for development testing only. */
+    int batch_ok = 0;
+    if (n_prompt >= 2 && getenv("TQ_BATCH_PREFILL")) {
+        int rc = tq_forward_batch(model, state, prompt_tokens, n_prompt, prefill_start);
+        if (getenv("TQ_DEBUG_PREFILL"))
+            fprintf(stderr, "[batch_prefill] rc=%d expected=%d (N=%d)\n",
+                    rc, prefill_start + n_prompt, n_prompt);
+        if (rc == prefill_start + n_prompt) {
+            tq_forward(model, state, prompt_tokens[n_prompt - 1],
+                       prefill_start + n_prompt - 1);
+            batch_ok = 1;
+        }
+    }
+    if (!batch_ok) {
+        for (int i = 0; i < n_prompt; i++) {
+            tq_forward(model, state, prompt_tokens[i], prefill_start + i);
+        }
     }
     pos_after_prefill = prefill_start + n_prompt;
 

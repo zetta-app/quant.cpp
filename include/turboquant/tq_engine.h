@@ -528,6 +528,22 @@ void tq_free_state(tq_state_t* state);
 /* Inference — returns pointer to logits (owned by state) */
 float* tq_forward(tq_model_t* model, tq_state_t* state, int token, int pos);
 
+/* Batched prefill — process N consecutive tokens in one call, sharing
+ * weight reads across the batch via tq_batched_matmul_q4. Supports the
+ * standard Llama architecture (Q/K/V/O + gate/up/down, RoPE, RMSNorm).
+ * For unsupported architectures (Phi-3 fused QKV, Gemma 4 dual-FFN,
+ * DeltaNet hybrids, MoE) returns -1 and the caller should fall back to
+ * a per-token loop of tq_forward.
+ *
+ * On success returns pos_start + N (the next position to write).
+ * The KV cache is updated in place. Logits are NOT computed (prefill
+ * only needs them for the very last token, and the caller can still
+ * call tq_forward(token, pos_start+N-1) for that purpose if needed).
+ *
+ * Requires: model->use_q4_weights (load-time Q4 conversion). */
+int tq_forward_batch(tq_model_t* model, tq_state_t* state,
+                     const int* tokens, int N, int pos_start);
+
 /* Generation */
 int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
                 const char* prompt, tq_gen_config_t* config,

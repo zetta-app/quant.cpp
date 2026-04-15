@@ -3013,3 +3013,308 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     }
     return s->logits;
 }
+
+/* ============================================================
+ * Batched prefill — process N consecutive tokens in one call.
+ *
+ * Strategy: walk the layers exactly like tq_forward does, but with the
+ * matmul calls replaced by tq_batched_matmul_q4 over an [N, D] activation
+ * matrix. Per-token operations (RoPE, attention against history) are
+ * still sequential — this is fine because attention is small for short
+ * context; the matmul gains dominate. KV cache writes are per-token but
+ * to consecutive positions [pos_start..pos_start+N).
+ *
+ * Currently supported: standard Llama family with load-time Q4 conversion
+ * (use_q4_weights=1, separate Q/K/V/O + gate/up/down). Returns -1 for
+ * unsupported architectures so the caller falls back to a per-token loop.
+ *
+ * Output: KV cache populated for [pos_start..pos_start+N). Logits NOT
+ * computed (would require an extra batched lm_head matmul; the caller
+ * can still tq_forward(token[N-1], pos_start+N-1) for the final token).
+ * ============================================================ */
+int tq_forward_batch(tq_model_t* model, tq_state_t* s,
+                     const int* tokens, int N, int pos_start) {
+    if (N <= 0) return pos_start;
+    tq_model_config_t* c = &model->config;
+
+    /* Architectural gating: only standard Llama for now. */
+    int dbg = (getenv("TQ_DEBUG_PREFILL") != NULL);
+    if (!model->use_q4_weights)               { if (dbg) fprintf(stderr, "[batch] bail: !use_q4_weights\n"); return -1; }
+    if (c->is_moe || c->is_gemma4)             { if (dbg) fprintf(stderr, "[batch] bail: moe/gemma4\n"); return -1; }
+    if (c->has_fused_qkv || c->has_fused_up_gate) { if (dbg) fprintf(stderr, "[batch] bail: fused qkv/up\n"); return -1; }
+    if (c->n_kv_shared_layers > 0)             { if (dbg) fprintf(stderr, "[batch] bail: kv_shared\n"); return -1; }
+    /* DeltaNet check */
+    for (int l = 0; l < c->n_layers; l++) {
+        if (model->layers[l].delta_a_log)       { if (dbg) fprintf(stderr, "[batch] bail: deltanet l=%d\n", l); return -1; }
+    }
+
+    int dim = c->hidden_dim;
+    int q_dim = c->n_heads * c->head_dim;
+    int kv_dim = c->n_kv_heads * c->head_dim;
+    int inter = c->intermediate_dim;
+
+    /* Allocate batch scratch (N×{dim, q_dim, kv_dim, inter} FP32).
+     * For Phi-3.5 N=32: 7 buffers × 32 × 8192 × 4 = 7 MB. Trivial. */
+    size_t bytes_x  = (size_t)N * dim   * sizeof(float);
+    size_t bytes_q  = (size_t)N * q_dim * sizeof(float);
+    size_t bytes_kv = (size_t)N * kv_dim * sizeof(float);
+    size_t bytes_h  = (size_t)N * inter * sizeof(float);
+
+    float* X     = (float*)malloc(bytes_x);
+    float* Xres  = (float*)malloc(bytes_x);  /* residual stream */
+    float* XBN   = (float*)malloc(bytes_x);  /* normed for matmul */
+    float* QB    = (float*)malloc(bytes_q);
+    float* KB    = (float*)malloc(bytes_kv);
+    float* VB    = (float*)malloc(bytes_kv);
+    float* OB    = (float*)malloc(bytes_x);
+    float* GB    = (float*)malloc(bytes_h);
+    float* UB    = (float*)malloc(bytes_h);
+    if (!X || !Xres || !XBN || !QB || !KB || !VB || !OB || !GB || !UB) {
+        free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+        free(OB); free(GB); free(UB);
+        return -1;
+    }
+
+    /* Step 1: token embeddings (per-token). Mirror tq_forward's lookup.
+     * Three sources: BF16 mmap, GGUF on-demand dequant, or FP32 table. */
+    for (int n = 0; n < N; n++) {
+        int tok = tokens[n];
+        float* dst = Xres + (size_t)n * dim;
+        if (model->embed_bf16) {
+            const uint16_t* src = model->embed_bf16 + (size_t)tok * dim;
+            for (int i = 0; i < dim; i++) {
+                uint32_t bits = ((uint32_t)src[i]) << 16;
+                memcpy(&dst[i], &bits, 4);
+            }
+        } else if (model->embed_gguf && !model->token_embedding) {
+            int block_elems = tq_ggml_type_blck(model->embed_gguf_type);
+            int block_bytes = (int)tq_ggml_type_size(model->embed_gguf_type);
+            int n_blocks = dim / block_elems;
+            size_t row_bytes = (size_t)n_blocks * block_bytes;
+            const uint8_t* row_ptr = (const uint8_t*)model->embed_gguf + (size_t)tok * row_bytes;
+            tq_dequant_row_gguf(model->embed_gguf_type, row_ptr, dst, dim);
+        } else if (model->token_embedding) {
+            memcpy(dst, model->token_embedding + (size_t)tok * dim,
+                   (size_t)dim * sizeof(float));
+        } else {
+            if (dbg) fprintf(stderr, "[batch] bail: no embed source (n=%d tok=%d)\n", n, tok);
+            free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+            free(OB); free(GB); free(UB);
+            return -1;
+        }
+    }
+
+    /* Per-layer KV cache stride (FP32 K and V). */
+    size_t kv_layer_stride = (size_t)c->max_seq_len * (size_t)kv_dim;
+
+    for (int l = 0; l < c->n_layers; l++) {
+        tq_layer_weights_t* layer = &model->layers[l];
+
+        /* Required Q4 weights for this fast path. */
+        if (!layer->wq_q4 || !layer->wk_q4 || !layer->wv_q4 || !layer->wo_q4 ||
+            !layer->w_gate_q4 || !layer->w_up_q4 || !layer->w_down_q4) {
+            if (dbg) fprintf(stderr, "[batch] bail: layer %d missing q4 weights (wq=%p wk=%p wv=%p wo=%p g=%p u=%p d=%p)\n",
+                l, (void*)layer->wq_q4, (void*)layer->wk_q4, (void*)layer->wv_q4,
+                (void*)layer->wo_q4, (void*)layer->w_gate_q4, (void*)layer->w_up_q4, (void*)layer->w_down_q4);
+            free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+            free(OB); free(GB); free(UB);
+            return -1;
+        }
+
+        /* 1. attn RMSNorm (per-row) */
+        for (int n = 0; n < N; n++) {
+            tq_rmsnorm(XBN + (size_t)n * dim, Xres + (size_t)n * dim,
+                       layer->attn_norm, dim, c->rms_norm_eps);
+        }
+
+        /* 2. Q, K, V batched matmul */
+        tq_batched_matmul_q4(QB, layer->wq_q4, layer->wq_q4s, XBN, q_dim,  dim, N, NULL);
+        tq_batched_matmul_q4(KB, layer->wk_q4, layer->wk_q4s, XBN, kv_dim, dim, N, NULL);
+        tq_batched_matmul_q4(VB, layer->wv_q4, layer->wv_q4s, XBN, kv_dim, dim, N, NULL);
+
+        /* 3. RoPE + KV cache write (per-token).
+         * Mirror tq_forward's RoPE selection: if model->rope_freqs is set
+         * (Llama 3.x learned RoPE scaling, 64 freq factors), apply per-pair
+         * factor; otherwise plain interleaved RoPE. */
+        for (int n = 0; n < N; n++) {
+            float* qn = QB + (size_t)n * q_dim;
+            float* kn = KB + (size_t)n * kv_dim;
+            int pos = pos_start + n;
+            if (model->rope_freqs && model->rope_freqs_len > 0) {
+                int rope_pairs = c->head_dim / 2;
+                if (rope_pairs > model->rope_freqs_len) rope_pairs = model->rope_freqs_len;
+                /* Llama 3 uses interleaved layout (a=2i, b=2i+1) */
+                for (int h = 0; h < c->n_heads; h++) {
+                    float* qh = qn + h * c->head_dim;
+                    for (int i = 0; i < rope_pairs; i++) {
+                        float base = 1.0f / powf(c->rope_freq_base, 2.0f * i / (float)c->head_dim);
+                        float freq = base / model->rope_freqs[i];
+                        float theta = pos * freq;
+                        float ct = cosf(theta), st = sinf(theta);
+                        float q0 = qh[2*i], q1 = qh[2*i+1];
+                        qh[2*i]   = q0 * ct - q1 * st;
+                        qh[2*i+1] = q0 * st + q1 * ct;
+                    }
+                }
+                for (int h = 0; h < c->n_kv_heads; h++) {
+                    float* kh = kn + h * c->head_dim;
+                    for (int i = 0; i < rope_pairs; i++) {
+                        float base = 1.0f / powf(c->rope_freq_base, 2.0f * i / (float)c->head_dim);
+                        float freq = base / model->rope_freqs[i];
+                        float theta = pos * freq;
+                        float ct = cosf(theta), st = sinf(theta);
+                        float k0 = kh[2*i], k1 = kh[2*i+1];
+                        kh[2*i]   = k0 * ct - k1 * st;
+                        kh[2*i+1] = k0 * st + k1 * ct;
+                    }
+                }
+            } else {
+                tq_rope(qn, kn, pos, c->head_dim, c->n_heads, c->n_kv_heads,
+                        c->rope_freq_base);
+            }
+            /* Write to cache */
+            memcpy(s->key_cache + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim,
+                   kn, (size_t)kv_dim * sizeof(float));
+            if (s->value_cache) {
+                memcpy(s->value_cache + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim,
+                       VB + (size_t)n * kv_dim, (size_t)kv_dim * sizeof(float));
+            } else if (s->value_cache_fp16) {
+                /* FP32 → FP16 conversion for storage. */
+                uint16_t* dst = s->value_cache_fp16
+                              + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim;
+                const float* src = VB + (size_t)n * kv_dim;
+                for (int i = 0; i < kv_dim; i++) {
+                    /* Use round-to-nearest IEEE 754 binary16 conversion via union */
+                    union { float f; uint32_t u; } v = { .f = src[i] };
+                    uint32_t b = v.u;
+                    uint16_t sign = (b >> 16) & 0x8000;
+                    int32_t  e    = (int32_t)((b >> 23) & 0xff) - 127 + 15;
+                    uint32_t m    = b & 0x7fffff;
+                    uint16_t out;
+                    if (e <= 0) {
+                        if (e < -10) out = sign;
+                        else {
+                            m = (m | 0x800000) >> (1 - e);
+                            if (m & 0x1000) m += 0x2000;
+                            out = sign | (uint16_t)(m >> 13);
+                        }
+                    } else if (e >= 31) {
+                        out = sign | 0x7c00 | (m ? (uint16_t)(m >> 13) : 0);
+                    } else {
+                        if (m & 0x1000) {
+                            m += 0x2000;
+                            if (m & 0x800000) { m = 0; e++; }
+                        }
+                        out = sign | ((uint16_t)e << 10) | (uint16_t)(m >> 13);
+                    }
+                    dst[i] = out;
+                }
+            } else {
+                if (dbg) fprintf(stderr, "[batch] bail: no FP32/FP16 V cache\n");
+                free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+                free(OB); free(GB); free(UB);
+                return -1;
+            }
+        }
+
+        /* 4. Attention (per-token, sequential — needs all preceding KV). */
+        int n_kv_heads = c->n_kv_heads;
+        int head_dim   = c->head_dim;
+        int n_heads    = c->n_heads;
+        int kv_mul     = n_heads / n_kv_heads;
+        float*    K_layer = s->key_cache + (size_t)l * kv_layer_stride;
+        float*    V_layer = s->value_cache ? (s->value_cache + (size_t)l * kv_layer_stride) : NULL;
+        uint16_t* V_layer_fp16 = s->value_cache_fp16
+                               ? (s->value_cache_fp16 + (size_t)l * kv_layer_stride) : NULL;
+
+        for (int n = 0; n < N; n++) {
+            int pos = pos_start + n;
+            float* qn = QB + (size_t)n * q_dim;
+            float* on = OB + (size_t)n * dim;
+            for (int h = 0; h < n_heads; h++) {
+                int kvh = h / kv_mul;
+                float* qh = qn + h * head_dim;
+                float* att = s->att + (size_t)h * c->max_seq_len;
+                float scale = 1.0f / sqrtf((float)head_dim);
+                for (int t = 0; t <= pos; t++) {
+                    float* kh = K_layer + (size_t)t * kv_dim + kvh * head_dim;
+                    float score = 0.0f;
+                    for (int i = 0; i < head_dim; i++) score += qh[i] * kh[i];
+                    att[t] = score * scale;
+                }
+                tq_softmax(att, pos + 1);
+                float* oh = on + h * head_dim;
+                memset(oh, 0, (size_t)head_dim * sizeof(float));
+                if (V_layer) {
+                    for (int t = 0; t <= pos; t++) {
+                        float* vh = V_layer + (size_t)t * kv_dim + kvh * head_dim;
+                        float w = att[t];
+                        for (int i = 0; i < head_dim; i++) oh[i] += w * vh[i];
+                    }
+                } else {
+                    /* FP16 V cache: dequant per element via shift. */
+                    for (int t = 0; t <= pos; t++) {
+                        uint16_t* vh = V_layer_fp16 + (size_t)t * kv_dim + kvh * head_dim;
+                        float w = att[t];
+                        for (int i = 0; i < head_dim; i++) {
+                            uint16_t h16 = vh[i];
+                            uint32_t sign = (uint32_t)(h16 >> 15) << 31;
+                            uint32_t exp  = (h16 >> 10) & 0x1f;
+                            uint32_t mant = h16 & 0x3ff;
+                            uint32_t bits;
+                            if (exp == 0) {
+                                if (mant == 0) bits = sign;
+                                else {
+                                    /* subnormal */
+                                    while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                                    mant &= 0x3ff;
+                                    bits = sign | ((exp + 127 - 15 + 1) << 23) | (mant << 13);
+                                }
+                            } else if (exp == 31) {
+                                bits = sign | 0x7f800000u | (mant << 13);
+                            } else {
+                                bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+                            }
+                            float vf;
+                            memcpy(&vf, &bits, 4);
+                            oh[i] += w * vf;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* 5. O matmul batched */
+        tq_batched_matmul_q4(X, layer->wo_q4, layer->wo_q4s, OB, dim, q_dim, N, NULL);
+
+        /* 6. Residual: Xres += X */
+        for (size_t i = 0; i < (size_t)N * dim; i++) Xres[i] += X[i];
+
+        /* 7. ffn_norm */
+        for (int n = 0; n < N; n++) {
+            tq_rmsnorm(XBN + (size_t)n * dim, Xres + (size_t)n * dim,
+                       layer->ffn_norm, dim, c->rms_norm_eps);
+        }
+
+        /* 8. gate, up batched matmul */
+        tq_batched_matmul_q4(GB, layer->w_gate_q4, layer->w_gate_q4s, XBN, inter, dim, N, NULL);
+        tq_batched_matmul_q4(UB, layer->w_up_q4,   layer->w_up_q4s,   XBN, inter, dim, N, NULL);
+
+        /* 9. SiLU(gate) * up (per-element) */
+        for (size_t i = 0; i < (size_t)N * inter; i++) {
+            float g = GB[i];
+            float silu = g / (1.0f + expf(-g));
+            GB[i] = silu * UB[i];
+        }
+
+        /* 10. down matmul batched (output back into X) */
+        tq_batched_matmul_q4(X, layer->w_down_q4, layer->w_down_q4s, GB, dim, inter, N, NULL);
+
+        /* 11. Residual: Xres += X */
+        for (size_t i = 0; i < (size_t)N * dim; i++) Xres[i] += X[i];
+    }
+
+    free(X); free(XBN); free(QB); free(KB); free(VB); free(OB); free(GB); free(UB);
+    free(Xres);
+    return pos_start + N;
+}
