@@ -2242,6 +2242,11 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     if (has_gguf) tq_metal_batch_flush_if_available();
     TQ_PROF_STOP(_tp, matmul_ns);
 
+    if (l <= 3 && pos <= 1 && getenv("TQ_DEBUG_PREFILL")) {
+        fprintf(stderr, "[fwd]   L%d pos=%d xb2 (after wo) [0:8] = ", l, pos);
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", s->xb2[i]);
+        fprintf(stderr, "\n");
+    }
     /* Debug: print attention output before residual add */
     if (pos == 0 && getenv("TQ_DEBUG") && (l < 3 || l == 5 || l == 11)) {
         float maxv = 0, minv = 0;
@@ -2483,6 +2488,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
 
         /* Pre-attention/DeltaNet RMSNorm */
         tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
+        if ((l == 0 || l == 1 || l == 4 || l == 8 || l == 15) && pos <= 1 && getenv("TQ_DEBUG_PREFILL")) {
+            fprintf(stderr, "[fwd]   L%d pos=%d xb [0:8] = ", l, pos);
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", s->xb[i]);
+            fprintf(stderr, "\n");
+        }
 
         /* Begin layer-level GPU batch scope: all GGUF matmuls in this layer
          * (QKV, wo, gate, up, down) encode into shared command buffers.
@@ -2815,6 +2825,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
 
     layer_postprocess:
+        if (l <= 3 && pos <= 1 && getenv("TQ_DEBUG_PREFILL")) {
+            fprintf(stderr, "[fwd]   L%d pos=%d final x [0:8] = ", l, pos);
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", s->x[i]);
+            fprintf(stderr, "\n");
+        }
         /* Post-layer processing: PLE, layer_output_scale.
          * GPU graph path jumps here after full-layer GPU forward. */
 
@@ -3141,10 +3156,12 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
             tq_rmsnorm(XBN + (size_t)n * dim, Xres + (size_t)n * dim,
                        layer->attn_norm, dim, c->rms_norm_eps);
         }
-        if (l == 0 && dbg) {
-            fprintf(stderr, "[batch] L0 XBN (after attn_norm) tok0 [0:8] = ");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", XBN[i]);
-            fprintf(stderr, "\n");
+        if ((l == 0 || l == 1 || l == 4 || l == 8 || l == 15) && dbg) {
+            for (int tn = 0; tn < N && tn < 2; tn++) {
+                fprintf(stderr, "[batch] L%d XBN tok%d [0:8] = ", l, tn);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", XBN[(size_t)tn * dim + i]);
+                fprintf(stderr, "\n");
+            }
         }
 
         /* 2. Q, K, V batched matmul (Q4 main weights) */
@@ -3399,16 +3416,12 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
         /* 6. Residual: Xres += X */
         for (size_t i = 0; i < (size_t)N * dim; i++) Xres[i] += X[i];
 
-        if (l == 0 && dbg) {
-            fprintf(stderr, "[batch] L0 after-attn-residual Xres[tok0,0:8] = ");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", Xres[i]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[batch] L0 after-attn-residual QB[tok0,0:8] = ");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", QB[i]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[batch] L0 after-attn-residual KB[tok0,0:8] = ");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", KB[i]);
-            fprintf(stderr, "\n");
+        if (l <= 3 && dbg) {
+            for (int tn = 0; tn < N && tn < 2; tn++) {
+                fprintf(stderr, "[batch] L%d after-attn-residual tok%d [0:8] = ", l, tn);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", Xres[(size_t)tn * dim + i]);
+                fprintf(stderr, "\n");
+            }
         }
 
         /* 7. ffn_norm */
@@ -3462,10 +3475,12 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
         /* 11. Residual: Xres += X */
         for (size_t i = 0; i < (size_t)N * dim; i++) Xres[i] += X[i];
 
-        if (l == 0 && dbg) {
-            fprintf(stderr, "[batch] L0 final Xres tok0 [0:8] = ");
-            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", Xres[i]);
-            fprintf(stderr, "\n");
+        if ((l <= 3) && dbg) {
+            for (int tn = 0; tn < N && tn < 2; tn++) {
+                fprintf(stderr, "[batch] L%d final Xres tok%d [0:8] = ", l, tn);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", Xres[(size_t)tn * dim + i]);
+                fprintf(stderr, "\n");
+            }
         }
     }
 
