@@ -1166,22 +1166,6 @@ void tq_batched_matmul_q4(float* out, const uint8_t* w_qs, const float* w_scales
 
     if (N <= 0 || n_rows <= 0 || d <= 0) return;
 
-    if (getenv("TQ_BATCHED_SERIAL")) {
-        /* Diagnostic path: process N tokens serially via tq_matmul_q4_preq.
-         * If THIS gives correct output, the bug is in the bm_q4_worker's
-         * FP accumulation order vs the per-token path's vector accumulator. */
-        int n_blocks = d / 32;
-        int8_t* xq = (int8_t*)malloc((size_t)d * sizeof(int8_t));
-        float*  xs = (float*)malloc((size_t)n_blocks * sizeof(float));
-        if (xq && xs) {
-            for (int n = 0; n < N; n++) {
-                tq_quantize_row_q8(x + (size_t)n * d, xq, xs, d);
-                tq_matmul_q4_preq(out + (size_t)n * n_rows, w_qs, w_scales, xq, xs, n_rows, d);
-            }
-        }
-        free(xq); free(xs);
-        return;
-    }
     if (N == 1) {
         /* Degenerate: hand off to single-vector quantized matmul. */
         int n_blocks = d / 32;
