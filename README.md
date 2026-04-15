@@ -163,6 +163,8 @@ The bug was using the same tool for both. The fix is using each for what it's go
 
 > **v3 update — Crossing the Cliff with RLV (2026-04-14):** If the cliff is real, the fix is to stop asking one LLM call to hold a full document in working memory. **RLV (Read-Locate-Verify)** is a 5-stage pipeline — gist → locate → lookup → verify → research — where each stage stays below the ~1K-token cliff while the *document* can be arbitrarily long. On 12K-token wikitext (≈10× the cliff for Llama 3.2 3B Q4), **RLV scores 10/10** vs. 8/10 for verify-only and 1/10 for long-context-only. Key trick: BM25 + Reciprocal Rank Fusion does the locating; the LLM is only a tiebreaker. Runs on the same 16GB Mac as the 3B model — no RAG index, no embeddings. [`bench/rlv/`](bench/rlv/) · [`docs/phase3_rlv_challenge.md`](docs/phase3_rlv_challenge.md)
 
+> **v3.1 throughput update (2026-04-15):** A focused perf round (Q4_K/Q5_K int8 fused dot, ARMv8.2 `vdotq_s32`, weight-row prefetch, 2-row ILP, P-core thread default) lifted CPU generation throughput by **+58% to +141%** across our model lineup on M1 Pro. Phi-3.5-mini Q8_0 jumped 5.4 → 13.0 tok/s (now at 71% of llama.cpp's pure-CPU speed). We're still 3-6× behind llama.cpp's mature Metal kernels — that's the next gap to close. Full numbers + reproduce instructions: [`bench/results/2026-04-15_throughput_vs_llamacpp.md`](bench/results/2026-04-15_throughput_vs_llamacpp.md).
+
 ---
 
 ## More Features
