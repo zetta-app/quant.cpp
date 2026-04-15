@@ -3070,9 +3070,18 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
     if (s->delta_kv_enabled)                   { if (dbg) fprintf(stderr, "[batch] bail: delta_kv\n"); return -1; }
     /* k_highres_window supported — circular FP32 buffer for recent keys. */
     if (s->value_quant_bits != 0)              { if (dbg) fprintf(stderr, "[batch] bail: quant_V\n"); return -1; }
-    /* DeltaNet check */
-    for (int l = 0; l < c->n_layers; l++) {
-        if (model->layers[l].delta_a_log)       { if (dbg) fprintf(stderr, "[batch] bail: deltanet l=%d\n", l); return -1; }
+    /* DeltaNet hybrid support is in-progress (see P1.6). For safety the
+     * bail is kept — batched advances SSM state per token and the final
+     * tq_forward's re-run of the last position double-advances state,
+     * producing empty/garbage generation. Path preserved below under
+     * TQ_DELTANET_BATCH=1 for future development. */
+    if (!getenv("TQ_DELTANET_BATCH")) {
+        for (int l = 0; l < c->n_layers; l++) {
+            if (model->layers[l].delta_a_log) {
+                if (dbg) fprintf(stderr, "[batch] bail: deltanet l=%d\n", l);
+                return -1;
+            }
+        }
     }
 
     int dim = c->hidden_dim;
@@ -3137,7 +3146,54 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
     for (int l = 0; l < c->n_layers; l++) {
         tq_layer_weights_t* layer = &model->layers[l];
 
-        /* Required Q4 weights for this fast path. */
+        /* DeltaNet layer (Qwen3.5 hybrid): recurrent state can't be batched
+         * across the sequence dim, so drive each token through the existing
+         * tq_forward per-layer path that updates s->delta_state and
+         * s->conv_state in sequence order. FFN for this layer is still done
+         * per-token because deltanet_forward writes residual into s->x and
+         * we continue from there. */
+        if (layer->delta_a_log) {
+            /* DeltaNet: SSM recurrent state can't be batched. Process the
+             * first N-1 tokens here; leave the last token for the final
+             * tq_forward to avoid advancing state past what that call expects. */
+            extern void deltanet_forward(tq_model_t* model, tq_state_t* s, int l);
+            for (int n = 0; n < N - 1; n++) {
+                memcpy(s->x, Xres + (size_t)n * dim, (size_t)dim * sizeof(float));
+                tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
+                deltanet_forward(model, s, l);
+                /* deltanet_forward adds residual into s->x. Copy back. */
+                memcpy(Xres + (size_t)n * dim, s->x, (size_t)dim * sizeof(float));
+
+                /* FFN for this token — use the existing tq_forward's logic
+                 * inline. Most Qwen3.5 layers have FFN norm → gate+up → silu
+                 * → down → residual. */
+                if (layer->w_gate_q4 && layer->w_up_q4 && layer->w_down_q4) {
+                    tq_rmsnorm(s->xb, s->x, layer->ffn_norm, dim, c->rms_norm_eps);
+                    /* Use tq_matmul_q4 via per-token path */
+                    int inter_l = c->intermediate_dim;
+                    float* tmp_g = (float*)malloc((size_t)inter_l * sizeof(float));
+                    float* tmp_u = (float*)malloc((size_t)inter_l * sizeof(float));
+                    float* tmp_d = (float*)malloc((size_t)dim * sizeof(float));
+                    if (tmp_g && tmp_u && tmp_d) {
+                        tq_quantize_row_q8(s->xb, s->xb_q8, s->xb_q8s, dim);
+                        tq_matmul_q4_preq(tmp_g, layer->w_gate_q4, layer->w_gate_q4s, s->xb_q8, s->xb_q8s, inter_l, dim);
+                        tq_matmul_q4_preq(tmp_u, layer->w_up_q4, layer->w_up_q4s, s->xb_q8, s->xb_q8s, inter_l, dim);
+                        for (int i = 0; i < inter_l; i++) {
+                            float g = tmp_g[i];
+                            tmp_g[i] = (g / (1.0f + expf(-g))) * tmp_u[i];
+                        }
+                        tq_quantize_row_q8(tmp_g, s->xb_q8, s->xb_q8s, inter_l);
+                        tq_matmul_q4_preq(tmp_d, layer->w_down_q4, layer->w_down_q4s, s->xb_q8, s->xb_q8s, dim, inter_l);
+                        for (int i = 0; i < dim; i++) s->x[i] += tmp_d[i];
+                        memcpy(Xres + (size_t)n * dim, s->x, (size_t)dim * sizeof(float));
+                    }
+                    free(tmp_g); free(tmp_u); free(tmp_d);
+                }
+            }
+            continue;  /* skip the self-attention layer code below */
+        }
+
+        /* Required Q4 weights for this fast path (self_attn layers). */
         if (!layer->wq_q4 || !layer->wk_q4 || !layer->wv_q4 || !layer->wo_q4 ||
             !layer->w_gate_q4 || !layer->w_up_q4 || !layer->w_down_q4) {
             if (dbg) fprintf(stderr, "[batch] bail: layer %d missing q4 weights (wq=%p wk=%p wv=%p wo=%p g=%p u=%p d=%p)\n",
