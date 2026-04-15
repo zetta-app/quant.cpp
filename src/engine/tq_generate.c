@@ -304,16 +304,12 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     if (config->load_kv_path && pos_after_prefill > 0) {
         prefill_start = pos_after_prefill;
     }
-    /* Batched prefill: enabled by default when KV cache is FP32 (no drift
-     * from FP16 round-trip). For FP16 V (default KV quantization mode),
-     * the 1-ULP drift amplifies at softmax cliffs and breaks downstream
-     * decode even though in-batch attention looks correct. Users who want
-     * batched speedup should pass `-k fp32`. Set TQ_BATCH_PREFILL=1 to
-     * force-enable for FP16 V (at the risk of degraded output). */
+    /* Batched prefill: enabled by default for supported architectures.
+     * Populates both FP32 K cache and quant_key_cache (if active) so that
+     * the final tq_forward's attention sees baseline-equivalent history.
+     * Set TQ_NO_BATCH_PREFILL=1 to force per-token (for A/B testing). */
     int batch_ok = 0;
-    int kv_is_fp32 = (state->kv_quant_type >= TQ_TYPE_COUNT);
-    int want_batched = (n_prompt >= 2) && !getenv("TQ_NO_BATCH_PREFILL")
-                     && (kv_is_fp32 || getenv("TQ_BATCH_PREFILL"));
+    int want_batched = (n_prompt >= 2) && !getenv("TQ_NO_BATCH_PREFILL");
     if (want_batched) {
         int rc = tq_forward_batch(model, state, prompt_tokens, n_prompt, prefill_start);
         if (getenv("TQ_DEBUG_PREFILL"))

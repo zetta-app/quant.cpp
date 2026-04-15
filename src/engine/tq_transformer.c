@@ -3067,6 +3067,9 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
     if (c->is_moe || c->is_gemma4)             { if (dbg) fprintf(stderr, "[batch] bail: moe/gemma4\n"); return -1; }
     if (c->has_fused_qkv || c->has_fused_up_gate) { if (dbg) fprintf(stderr, "[batch] bail: fused qkv/up\n"); return -1; }
     if (c->n_kv_shared_layers > 0)             { if (dbg) fprintf(stderr, "[batch] bail: kv_shared\n"); return -1; }
+    if (s->delta_kv_enabled)                   { if (dbg) fprintf(stderr, "[batch] bail: delta_kv\n"); return -1; }
+    /* k_highres_window supported — circular FP32 buffer for recent keys. */
+    if (s->value_quant_bits != 0)              { if (dbg) fprintf(stderr, "[batch] bail: quant_V\n"); return -1; }
     /* DeltaNet check */
     for (int l = 0; l < c->n_layers; l++) {
         if (model->layers[l].delta_a_log)       { if (dbg) fprintf(stderr, "[batch] bail: deltanet l=%d\n", l); return -1; }
@@ -3274,9 +3277,43 @@ int tq_forward_batch(tq_model_t* model, tq_state_t* s,
                 for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", kn[i]);
                 fprintf(stderr, "\n");
             }
-            /* Write to cache */
+            int use_quant_kv_batch = (s->quant_key_cache && s->kv_quant_type < TQ_TYPE_COUNT);
+            /* Always write FP32 K to s->key_cache — the batched attention
+             * loop below reads from it. Baseline with use_quant_kv ONLY writes
+             * to quant cache (saves memory) but we need the FP32 for our
+             * batched attention (which doesn't call the traits dequantize).
+             * The extra memory is negligible (same size as already-allocated
+             * cache). */
             memcpy(s->key_cache + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim,
                    kn, (size_t)kv_dim * sizeof(float));
+            /* Also populate highres FP32 circular buffer when active. */
+            if (use_quant_kv_batch && s->k_highres_window > 0 && s->key_highres_fp32) {
+                int win_idx = pos % s->k_highres_window;
+                size_t hr_layer_stride = (size_t)s->k_highres_window * kv_dim;
+                float* hr_dst = s->key_highres_fp32
+                    + (size_t)l * hr_layer_stride + (size_t)win_idx * kv_dim;
+                memcpy(hr_dst, kn, (size_t)kv_dim * sizeof(float));
+            }
+            /* quant_key_cache write for baseline's attention to read later. */
+            if (use_quant_kv_batch && !s->delta_kv_enabled) {
+                const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
+                int cache_n_kv_heads = c->n_kv_heads;
+                if (c->full_n_kv_heads > cache_n_kv_heads) cache_n_kv_heads = c->full_n_kv_heads;
+                for (int kh = 0; kh < c->n_kv_heads; kh++) {
+                    const float* key_src = kn + kh * c->head_dim;
+                    uint8_t* quant_dst = (uint8_t*)s->quant_key_cache
+                        + (size_t)l * s->quant_kv_stride
+                        + (size_t)pos * cache_n_kv_heads * s->quant_head_stride
+                        + (size_t)kh * s->quant_head_stride;
+                    for (int blk = 0; blk < c->head_dim; blk += TQ_BK) {
+                        int blen = c->head_dim - blk;
+                        if (blen > TQ_BK) blen = TQ_BK;
+                        traits->quantize(key_src + blk,
+                                         quant_dst + (blk / TQ_BK) * traits->type_size,
+                                         blen);
+                    }
+                }
+            }
             if (s->value_cache) {
                 memcpy(s->value_cache + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim,
                        VB + (size_t)n * kv_dim, (size_t)kv_dim * sizeof(float));
