@@ -2931,6 +2931,20 @@ tq_model_t* tq_load_gguf(const char* path) {
         c->attn_logit_softcap = 50.0f;
     }
 
+    /* LongRoPE config (Phi-3 etc.) */
+    c->rope_orig_ctx_len = (int)tq_gguf_get_u32(gguf, GGUF_KEY("rope.scaling.original_context_length"), 0);
+    c->rope_attn_factor = tq_gguf_get_f32(gguf, GGUF_KEY("rope.scaling.attn_factor"), 0.0f);
+    {
+        const tq_gguf_tensor_t* rfs = tq_gguf_find_tensor(gguf, "rope_factors_short.weight");
+        const tq_gguf_tensor_t* rfl = tq_gguf_find_tensor(gguf, "rope_factors_long.weight");
+        if (rfs && rfs->type == TQ_GGML_TYPE_F32) c->rope_factors_short = (const float*)rfs->data;
+        if (rfl && rfl->type == TQ_GGML_TYPE_F32) c->rope_factors_long  = (const float*)rfl->data;
+        if (rfs || rfl) {
+            fprintf(stderr, "tq_load_gguf: LongRoPE detected — orig_ctx=%d, attn_factor=%.4f\n",
+                    c->rope_orig_ctx_len, c->rope_attn_factor);
+        }
+    }
+
     /* Cap context for memory safety on small machines.
      * GGUF models often claim 262K context but we cap at 4096 by default.
      * Users can override with --ctx flag in quant. */
@@ -3024,9 +3038,15 @@ tq_model_t* tq_load_gguf(const char* path) {
             /* Gemma 4 (LLM_ARCH_GEMMA4): n_rot_full = rope.dimension_count (no halving).
              * rope_n_dims_full is already set from rope.dimension_count.
              * Refs: llama.cpp llama-model.cpp line 472-474 — reads ROPE_DIMENSION_COUNT directly. */
+            /* KV sharing: last N layers reuse K/V from earlier same-type layers */
+            c->n_kv_shared_layers = tq_gguf_get_i32(gguf, GGUF_KEY("attention.shared_kv_layers"), 0);
             fprintf(stderr, "tq_load_gguf: Gemma4 — RoPE dims swa=%d full=%d, "
                     "GeGLU, rope_freqs for full layers only\n",
                     c->rope_n_dims, c->rope_n_dims_full);
+            if (c->n_kv_shared_layers > 0) {
+                fprintf(stderr, "tq_load_gguf: KV sharing enabled — last %d layers reuse KV from earlier same-type layers\n",
+                        c->n_kv_shared_layers);
+            }
         }
         fprintf(stderr, "tq_load_gguf: Gemma family detected (sliding_window=%d)\n", c->sliding_window);
     } else if (c->is_moe) {
@@ -3076,9 +3096,11 @@ tq_model_t* tq_load_gguf(const char* path) {
     int attn_indices[256]; /* max layers */
 
     /* Detect if GGUF already has Gemma +1.0 norm adjustment baked in.
-     * If first layer's attn_norm has mean > 2.0, it's already adjusted. */
-    int gemma_norms_adjusted = 0;
-    if (c->model_type == 1) {
+     * If first layer's attn_norm has mean > 2.0, it's already adjusted.
+     * Gemma 4 does NOT use the +1 convention (norm_shift=0 in converter),
+     * so skip the adjustment entirely for Gemma 4. */
+    int gemma_norms_adjusted = c->is_gemma4 ? 1 : 0;
+    if (c->model_type == 1 && !c->is_gemma4) {
         const tq_gguf_tensor_t* probe = tq_gguf_find_tensor(gguf, "blk.0.attn_norm.weight");
         if (probe && probe->type == TQ_GGML_TYPE_F32 && probe->shape[0] > 0) {
             const float* pw = (const float*)probe->data;
@@ -3223,6 +3245,29 @@ tq_model_t* tq_load_gguf(const char* path) {
          * We store the raw data pointer + type info using a small struct packed into
          * the existing FP32 weight pointer fields. For GGUF models, we use a special
          * dispatch: if gguf_ctx is non-NULL, the forward pass uses tq_matmul_gguf. */
+
+        /* Fused QKV detection (Phi-3 etc.): attn_qkv.weight contains Q, K, V concatenated.
+         * NOTE: Qwen3.5 DeltaNet layers ALSO have attn_qkv.weight as their fused Q/K/V
+         * projection, but those are NOT self-attention. Distinguish by checking for
+         * DeltaNet marker tensor (ssm_a) at the same layer — if present, this is a
+         * DeltaNet layer and the attn_qkv will be loaded by the DeltaNet path below. */
+        snprintf(tname, sizeof(tname), "blk.%d.ssm_a", l);
+        const tq_gguf_tensor_t* ssm_probe = find_gguf_tensor(gguf, tname);
+        snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
+        const tq_gguf_tensor_t* wqkv_t = find_gguf_tensor(gguf, tname);
+        if (wqkv_t && !ssm_probe) {
+            layer->gguf_w_qkv = wqkv_t->data;
+            layer->gguf_w_qkv_type = wqkv_t->type;
+            c->has_fused_qkv = 1;
+
+            snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) { layer->gguf_wo = t->data; layer->gguf_wo_type = t->type; }
+
+            attn_indices[n_attn_layers++] = l;
+            goto post_attn_load;  /* Skip standard attn_q/k/v loading */
+        }
+
         snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
         const tq_gguf_tensor_t* wq_t = find_gguf_tensor(gguf, tname);
         int is_attn_layer = (wq_t != NULL);
@@ -3262,8 +3307,20 @@ tq_model_t* tq_load_gguf(const char* path) {
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_wo = t->data; layer->gguf_wo_type = t->type; }
 
+            /* Attention biases (Qwen2/2.5/3): Q, K, V biases are F32 */
+            snprintf(tname, sizeof(tname), "blk.%d.attn_q.bias", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->q_bias = dequant_tensor_fp32(t);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_k.bias", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->k_bias = dequant_tensor_fp32(t);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_v.bias", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->v_bias = dequant_tensor_fp32(t);
+
             attn_indices[n_attn_layers++] = l;
         }
+        post_attn_load: ; /* Both fused QKV and standard Q/K/V paths converge here */
 
         /* Check for DeltaNet / SSM weights (Qwen3.5 hybrid) */
         snprintf(tname, sizeof(tname), "blk.%d.ssm_a", l);
@@ -3296,18 +3353,21 @@ tq_model_t* tq_load_gguf(const char* path) {
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_delta_b = t->data; layer->gguf_delta_b_type = t->type; }
 
-            /* Large DeltaNet projections: dequant to FP32 for recurrent
-             * state precision.  Q5_K (5-bit) introduces too much error in
-             * the recurrent state that accumulates across time steps.
-             * ~24 MB/layer × 30 layers ≈ 720 MB — fits in 16 GB. */
+            /* DeltaNet projections: historically dequanted Q5_K → FP32 with
+             * the rationale that "5-bit introduces too much error in recurrent
+             * state". This was over-cautious — the matmul output goes through
+             * FP32 accumulation regardless of weight type. Set TQ_DELTANET_FP32=1
+             * to restore the FP32 dequant if a downstream regression appears. */
+            int deltanet_fp32 = (getenv("TQ_DELTANET_FP32") != NULL);
             snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
             t = find_gguf_tensor(gguf, tname);
             if (t) {
-                if (t->type == TQ_GGML_TYPE_Q5_K || t->type == TQ_GGML_TYPE_IQ2_XXS ||
-                    t->type == TQ_GGML_TYPE_IQ3_XXS || t->type == TQ_GGML_TYPE_IQ4_XS) {
-                    /* Low-precision: dequant to FP32 for recurrent accuracy */
+                int needs_fp32 = deltanet_fp32 &&
+                    (t->type == TQ_GGML_TYPE_Q5_K || t->type == TQ_GGML_TYPE_IQ2_XXS ||
+                     t->type == TQ_GGML_TYPE_IQ3_XXS || t->type == TQ_GGML_TYPE_IQ4_XS);
+                if (needs_fp32) {
                     layer->delta_in_proj_qkv = dequant_tensor_fp32(t);
-                    fprintf(stderr, "tq_load_gguf: layer %d attn_qkv dequant to FP32 (was type %d)\n", l, t->type);
+                    fprintf(stderr, "tq_load_gguf: layer %d attn_qkv dequant to FP32 (was type %d, TQ_DELTANET_FP32 set)\n", l, t->type);
                 } else {
                     layer->gguf_delta_qkv = t->data;
                     layer->gguf_delta_qkv_type = t->type;
@@ -3317,10 +3377,12 @@ tq_model_t* tq_load_gguf(const char* path) {
             snprintf(tname, sizeof(tname), "blk.%d.attn_gate.weight", l);
             t = find_gguf_tensor(gguf, tname);
             if (t) {
-                if (t->type == TQ_GGML_TYPE_Q5_K || t->type == TQ_GGML_TYPE_IQ2_XXS ||
-                    t->type == TQ_GGML_TYPE_IQ3_XXS || t->type == TQ_GGML_TYPE_IQ4_XS) {
+                int needs_fp32 = deltanet_fp32 &&
+                    (t->type == TQ_GGML_TYPE_Q5_K || t->type == TQ_GGML_TYPE_IQ2_XXS ||
+                     t->type == TQ_GGML_TYPE_IQ3_XXS || t->type == TQ_GGML_TYPE_IQ4_XS);
+                if (needs_fp32) {
                     layer->delta_in_proj_z = dequant_tensor_fp32(t);
-                    fprintf(stderr, "tq_load_gguf: layer %d attn_gate dequant to FP32 (was type %d)\n", l, t->type);
+                    fprintf(stderr, "tq_load_gguf: layer %d attn_gate dequant to FP32 (was type %d, TQ_DELTANET_FP32 set)\n", l, t->type);
                 } else {
                     layer->gguf_delta_z = t->data;
                     layer->gguf_delta_z_type = t->type;
@@ -3524,7 +3586,18 @@ tq_model_t* tq_load_gguf(const char* path) {
             if (t) { layer->gguf_w_gate = t->data; layer->gguf_w_gate_type = t->type; }
             snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
             t = find_gguf_tensor(gguf, tname);
-            if (t) { layer->gguf_w_up = t->data; layer->gguf_w_up_type = t->type; }
+            if (t) {
+                /* Phi-3 fused gate||up: ffn_up contains both gate and up projections
+                 * concatenated along output dim (shape[1] == 2 * intermediate_dim) */
+                if (c->intermediate_dim > 0 && (int)t->shape[1] == 2 * c->intermediate_dim) {
+                    layer->gguf_w_up_gate = t->data;
+                    layer->gguf_w_up_gate_type = t->type;
+                    c->has_fused_up_gate = 1;
+                } else {
+                    layer->gguf_w_up = t->data;
+                    layer->gguf_w_up_type = t->type;
+                }
+            }
             snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_w_down = t->data; layer->gguf_w_down_type = t->type; }
@@ -3593,6 +3666,38 @@ tq_model_t* tq_load_gguf(const char* path) {
         }
     }
 
+    /* Set up KV source layer mapping for Gemma 4 KV sharing.
+     * KV-shared layers (last n_kv_shared_layers) reuse the KV cache from the
+     * last non-shared layer of the same attention type (sliding or full).
+     * Non-shared layers use their own cache (kv_source_layer[l] = l). */
+    if (c->n_kv_shared_layers > 0 && model->layer_is_sliding) {
+        int first_shared = c->n_layers - c->n_kv_shared_layers;
+        model->kv_source_layer = (int*)calloc((size_t)c->n_layers, sizeof(int));
+        if (model->kv_source_layer) {
+            /* Non-shared layers: use own cache */
+            for (int l = 0; l < c->n_layers; l++) {
+                model->kv_source_layer[l] = l;  /* default: self */
+            }
+            /* Find the last non-shared sliding and full layers */
+            int last_sliding = -1, last_full = -1;
+            for (int l = 0; l < first_shared; l++) {
+                if (model->layer_is_sliding[l]) last_sliding = l;
+                else last_full = l;
+            }
+            /* Map shared layers to their source */
+            for (int l = first_shared; l < c->n_layers; l++) {
+                if (model->layer_is_sliding[l]) {
+                    model->kv_source_layer[l] = last_sliding >= 0 ? last_sliding : 0;
+                } else {
+                    model->kv_source_layer[l] = last_full >= 0 ? last_full : 0;
+                }
+            }
+            fprintf(stderr, "tq_load_gguf: KV source mapping — shared from layer %d, "
+                    "last_sliding=%d, last_full=%d\n",
+                    first_shared, last_sliding, last_full);
+        }
+    }
+
     /* Load embedding + output weights.
      * For large vocab (>100K) with quantized embedding, keep GGUF pointer for
      * fused dot output projection (saves 2.8GB FP32 allocation + faster matmul).
@@ -3604,11 +3709,15 @@ tq_model_t* tq_load_gguf(const char* path) {
         } else if (emb_t->type == TQ_GGML_TYPE_BF16 || emb_t->type == TQ_GGML_TYPE_F16) {
             model->embed_bf16 = (const uint16_t*)emb_t->data;
         } else if (c->vocab_size > 100000 || emb_t->shape[1] > 100000) {
-            /* Large vocab: keep GGUF for output projection, dequant rows on demand */
-            model->output_gguf = emb_t->data;
+            /* Large vocab: keep GGUF pointers for on-demand dequant.
+             * embed_gguf = embedding for token lookup (per-row dequant)
+             * output_gguf = lm_head for output projection (fused dot)
+             * These start as the same tensor; if output.weight exists separately,
+             * output_gguf is overridden below. */
+            model->embed_gguf = emb_t->data;
+            model->embed_gguf_type = emb_t->type;
+            model->output_gguf = emb_t->data;        /* default: tied weights */
             model->output_gguf_type = emb_t->type;
-            /* Still need FP32 embedding for token lookup — allocate just one row buffer.
-             * The full FP32 table is NOT allocated. Token lookup uses on-the-fly dequant. */
             model->token_embedding = NULL;
             model->embed_bf16 = NULL;
             fprintf(stderr, "tq_load_gguf: large vocab (%d) — using GGUF embedding "
@@ -3627,7 +3736,17 @@ tq_model_t* tq_load_gguf(const char* path) {
 
     const tq_gguf_tensor_t* out_t = find_gguf_tensor(gguf, "output.weight");
     if (out_t) {
-        if (out_t->type == TQ_GGML_TYPE_F32) {
+        /* Separate output weight tensor (untied from embedding).
+         * For large vocab: use GGUF fused dot for output projection too. */
+        if (c->vocab_size > 100000 || (emb_t && emb_t->shape[1] > 100000)) {
+            /* Override output_gguf with the actual output weight (not embedding) */
+            model->output_gguf = out_t->data;
+            model->output_gguf_type = out_t->type;
+            model->output_weight = NULL;
+            fprintf(stderr, "tq_load_gguf: separate output.weight detected — "
+                    "using %s for lm_head (type differs from embedding)\n",
+                    tq_ggml_type_name(out_t->type));
+        } else if (out_t->type == TQ_GGML_TYPE_F32) {
             model->output_weight = (float*)out_t->data;
         } else if (out_t->type == TQ_GGML_TYPE_BF16 || out_t->type == TQ_GGML_TYPE_F16) {
             model->output_weight_bf16 = (const uint16_t*)out_t->data;
@@ -3695,6 +3814,21 @@ tq_model_t* tq_load_gguf(const char* path) {
             c->n_layers, n_attn_layers,
             c->is_moe ? ", MoE" : "",
             c->hidden_dim, c->n_heads, c->n_kv_heads, c->vocab_size);
+
+    /* Hard-fail when no attention layers were detected. Without this,
+     * the forward pass runs against zero-initialized weights → garbage.
+     * This was the root cause of the Phi-3 first-time experience bug:
+     * "loaded 32 layers (0 self_attn)" looked like success. */
+    if (n_attn_layers == 0 && c->delta_n_heads == 0) {
+        fprintf(stderr,
+            "tq_load_gguf: ERROR — model architecture '%s' is not supported.\n"
+            "  Detected 0 self_attn layers and no DeltaNet weights.\n"
+            "  This usually means the model uses an unsupported attention\n"
+            "  tensor layout. See docs/supported_models.md.\n",
+            gguf->arch[0] ? gguf->arch : "unknown");
+        tq_free_model(model);
+        return NULL;
+    }
 
     /* ============================================================
      * Load-time weight conversion: GGUF -> Q4
@@ -3772,10 +3906,21 @@ tq_model_t* tq_load_gguf(const char* path) {
             goto skip_q4_conversion;
         }
         int has_gguf_weights = 0;
+        int phi3_split = (getenv("TQ_PHI3_SPLIT") != NULL);
         for (int l = 0; l < c->n_layers && !has_gguf_weights; l++) {
-            if (model->layers[l].gguf_wq || model->layers[l].gguf_w_gate
-                || model->layers[l].gguf_delta_qkv || model->layers[l].gguf_delta_z
-                || model->layers[l].moe)
+            tq_layer_weights_t* ly = &model->layers[l];
+            int fused_convertible = 0;
+            if (phi3_split && ly->gguf_w_qkv
+                && (ly->gguf_w_qkv_type == TQ_GGML_TYPE_Q4_K
+                 || ly->gguf_w_qkv_type == TQ_GGML_TYPE_Q4_0
+                 || ly->gguf_w_qkv_type == TQ_GGML_TYPE_Q5_K)) fused_convertible = 1;
+            if (phi3_split && ly->gguf_w_up_gate
+                && (ly->gguf_w_up_gate_type == TQ_GGML_TYPE_Q4_K
+                 || ly->gguf_w_up_gate_type == TQ_GGML_TYPE_Q4_0
+                 || ly->gguf_w_up_gate_type == TQ_GGML_TYPE_Q5_K)) fused_convertible = 1;
+            if (ly->gguf_wq || ly->gguf_w_gate
+                || ly->gguf_delta_qkv || ly->gguf_delta_z
+                || ly->moe || fused_convertible)
                 has_gguf_weights = 1;
         }
 
@@ -3870,6 +4015,70 @@ tq_model_t* tq_load_gguf(const char* path) {
                         layer->w_down = fp;
                         layer->gguf_w_down = NULL;
                         fp32_temps[n_tmp++] = fp;
+                    }
+                }
+
+                /* Phi-3 fused QKV split to internal Q4 was TESTED and caused
+                 * quality regression on arithmetic tasks (2+2=3 instead of 4).
+                 * The internal Q4 format has per-32 scales where Q4_K uses
+                 * 6-bit sub-block scales — strictly less precision. The split
+                 * path is preserved below but gated behind TQ_PHI3_SPLIT=1
+                 * for future work on a better-quality path (e.g., Q4+Q2 with
+                 * larger residual tables, or keeping Q5_K for critical rows). */
+                if (layer->gguf_w_qkv && getenv("TQ_PHI3_SPLIT")
+                    && (layer->gguf_w_qkv_type == TQ_GGML_TYPE_Q4_K
+                     || layer->gguf_w_qkv_type == TQ_GGML_TYPE_Q4_0
+                     || layer->gguf_w_qkv_type == TQ_GGML_TYPE_Q5_K)) {
+                    int lq = c->n_heads * c->head_dim;
+                    int lkv = c->n_kv_heads * c->head_dim;
+                    int total_out = lq + 2 * lkv;
+                    int n_full = total_out * dim;
+                    float* fp_full = (float*)malloc((size_t)n_full * sizeof(float));
+                    if (fp_full) {
+                        tq_dequant_row_gguf(layer->gguf_w_qkv_type, layer->gguf_w_qkv, fp_full, n_full);
+                        /* Split row-major [total_out, dim] → wq/wk/wv. */
+                        float* wq = (float*)malloc((size_t)lq  * dim * sizeof(float));
+                        float* wk = (float*)malloc((size_t)lkv * dim * sizeof(float));
+                        float* wv = (float*)malloc((size_t)lkv * dim * sizeof(float));
+                        if (wq && wk && wv) {
+                            memcpy(wq, fp_full,                              (size_t)lq  * dim * sizeof(float));
+                            memcpy(wk, fp_full + (size_t)lq * dim,           (size_t)lkv * dim * sizeof(float));
+                            memcpy(wv, fp_full + (size_t)(lq + lkv) * dim,   (size_t)lkv * dim * sizeof(float));
+                            layer->wq = wq;
+                            layer->wk = wk;
+                            layer->wv = wv;
+                            fp32_temps[n_tmp++] = wq;
+                            fp32_temps[n_tmp++] = wk;
+                            fp32_temps[n_tmp++] = wv;
+                        }
+                        free(fp_full);
+                        layer->gguf_w_qkv = NULL;
+                        c->has_fused_qkv = 0; /* after split, no longer fused */
+                    }
+                }
+                /* Same quality caveat as fused QKV. Gated behind TQ_PHI3_SPLIT. */
+                if (layer->gguf_w_up_gate && getenv("TQ_PHI3_SPLIT")
+                    && (layer->gguf_w_up_gate_type == TQ_GGML_TYPE_Q4_K
+                     || layer->gguf_w_up_gate_type == TQ_GGML_TYPE_Q4_0
+                     || layer->gguf_w_up_gate_type == TQ_GGML_TYPE_Q5_K)) {
+                    int n_full = 2 * lint * dim;
+                    float* fp_full = (float*)malloc((size_t)n_full * sizeof(float));
+                    if (fp_full) {
+                        tq_dequant_row_gguf(layer->gguf_w_up_gate_type, layer->gguf_w_up_gate, fp_full, n_full);
+                        /* Phi-3 layout is [gate | up] concatenated along output rows. */
+                        float* w_gate = (float*)malloc((size_t)lint * dim * sizeof(float));
+                        float* w_up   = (float*)malloc((size_t)lint * dim * sizeof(float));
+                        if (w_gate && w_up) {
+                            memcpy(w_gate, fp_full,                         (size_t)lint * dim * sizeof(float));
+                            memcpy(w_up,   fp_full + (size_t)lint * dim,    (size_t)lint * dim * sizeof(float));
+                            layer->w_gate = w_gate;
+                            layer->w_up = w_up;
+                            fp32_temps[n_tmp++] = w_gate;
+                            fp32_temps[n_tmp++] = w_up;
+                        }
+                        free(fp_full);
+                        layer->gguf_w_up_gate = NULL;
+                        c->has_fused_up_gate = 0;
                     }
                 }
 
@@ -4072,9 +4281,15 @@ skip_q4_conversion: ;
      *   Adding +1 at runtime would double-apply and cause activation explosion.
      * The Gemma heuristic above (mean > 2.0 check) handles the Gemma case. */
 
-    /* Initialize persistent Metal GPU buffers for layer-level compute */
+    /* Initialize persistent Metal GPU buffers for layer-level compute.
+     * Skip for Phi-3 (has_fused_qkv): Metal GPU init corrupts Phi-3.5
+     * inference. The matmul dispatch already falls back to CPU via
+     * tq_matmul_force_cpu, but the GPU buffer allocation itself (or the
+     * Metal init it triggers) causes garbage output. Root cause TBD —
+     * possibly Metal shared-memory buffer allocation interferes with the
+     * GGUF mmap'd weight data on unified memory. */
 #ifdef TQ_HAS_METAL
-    {
+    if (!c->has_fused_qkv) {
         extern int tq_metal_gpu_init_buffers(int, int, int, int);
         extern int tq_metal_gpu_init_attn(int, int, int);
         int max_q_dim = c->n_heads * c->head_dim;
@@ -4371,6 +4586,7 @@ void tq_free_model(tq_model_t* model) {
     free(model->_q2_data);
     free(model->attn_layer_indices);
     free(model->layer_is_sliding);
+    free(model->kv_source_layer);
 
     /* Free MoE LRU caches (must happen before freeing layers) */
     tq_moe_cache_free();
@@ -4412,6 +4628,43 @@ void tq_free_model(tq_model_t* model) {
         }
     }
     free(model->moe_config);
+
+    /* Free dequantized norm/embedding buffers (GGUF path only).
+     * In the GGUF path, dequant_tensor_fp32() individually malloc's each
+     * norm weight. In the SafeTensor path, these point into _converted_data
+     * (freed above), so we must NOT free them again. (issue #60) */
+    if (model->gguf_ctx && model->layers) {
+        for (int l = 0; l < model->config.n_layers; l++) {
+            tq_layer_weights_t* layer = &model->layers[l];
+            free(layer->attn_norm);
+            free(layer->ffn_norm);
+            free(layer->q_norm);
+            free(layer->k_norm);
+            free(layer->post_attn_norm);
+            free(layer->post_ffn_norm);
+            free(layer->pre_ffn_norm);
+            free(layer->post_ffn_norm_1);
+            free(layer->pre_ffn_norm_2);
+            free(layer->post_ffn_norm_2);
+            free(layer->ple_norm);
+            free(layer->delta_a_log);
+            free(layer->delta_conv1d);
+            free(layer->delta_dt_bias);
+            free(layer->delta_in_proj_qkv);
+            free(layer->delta_in_proj_z);
+            free(layer->delta_norm);
+            free(layer->delta_in_proj_a);
+            free(layer->delta_in_proj_b);
+            free(layer->delta_out_proj);
+        }
+        free(model->token_embedding);
+        free(model->output_weight);
+        free(model->output_norm);
+        free(model->rope_freqs);
+        free(model->ple_proj);
+        free(model->ple_proj_norm);
+    }
+
     free(model->layers);
 
     /* Free GGUF context (handles munmap internally) */

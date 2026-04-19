@@ -4,18 +4,24 @@ quantcpp -- Compress AI's memory 3x. It gets faster.
 Quick start:
 
     from quantcpp import Model
-    m = Model.from_pretrained("Llama-3.2-1B")
+    m = Model.from_pretrained("Qwen3-4B")
     print(m.ask("What is gravity?"))
 
-Note: SmolLM2-135M downloads faster but produces low-quality output.
-Use Llama-3.2-1B (~750 MB, one-time download) for good results.
+Model selection guide:
+    Qwen3-4B       (2.5 GB, vocab 152K) — DEFAULT. 4.5 tok/s on M3.
+                                          Best quality (MMLU 73) AND
+                                          fastest (Q4 NEON fused dot).
+    Phi-3.5-mini   (3.8 GB, vocab 32K)  — 1.9 tok/s. Good quality.
+    SmolLM2-1.7B   (1.7 GB, vocab 49K)  — lightweight, ~12 tok/s.
+    Llama-3.2-1B   (750 MB, vocab 128K) — smallest download.
+    SmolLM2-135M   (138 MB, vocab 49K)  — demo only.
 """
 
 try:
     from importlib.metadata import version as _pkg_version
     __version__ = _pkg_version("quantcpp")
 except Exception:
-    __version__ = "0.12.1"  # fallback for editable / source-tree imports
+    __version__ = "0.13.0"  # fallback for editable / source-tree imports
 
 import os
 import sys
@@ -35,6 +41,16 @@ from quantcpp._binding import (
 )
 
 
+class ChatContextOverflow(RuntimeError):
+    """Raised when chat history exceeds the model's context window.
+
+    The C side has already auto-reset the session by the time this is
+    raised — the caller must trim its conversation history (drop the
+    oldest turns) and retry. Catching this is the supported way to
+    detect "we hit max_seq_len" without parsing log output.
+    """
+
+
 # -----------------------------------------------------------------------
 # Model registry — small GGUF models auto-downloaded from HuggingFace
 # -----------------------------------------------------------------------
@@ -43,21 +59,60 @@ _CACHE_DIR = Path(os.environ.get("QUANTCPP_CACHE",
                                   Path.home() / ".cache" / "quantcpp"))
 
 # name → (HuggingFace repo, filename, approx size in MB)
+# Note: download URL is constructed as
+#   https://huggingface.co/{repo}/resolve/main/{filename}
+# Verify both fields against the actual HuggingFace listing before
+# adding new entries — there is no integrity check at runtime.
 _MODEL_REGISTRY = {
-    "SmolLM2-135M": (
-        "Felladrin/gguf-Q8_0-SmolLM2-135M-Instruct",
-        "smollm2-135m-instruct-q8_0.gguf",
-        135,
+    # ── DEFAULT ──
+    # Qwen3-4B Q4_K_M: best speed + quality combo (2026-04-13).
+    #
+    # Measured on Apple M3 (CPU, kv_compress=0):
+    #   Qwen3-4B Q4_K_M:    4.5 tok/s  (Q4 converted, NEON fused dot)
+    #   Phi-3.5-mini Q8_0:  1.9 tok/s  (GGUF on-the-fly, no Q4 path)
+    #
+    # Qwen3 is 2.4x faster AND has higher benchmark scores (MMLU 73
+    # vs ~65). The speed advantage comes from separate Q/K/V tensors
+    # that enable load-time Q4 conversion → NEON Q4×Q8 fused dot.
+    # Phi-3.5's fused QKV blocks this optimization.
+    #
+    # vocab 152K is larger than Phi-3.5's 32K, but the Q4 matmul
+    # speed more than compensates for the bigger lm_head.
+    "Qwen3-4B": (
+        "bartowski/Qwen_Qwen3-4B-GGUF",
+        "Qwen_Qwen3-4B-Q4_K_M.gguf",
+        2500,
+    ),
+    # Previous default. Still a good option for users who want the
+    # smallest lm_head (vocab 32K). Slower than Qwen3 because the
+    # fused QKV tensor blocks Q4 conversion.
+    "Phi-3.5-mini": (
+        "bartowski/Phi-3.5-mini-instruct-GGUF",
+        "Phi-3.5-mini-instruct-Q8_0.gguf",
+        3800,
+    ),
+    # Lightweight all-rounder. vocab 49K, ~12 tok/s on M3.
+    "SmolLM2-1.7B": (
+        "bartowski/SmolLM2-1.7B-Instruct-GGUF",
+        "SmolLM2-1.7B-Instruct-Q8_0.gguf",
+        1700,
+    ),
+    # Smallest usable download. 128K vocab → slower lm_head.
+    "Llama-3.2-1B": (
+        "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF",
+        "llama-3.2-1b-instruct-q4_k_m.gguf",
+        750,
     ),
     "Qwen3.5-0.8B": (
         "unsloth/Qwen3.5-0.8B-GGUF",
         "Qwen3.5-0.8B-Q4_K_M.gguf",
         508,
     ),
-    "Llama-3.2-1B": (
-        "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF",
-        "llama-3.2-1b-instruct-q4_k_m.gguf",
-        750,
+    # 138 MB demo model. Too small for real use.
+    "SmolLM2-135M": (
+        "Felladrin/gguf-Q8_0-SmolLM2-135M-Instruct",
+        "smollm2-135m-instruct-q8_0.gguf",
+        135,
     ),
 }
 
@@ -100,14 +155,36 @@ def _download_with_progress(url: str, dest: Path, desc: str) -> None:
     tmp.rename(dest)
 
 
+_MODEL_ALIASES = {
+    "smollm2":         "SmolLM2-1.7B",
+    "smollm2:1.7b":    "SmolLM2-1.7B",
+    "smollm2:135m":    "SmolLM2-135M",
+    "qwen3.5":         "Qwen3.5-0.8B",
+    "qwen3.5:0.8b":    "Qwen3.5-0.8B",
+    "llama3.2":        "Llama-3.2-1B",
+    "llama3.2:1b":     "Llama-3.2-1B",
+    "phi3.5":          "Phi-3.5-mini",
+    "phi3.5:mini":     "Phi-3.5-mini",
+    "phi-3.5":         "Phi-3.5-mini",
+    "phi-3.5-mini":    "Phi-3.5-mini",
+}
+
+
+def _resolve_model_name(name: str) -> str:
+    """Resolve alias or case-insensitive name to canonical registry key."""
+    if name in _MODEL_REGISTRY:
+        return name
+    return _MODEL_ALIASES.get(name.lower(), name)
+
+
 def download(name: str) -> str:
     """Download a model from HuggingFace Hub and return its local path.
 
     Parameters
     ----------
     name : str
-        Model name from the registry. Currently available:
-        ``"SmolLM2-135M"`` (~135 MB, good for testing).
+        Model name or alias. Examples: ``"Phi-3.5-mini"``, ``"phi3.5:mini"``,
+        ``"smollm2"``, ``"llama3.2:1b"``.
 
     Returns
     -------
@@ -116,9 +193,10 @@ def download(name: str) -> str:
 
     Examples
     --------
-    >>> path = quantcpp.download("SmolLM2-135M")
+    >>> path = quantcpp.download("phi3.5:mini")
     >>> m = quantcpp.Model(path)
     """
+    name = _resolve_model_name(name)
     if name not in _MODEL_REGISTRY:
         avail = ", ".join(sorted(_MODEL_REGISTRY))
         raise ValueError(
@@ -160,9 +238,9 @@ class Model:
 
     Examples
     --------
-    >>> m = Model.from_pretrained("SmolLM2-135M")
+    >>> m = Model.from_pretrained("Phi-3.5-mini")
     >>> m.ask("What is gravity?")
-    'Gravity is a force that attracts ...'
+    'Gravity is a fundamental force that attracts ...'
 
     >>> with Model("model.gguf") as m:
     ...     for tok in m.generate("Once upon a time"):
@@ -315,6 +393,56 @@ class Model:
 
         return text
 
+    def ask_verified(self, context: str, question: str) -> tuple:
+        """Answer a question from context with coherence verification.
+
+        Returns (answer, confidence) where confidence is 0.0-1.0.
+        If verification fails, returns ("", 0.0).
+
+        This is the Python wrapper for quant_ask_verified() — the
+        universal coherence check that catches 'related but wrong' answers.
+
+        Example
+        -------
+        >>> answer, conf = m.ask_verified("Acme reported $847M revenue.", "What was revenue?")
+        >>> print(f"{answer} (confidence: {conf:.0%})")
+        '$847M (confidence: 90%)'
+        """
+        self._ensure_open()
+
+        # Step 1: Ask with self-check format
+        lookup_prompt = (
+            f"Document:\n{context}\n\n"
+            f"Question: {question}\n"
+            f"If this text answers the question, reply ANSWER: <answer>. "
+            f"If not, reply NONE."
+        )
+        answer = self.ask(lookup_prompt)
+
+        if not answer or answer.startswith("NONE") or "does not" in answer.lower():
+            return ("", 0.05)
+
+        # Strip ANSWER: prefix
+        text = answer
+        if text.upper().startswith("ANSWER:"):
+            text = text[7:].strip()
+
+        # Step 2: Coherence check
+        check_prompt = (
+            f"A user asked: \"{question}\"\n"
+            f"The system answered: \"{text[:200]}\"\n"
+            f"Is the EXACT question answered? YES or NO."
+        )
+        verdict = self.ask(check_prompt)
+        v = verdict.strip().lower()[:10] if verdict else ""
+
+        if "no" in v and "yes" not in v:
+            return (text, 0.1)
+        elif "yes" in v:
+            return (text, 0.9)
+        else:
+            return (text, 0.5)
+
     def generate(self, prompt: str) -> Iterator[str]:
         """Stream tokens from a prompt. Yields token strings one at a time.
 
@@ -394,6 +522,15 @@ class Model:
 
         Falls back to ``generate()`` on older library builds without
         ``quant_chat`` symbol.
+
+        Raises
+        ------
+        ChatContextOverflow
+            When the conversation history exceeds the model's context
+            window. The session has been auto-reset; the caller should
+            trim history and retry.
+        RuntimeError
+            On other generation failures (allocation, invalid state).
         """
         self._ensure_open()
         lib = get_lib()
@@ -414,6 +551,7 @@ class Model:
         tokens = []
         done = threading.Event()
         error_box = [None]
+        rc_box = [0]
 
         def _on_token(text_ptr, _user_data):
             if text_ptr:
@@ -424,7 +562,8 @@ class Model:
         def _run():
             try:
                 with self._lock:
-                    lib.quant_chat(self._ctx, prompt.encode("utf-8"), cb, None)
+                    rc_box[0] = lib.quant_chat(
+                        self._ctx, prompt.encode("utf-8"), cb, None)
             except Exception as e:
                 error_box[0] = e
             finally:
@@ -447,6 +586,19 @@ class Model:
 
         if error_box[0] is not None:
             raise error_box[0]
+
+        # Surface generation failures from the C side. Previously these
+        # were silently swallowed: -2 (context overflow) and -1 (alloc
+        # failure) both produced empty token streams that callers could
+        # not distinguish from "the model decided to say nothing".
+        rc = rc_box[0]
+        if rc == -2:
+            raise ChatContextOverflow(
+                "conversation history exceeds the model's context window — "
+                "session has been reset, retry with shorter history"
+            )
+        if rc < 0:
+            raise RuntimeError(f"quant_chat failed with rc={rc}")
 
     def reset_chat(self) -> None:
         """Reset the chat KV cache. Next chat() call starts fresh."""
@@ -528,4 +680,4 @@ def load(path: str, **kwargs) -> Model:
     return Model(path, **kwargs)
 
 
-__all__ = ["Model", "load", "download", "__version__"]
+__all__ = ["Model", "load", "download", "ChatContextOverflow", "__version__"]

@@ -185,6 +185,14 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
     if (max_q_dim > max_dim) max_dim = max_q_dim;
     if (q_proj_dim > max_dim) max_dim = q_proj_dim;
     if (delta_qkv_dim > max_dim) max_dim = delta_qkv_dim;
+    /* Phi-3 fused QKV: xb2 is used as temp buffer for [Q|K|V] output */
+    if (config->has_fused_qkv) {
+        int fused_qkv_dim = q_dim + 2 * kv_dim;
+        if (fused_qkv_dim > max_dim) max_dim = fused_qkv_dim;
+    }
+    /* Phi-3 fused gate||up: hb must hold 2*inter for the fused matmul */
+    int hb_dim = inter_dim;
+    if (config->has_fused_up_gate) hb_dim = 2 * inter_dim;
 
     s->x      = (float*)calloc((size_t)dim, sizeof(float));
     s->xb     = (float*)calloc((size_t)max_dim, sizeof(float));
@@ -193,7 +201,7 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
     s->k      = (float*)calloc((size_t)max_kv_dim, sizeof(float));
     s->v      = (float*)calloc((size_t)max_kv_dim, sizeof(float));
     s->att    = (float*)calloc((size_t)n_heads * max_seq, sizeof(float));
-    s->hb     = (float*)calloc((size_t)inter_dim, sizeof(float));
+    s->hb     = (float*)calloc((size_t)hb_dim, sizeof(float));
     s->hb2    = (float*)calloc((size_t)inter_dim, sizeof(float));
     s->logits = (float*)calloc((size_t)config->vocab_size, sizeof(float));
 
@@ -957,6 +965,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     int has_q2 = (layer->wq_q2 != NULL);
     int has_q4 = (layer->wq_q4 != NULL);
     int has_gguf = (layer->gguf_wq != NULL);
+    int has_fused_qkv_layer = (layer->gguf_w_qkv != NULL);
     if (has_q2 || has_q4) {
         tq_quantize_row_q8(s->xb, s->xb_q8, s->xb_q8s, dim);
     }
@@ -974,7 +983,23 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
      * layer-level batch scope in tq_forward(). */
 
     float* gate_q = NULL;
-    if (c->attn_output_gate) {
+    if (has_fused_qkv_layer) {
+        /* Phi-3 fused QKV: one matmul produces [Q | K | V].
+         * Force CPU path — Metal has a buffer sizing bug with the large
+         * output dim (total_out = 3*dim for Phi-3.5, much larger than
+         * typical single-projection matmuls). */
+        extern void tq_matmul_gguf_cpu(float*, const float*, const void*,
+                                        int, int, int);
+        int q_out  = n_heads * head_dim;
+        int kv_out = kv_dim;
+        int total_out = q_out + 2 * kv_out;
+        tq_matmul_gguf_cpu(s->xb2, s->xb,
+                           layer->gguf_w_qkv, layer->gguf_w_qkv_type,
+                           total_out, dim);
+        memcpy(s->q, s->xb2,                       (size_t)q_out  * sizeof(float));
+        memcpy(s->k, s->xb2 + q_out,               (size_t)kv_out * sizeof(float));
+        memcpy(s->v, s->xb2 + q_out + kv_out,      (size_t)kv_out * sizeof(float));
+    } else if (c->attn_output_gate) {
         int qg_dim = n_heads * head_dim * 2;
         if (layer->wq_q2) {
             TQ_MATMUL_Q2_OR_1BIT(s->xb2, s->xb, layer->wq_q2, layer->wq_q2s, s->xb_q8, s->xb_q8s, qg_dim, dim, model->use_1bit_weights);
@@ -1015,33 +1040,56 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             tq_matmul(s->q, s->xb, layer->wq, n_heads * head_dim, dim);
         }
     }
-    if (layer->wk_q2) {
-        TQ_MATMUL_Q2_OR_1BIT(s->k, s->xb, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
-    } else if (layer->wk_q4) {
-        tq_matmul_q4q2_preq(s->k, layer->wk_q4, layer->wk_q4s, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
-    } else if (layer->wk_q8) {
-        tq_matmul_q8(s->k, s->xb, layer->wk_q8, layer->wk_q8s, kv_dim, dim);
-    } else if (has_gguf) {
-        tq_matmul_gguf(s->k, s->xb, layer->gguf_wk, layer->gguf_wk_type, kv_dim, dim);
-    } else {
-        tq_matmul(s->k, s->xb, layer->wk, kv_dim, dim);
+    /* Apply Q bias (Qwen2/2.5/3) */
+    if (layer->q_bias) {
+        int q_dim = n_heads * head_dim;
+        for (int i = 0; i < q_dim; i++) s->q[i] += layer->q_bias[i];
     }
-    /* V projection: if V weights are absent (Gemma 4 K=V), copy K to V */
+
+    /* Check if this is a KV-shared layer (reuse KV cache from source layer).
+     * KV-shared layers DO have K/V weights in GGUF but we skip them, matching
+     * llama.cpp's has_kv(il) which returns false for l >= n_layer - n_kv_shared_layers. */
     int has_v_weights = (layer->wv_q2 || layer->wv_q4 || layer->wv_q8 ||
                          layer->gguf_wv || layer->wv);
-    if (!has_v_weights) {
-        /* K=V: value is same as key (attention_k_eq_v) */
-        memcpy(s->v, s->k, kv_dim * sizeof(float));
-    } else if (layer->wv_q2) {
-        TQ_MATMUL_Q2_OR_1BIT(s->v, s->xb, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
-    } else if (layer->wv_q4) {
-        tq_matmul_q4q2_preq(s->v, layer->wv_q4, layer->wv_q4s, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
-    } else if (layer->wv_q8) {
-        tq_matmul_q8(s->v, s->xb, layer->wv_q8, layer->wv_q8s, kv_dim, dim);
-    } else if (has_gguf) {
-        tq_matmul_gguf(s->v, s->xb, layer->gguf_wv, layer->gguf_wv_type, kv_dim, dim);
-    } else {
-        tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
+    int is_kv_shared = (c->n_kv_shared_layers > 0 && model->kv_source_layer &&
+                         l >= c->n_layers - c->n_kv_shared_layers);
+
+    if (!has_fused_qkv_layer && !is_kv_shared) {
+        if (layer->wk_q2) {
+            TQ_MATMUL_Q2_OR_1BIT(s->k, s->xb, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
+        } else if (layer->wk_q4) {
+            tq_matmul_q4q2_preq(s->k, layer->wk_q4, layer->wk_q4s, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
+        } else if (layer->wk_q8) {
+            tq_matmul_q8(s->k, s->xb, layer->wk_q8, layer->wk_q8s, kv_dim, dim);
+        } else if (has_gguf) {
+            tq_matmul_gguf(s->k, s->xb, layer->gguf_wk, layer->gguf_wk_type, kv_dim, dim);
+        } else {
+            tq_matmul(s->k, s->xb, layer->wk, kv_dim, dim);
+        }
+        if (!has_v_weights) {
+            /* K=V: value is same as key (attention_k_eq_v) */
+            memcpy(s->v, s->k, kv_dim * sizeof(float));
+        } else if (layer->wv_q2) {
+            TQ_MATMUL_Q2_OR_1BIT(s->v, s->xb, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
+        } else if (layer->wv_q4) {
+            tq_matmul_q4q2_preq(s->v, layer->wv_q4, layer->wv_q4s, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
+        } else if (layer->wv_q8) {
+            tq_matmul_q8(s->v, s->xb, layer->wv_q8, layer->wv_q8s, kv_dim, dim);
+        } else if (has_gguf) {
+            tq_matmul_gguf(s->v, s->xb, layer->gguf_wv, layer->gguf_wv_type, kv_dim, dim);
+        } else {
+            tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
+        }
+    }
+
+    /* Apply K/V biases (Qwen2/2.5/3) */
+    if (!is_kv_shared) {
+        if (layer->k_bias) {
+            for (int i = 0; i < kv_dim; i++) s->k[i] += layer->k_bias[i];
+        }
+        if (layer->v_bias) {
+            for (int i = 0; i < kv_dim; i++) s->v[i] += layer->v_bias[i];
+        }
     }
 
     /* Flush batched Q+K+V GPU dispatches before CPU-side RoPE/attention */
@@ -1060,14 +1108,15 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
      * This gives 2x V memory savings while preserving key precision. */
     int save_pre_norm_keys = 0; /* disabled — see above */
 
-    /* Apply QK-norm if present (per-head RMSNorm) */
+    /* Apply QK-norm if present (per-head RMSNorm).
+     * For KV-shared layers: only Q-norm is applied (no K/V to normalize). */
     if (layer->q_norm) {
         for (int h = 0; h < n_heads; h++) {
             tq_rmsnorm(s->q + h * head_dim, s->q + h * head_dim,
                        layer->q_norm, head_dim, c->rms_norm_eps);
         }
     }
-    if (layer->k_norm) {
+    if (layer->k_norm && !is_kv_shared) {
         for (int h = 0; h < n_kv_heads; h++) {
             tq_rmsnorm(s->k + h * head_dim, s->k + h * head_dim,
                        layer->k_norm, head_dim, c->rms_norm_eps);
@@ -1076,7 +1125,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
 
     /* Gemma 4: V normalization (RMS norm without learned weights).
      * Reference: refs/llama.cpp/src/models/gemma4-iswa.cpp line 82 */
-    if (c->is_gemma4 && has_v_weights) {
+    if (c->is_gemma4 && has_v_weights && !is_kv_shared) {
         for (int h = 0; h < n_kv_heads; h++) {
             float* vh = s->v + h * head_dim;
             float ss = 0.0f;
@@ -1157,6 +1206,12 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         if (rope_pairs > model->rope_freqs_len)
             rope_pairs = model->rope_freqs_len;
 
+        /* Gemma 4 / STEP35 uses NeoX-style RoPE: pairs are (q[i], q[i+half])
+         * where half = head_dim/2. Other models use interleaved: (q[2i], q[2i+1]).
+         * The GGUF converter generates rope_freqs assuming NeoX layout. */
+        int neox = c->is_gemma4;
+        int half = head_dim / 2;
+
         for (int h = 0; h < n_heads; h++) {
             float* qh = s->q + h * head_dim;
             for (int i = 0; i < rope_pairs; i++) {
@@ -1165,25 +1220,31 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                 float theta = pos * freq;
                 float cos_t = cosf(theta);
                 float sin_t = sinf(theta);
-                float q0 = qh[2 * i];
-                float q1 = qh[2 * i + 1];
-                qh[2 * i]     = q0 * cos_t - q1 * sin_t;
-                qh[2 * i + 1] = q0 * sin_t + q1 * cos_t;
+                int a = neox ? i        : 2 * i;
+                int b = neox ? i + half  : 2 * i + 1;
+                float q0 = qh[a];
+                float q1 = qh[b];
+                qh[a] = q0 * cos_t - q1 * sin_t;
+                qh[b] = q0 * sin_t + q1 * cos_t;
             }
             /* Pairs beyond rope_pairs are left unrotated (pass-through) */
         }
-        for (int h = 0; h < n_kv_heads; h++) {
-            float* kh = s->k + h * head_dim;
-            for (int i = 0; i < rope_pairs; i++) {
-                float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)rope_n_dims);
-                float freq = base_freq / model->rope_freqs[i];
-                float theta = pos * freq;
-                float cos_t = cosf(theta);
-                float sin_t = sinf(theta);
-                float k0 = kh[2 * i];
-                float k1 = kh[2 * i + 1];
-                kh[2 * i]     = k0 * cos_t - k1 * sin_t;
-                kh[2 * i + 1] = k0 * sin_t + k1 * cos_t;
+        if (!is_kv_shared) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = s->k + h * head_dim;
+                for (int i = 0; i < rope_pairs; i++) {
+                    float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)rope_n_dims);
+                    float freq = base_freq / model->rope_freqs[i];
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    int a = neox ? i        : 2 * i;
+                    int b = neox ? i + half  : 2 * i + 1;
+                    float k0 = kh[a];
+                    float k1 = kh[b];
+                    kh[a] = k0 * cos_t - k1 * sin_t;
+                    kh[b] = k0 * sin_t + k1 * cos_t;
+                }
             }
         }
     } else {
@@ -1193,7 +1254,94 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             model->layer_is_sliding && model->layer_is_sliding[l]) {
             rope_base = c->rope_local_base_freq;
         }
-        tq_rope(s->q, s->k, pos, head_dim, n_heads, n_kv_heads, rope_base);
+        if (c->rope_factors_short || c->rope_factors_long) {
+            /* Phi-3 LongRoPE with NeoX-style rotation (non-interleaved pairs) */
+            const float* factors =
+                (pos >= c->rope_orig_ctx_len && c->rope_factors_long)
+                    ? c->rope_factors_long
+                    : (c->rope_factors_short ? c->rope_factors_short : c->rope_factors_long);
+            int half = head_dim / 2;
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float freq = base_freq / factors[i];
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float q0 = qh[i], q1 = qh[i + half];
+                    qh[i]        = q0 * cos_t - q1 * sin_t;
+                    qh[i + half] = q0 * sin_t + q1 * cos_t;
+                }
+            }
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = s->k + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float freq = base_freq / factors[i];
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float k0 = kh[i], k1 = kh[i + half];
+                    kh[i]        = k0 * cos_t - k1 * sin_t;
+                    kh[i + half] = k0 * sin_t + k1 * cos_t;
+                }
+            }
+            if (pos >= c->rope_orig_ctx_len && c->rope_attn_factor > 0.0f) {
+                float scale = c->rope_attn_factor;
+                for (int i = 0; i < n_heads * head_dim; i++) s->q[i] *= scale;
+            }
+        } else if (c->is_gemma4) {
+            /* Gemma 4 uses NeoX-style RoPE: pairs are (q[i], q[i+half]) */
+            int half = head_dim / 2;
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float q0 = qh[i], q1 = qh[i + half];
+                    qh[i]        = q0 * cos_t - q1 * sin_t;
+                    qh[i + half] = q0 * sin_t + q1 * cos_t;
+                }
+            }
+            if (!is_kv_shared) {
+                for (int h = 0; h < n_kv_heads; h++) {
+                    float* kh = s->k + h * head_dim;
+                    for (int i = 0; i < half; i++) {
+                        float freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                        float theta = pos * freq;
+                        float cos_t = cosf(theta);
+                        float sin_t = sinf(theta);
+                        float k0 = kh[i], k1 = kh[i + half];
+                        kh[i]        = k0 * cos_t - k1 * sin_t;
+                        kh[i + half] = k0 * sin_t + k1 * cos_t;
+                    }
+                }
+            }
+        } else if (is_kv_shared) {
+            /* KV-shared layer: only apply RoPE to Q, not K */
+            int half_dim = head_dim / 2;
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                float r_base = rope_base;
+                for (int i = 0; i < half_dim; i++) {
+                    float freq = 1.0f / powf(r_base, 2.0f * i / (float)head_dim);
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    /* NeoX style for Gemma 4, interleaved for others */
+                    int a = c->is_gemma4 ? i : 2 * i;
+                    int b = c->is_gemma4 ? i + half_dim : 2 * i + 1;
+                    float q0 = qh[a], q1 = qh[b];
+                    qh[a] = q0 * cos_t - q1 * sin_t;
+                    qh[b] = q0 * sin_t + q1 * cos_t;
+                }
+            }
+        } else {
+            tq_rope(s->q, s->k, pos, head_dim, n_heads, n_kv_heads, rope_base);
+        }
     }
 
     /* Store K,V in cache.
@@ -1206,8 +1354,18 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     if (use_quant_kv && c->is_gemma4 && c->use_qk_norm) {
         use_quant_kv = 0; /* fall through to FP32 key storage */
     }
-    float* key_cache_layer = s->key_cache + l * kv_layer_stride;
-    if (!use_quant_kv) {
+    /* For KV-shared layers, use the source layer's cache instead of this layer's.
+     * The source layer already wrote K/V at each position, so we just read from it. */
+    int kv_cache_layer_idx = l;
+    if (is_kv_shared && model->kv_source_layer) {
+        kv_cache_layer_idx = model->kv_source_layer[l];
+    }
+    float* key_cache_layer = s->key_cache + kv_cache_layer_idx * kv_layer_stride;
+
+    /* Skip K/V cache write for KV-shared layers (source layer already wrote) */
+    if (is_kv_shared) {
+        /* No K/V to store — skip to attention */
+    } else if (!use_quant_kv) {
         /* Use cache_kv_dim for position stride (cache allocated with sliding dims).
          * Full layers write fewer floats (kv_dim < cache_kv_dim) but at correct stride. */
         memcpy(key_cache_layer + (size_t)pos * cache_kv_dim, s->k, kv_dim * sizeof(float));
@@ -1286,11 +1444,15 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             f32_to_fp16_vec(s->v, hr_dst, kv_dim);
         }
     } else if (s->use_fp16_values) {
-        uint16_t* val_fp16_layer = s->value_cache_fp16 + l * kv_layer_stride;
-        f32_to_fp16_vec(s->v, val_fp16_layer + (size_t)pos * cache_kv_dim, kv_dim);
+        uint16_t* val_fp16_layer = s->value_cache_fp16 + kv_cache_layer_idx * kv_layer_stride;
+        if (!is_kv_shared) {
+            f32_to_fp16_vec(s->v, val_fp16_layer + (size_t)pos * cache_kv_dim, kv_dim);
+        }
     } else {
-        float* val_cache_layer = s->value_cache + l * kv_layer_stride;
-        memcpy(val_cache_layer + (size_t)pos * cache_kv_dim, s->v, kv_dim * sizeof(float));
+        float* val_cache_layer = s->value_cache + kv_cache_layer_idx * kv_layer_stride;
+        if (!is_kv_shared) {
+            memcpy(val_cache_layer + (size_t)pos * cache_kv_dim, s->v, kv_dim * sizeof(float));
+        }
     }
 
     /* Quantize the new key into the quantized cache for integer attention.
@@ -1384,7 +1546,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                 sqrtf(cd1/head_dim), mse/head_dim, cn/(sqrtf(cd1)*sqrtf(cd2)+1e-10f));
     }
     float kv_prescale = 1.0f;
-    if (use_int_attn) {
+    if (use_int_attn && !is_kv_shared) {
         const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
         for (int kh = 0; kh < n_kv_heads; kh++) {
             /* Use pre-QK-norm keys for quantization (better rms→cosine) */
@@ -1994,7 +2156,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             }
         } else if (s->use_fp16_values) {
             /* FP16 value path: convert on the fly during weighted sum */
-            const uint16_t* vfp16_layer = s->value_cache_fp16 + l * kv_layer_stride;
+            const uint16_t* vfp16_layer = s->value_cache_fp16 + kv_cache_layer_idx * kv_layer_stride;
             for (int t = 0; t < seq_len; t++) {
                 const uint16_t* vt16 = vfp16_layer + (size_t)t * cache_kv_dim + kv_h * head_dim;
                 float a = atth[t];
@@ -2019,7 +2181,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             }
         } else {
             /* FP32 value path (original) */
-            const float* val_cache_layer_fp32 = s->value_cache + l * kv_layer_stride;
+            const float* val_cache_layer_fp32 = s->value_cache + kv_cache_layer_idx * kv_layer_stride;
             for (int t = 0; t < seq_len; t++) {
                 const float* vt = val_cache_layer_fp32 + (size_t)t * cache_kv_dim + kv_h * head_dim;
                 float a = atth[t];
@@ -2080,6 +2242,15 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     if (has_gguf) tq_metal_batch_flush_if_available();
     TQ_PROF_STOP(_tp, matmul_ns);
 
+    if (l == 3 && pos <= 1 && getenv("TQ_DEBUG_PREFILL")) {
+        double _sum=0, _sabs=0;
+        for (int i = 0; i < dim; i++) { _sum += s->xb[i]; _sabs += (s->xb[i]<0?-s->xb[i]:s->xb[i]); }
+        fprintf(stderr, "[fwd]   L3 pos=%d xb sum=%.6f sumabs=%.6f [0:4]=%.6f,%.6f,%.6f,%.6f [dim/2]=%.6f\n",
+            pos, _sum, _sabs, s->xb[0], s->xb[1], s->xb[2], s->xb[3], s->xb[dim/2]);
+        fprintf(stderr, "[fwd]   L3 pos=%d xb2 (after wo) [0:8] = ", pos);
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", s->xb2[i]);
+        fprintf(stderr, "\n");
+    }
     /* Debug: print attention output before residual add */
     if (pos == 0 && getenv("TQ_DEBUG") && (l < 3 || l == 5 || l == 11)) {
         float maxv = 0, minv = 0;
@@ -2113,6 +2284,16 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     tq_model_config_t* c = &model->config;
     int dim = c->hidden_dim;
 
+    /* Phi-3: force all GGUF matmuls to CPU for the entire forward pass.
+     * Metal kernels produce garbage for Phi-3.5's architecture (fused QKV,
+     * head_dim=96, LongRoPE). CPU NEON path is correct and fast enough
+     * on Apple Silicon. Restored at function exit. */
+    int _phi3_force_cpu = c->has_fused_qkv;
+    if (_phi3_force_cpu) {
+        extern int tq_matmul_force_cpu;
+        tq_matmul_force_cpu = 1;
+    }
+
     /* Step 1: Token embedding */
     if (model->embed_bf16) {
         /* Streaming BF16->FP32 conversion: convert only this token's row */
@@ -2134,14 +2315,14 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             memcpy(&s->x[i], &bits, 4);
         }
 #endif
-    } else if (model->output_gguf && !model->token_embedding) {
+    } else if (model->embed_gguf && !model->token_embedding) {
         /* GGUF embedding: dequant single row on demand (no FP32 table in memory) */
-        int block_elems = tq_ggml_type_blck(model->output_gguf_type);
-        int block_bytes = (int)tq_ggml_type_size(model->output_gguf_type);
+        int block_elems = tq_ggml_type_blck(model->embed_gguf_type);
+        int block_bytes = (int)tq_ggml_type_size(model->embed_gguf_type);
         int n_blocks = dim / block_elems;
         size_t row_bytes = (size_t)n_blocks * block_bytes;
-        const uint8_t* row_ptr = (const uint8_t*)model->output_gguf + (size_t)token * row_bytes;
-        tq_dequant_row_gguf(model->output_gguf_type, row_ptr, s->x, dim);
+        const uint8_t* row_ptr = (const uint8_t*)model->embed_gguf + (size_t)token * row_bytes;
+        tq_dequant_row_gguf(model->embed_gguf_type, row_ptr, s->x, dim);
     } else {
         memcpy(s->x, model->token_embedding + (size_t)token * dim,
                dim * sizeof(float));
@@ -2170,17 +2351,18 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     if (model->ple_dim > 0 && model->ple_embedding && model->ple_proj && !getenv("TQ_NO_PLE")) {
         int ple_dim = model->ple_dim;
         int n_layers = c->n_layers;
-        int total_ple = n_layers * ple_dim;  /* e.g., 35 * 256 = 8960 */
+        int total_ple = n_layers * ple_dim;  /* E2B: 35*256=8960, E4B: 42*256=10752 */
 
         /* Lazy allocation of ple_buf */
         if (!s->ple_buf) {
             s->ple_buf = (float*)calloc((size_t)total_ple, sizeof(float));
         }
 
-        /* Step A: Dequant per_layer_token_embd[token] → temp_embd[8960]
+        /* Step A: Dequant per_layer_token_embd[token] → temp_embd
          * The embedding tensor is [total_ple, vocab_size] in GGUF row-major,
          * so one token's data is at row offset = token * row_bytes. */
-        float temp_embd[8960];  /* stack buffer, total_ple <= 8960 */
+        float temp_embd[16384];  /* stack buffer, sized for total_ple up to 16384 (E4B=10752) */
+        if (total_ple > 16384) return s->logits;  /* safety guard — should not happen */
         {
             size_t type_size = tq_ggml_type_size(model->ple_embedding_type);
             int blck = tq_ggml_type_blck(model->ple_embedding_type);
@@ -2196,11 +2378,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             temp_embd[i] *= ple_scale;
         }
 
-        /* Step B: per_layer_model_proj @ embed_raw → temp_proj[8960]
-         * ple_proj is [total_ple, hidden_dim] FP32 (rows=8960, cols=1536).
+        /* Step B: per_layer_model_proj @ embed_raw → temp_proj
+         * ple_proj is [total_ple, hidden_dim] FP32. For E4B: [10752, 2560].
          * We need: for each output row d in [0, total_ple): dot(ple_proj[d,:], s->x[:])
          * Note: s->x already has the scaled embedding from above. */
-        float temp_proj[8960];
+        float temp_proj[16384];
         tq_matmul(temp_proj, s->x, model->ple_proj, total_ple, dim);
 
         /* Scale by 1/sqrt(hidden_dim) */
@@ -2304,7 +2486,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
 #endif
 
-        int layer_has_gguf = (layer->gguf_wq != NULL);
+        int layer_has_gguf = (layer->gguf_wq != NULL || layer->gguf_w_qkv != NULL);
 
         if (gpu_layer_done) goto layer_postprocess;
 
@@ -2319,12 +2501,27 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         /* Metal batch mode: GGUF on-the-fly path only (Gemma 4 MoE).
          * Q4 converted weights: CPU NEON Q4×Q8 is faster than Metal GPU
          * due to per-dispatch overhead exceeding compute time on small matrices.
-         * Benchmarked: Metal Q4 batch → 38 tok/s vs CPU Q4 → 95 tok/s (SmolLM2). */
-        if (layer_has_gguf) tq_metal_batch_begin_if_available();
+         * Benchmarked: Metal Q4 batch → 38 tok/s vs CPU Q4 → 95 tok/s (SmolLM2).
+         *
+         * Skip Metal batch for Phi-3 fused layers: mixing CPU fallback
+         * (fused QKV/FFN) with GPU matmuls (wo, down) in the same batch
+         * causes buffer synchronization issues. All matmuls fall through
+         * to CPU NEON path instead — still fast on Apple Silicon. */
+        /* Phi-3 fused layers: force ALL GGUF matmuls to CPU for this layer.
+         * Metal immediate-mode matmul also produces garbage for Phi-3.5's
+         * dimensions (hidden=3072, inter=8192) — root cause TBD. CPU NEON
+         * path works correctly and is fast enough on Apple Silicon. */
+        int skip_metal_batch = (layer->gguf_w_qkv != NULL);
+        if (layer_has_gguf && !skip_metal_batch) tq_metal_batch_begin_if_available();
 
         if (layer->delta_a_log) {
             /* DeltaNet layer */
             deltanet_forward(model, s, l);
+        } else if (layer->gguf_w_qkv) {
+            /* Phi-3 fused QKV — `gguf_wq/wk/wv` are NULL because Q, K
+             * and V are concatenated into `gguf_w_qkv`. self_attn_forward
+             * handles the fused dispatch internally. */
+            self_attn_forward(model, s, l, pos);
         } else if ((layer->wq || layer->wq_q8 || layer->wq_q4 || layer->gguf_wq || layer->wq_q2) &&
                    (layer->wk || layer->wk_q8 || layer->wk_q4 || layer->gguf_wk || layer->wk_q2) &&
                    (layer->wv || layer->wv_q8 || layer->wv_q4 || layer->gguf_wv || layer->wv_q2 ||
@@ -2508,8 +2705,8 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
          * Qwen: layers are either MoE or dense, NOT both.
          * Gemma 3 non-MoE layers: run dense FFN. */
         if (!did_moe &&
-            (layer->w_gate || layer->w_gate_q8 || layer->w_gate_q4 || layer->w_gate_q2 || layer->gguf_w_gate) &&
-            (layer->w_up || layer->w_up_q8 || layer->w_up_q4 || layer->w_up_q2 || layer->gguf_w_up) &&
+            (layer->w_gate || layer->w_gate_q8 || layer->w_gate_q4 || layer->w_gate_q2 || layer->gguf_w_gate || layer->gguf_w_up_gate) &&
+            (layer->w_up || layer->w_up_q8 || layer->w_up_q4 || layer->w_up_q2 || layer->gguf_w_up || layer->gguf_w_up_gate) &&
             (layer->w_down || layer->w_down_q8 || layer->w_down_q4 || layer->w_down_q2 || layer->gguf_w_down)) {
 
             /* Pre-FFN norm: Gemma 4 dual-FFN uses pre_ffw_norm_2 for the dense FFN.
@@ -2557,6 +2754,14 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                                    s->xb_q8, s->xb_q8s, inter, dim);
                 tq_matmul_q4_preq(s->hb2, layer->w_up_q4, layer->w_up_q4s,
                                    s->xb_q8, s->xb_q8s, inter, dim);
+            } else if (layer->gguf_w_up_gate) {
+                /* Phi-3 fused gate||up — force CPU (same Metal issue as fused QKV) */
+                extern void tq_matmul_gguf_cpu(float*, const float*, const void*,
+                                                int, int, int);
+                tq_matmul_gguf_cpu(s->hb, s->xb,
+                                   layer->gguf_w_up_gate, layer->gguf_w_up_gate_type,
+                                   2 * inter, dim);
+                memcpy(s->hb2, s->hb + inter, (size_t)inter * sizeof(float));
             } else if (layer->gguf_w_gate) {
                 /* Gate+up GPU dispatches batched by layer-level batch scope */
                 tq_matmul_gguf(s->hb, s->xb, layer->gguf_w_gate, layer->gguf_w_gate_type, inter, dim);
@@ -2619,6 +2824,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
 
     layer_postprocess:
+        if (l <= 3 && pos <= 1 && getenv("TQ_DEBUG_PREFILL")) {
+            double _s=0, _sa=0;
+            for (int i = 0; i < dim; i++) { _s += s->x[i]; _sa += (s->x[i]<0?-s->x[i]:s->x[i]); }
+            fprintf(stderr, "[fwd]   L%d pos=%d final x sum=%.9f sumabs=%.9f\n", l, pos, _s, _sa);
+        }
         /* Post-layer processing: PLE, layer_output_scale.
          * GPU graph path jumps here after full-layer GPU forward. */
 
@@ -2668,7 +2878,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
 
         /* End layer-level GPU batch scope */
-        if (layer_has_gguf) tq_metal_batch_end_if_available();
+        if (layer_has_gguf && !skip_metal_batch) tq_metal_batch_end_if_available();
 
         /* Gemma 4: layer_output_scale is a simple scalar multiply on the entire hidden state.
          * Reference: refs/llama.cpp/src/models/gemma4-iswa.cpp line 216-218
@@ -2691,7 +2901,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
 
         /* Debug: print layer output */
         if (pos == 0 && getenv("TQ_DEBUG")) {
-            if (l < 10 || l == c->n_layers - 1 || getenv("TQ_DEBUG_ALL")) {
+            if (l < 10 || l == c->n_layers - 1 || l % 10 == 0) {
                 float maxv = 0, minv = 0;
                 for (int i = 0; i < dim; i++) {
                     if (s->x[i] > maxv) maxv = s->x[i];
@@ -2810,5 +3020,573 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         }
     }
 
+    /* Restore Metal dispatch for non-Phi3 models */
+    if (_phi3_force_cpu) {
+        extern int tq_matmul_force_cpu;
+        tq_matmul_force_cpu = 0;
+    }
     return s->logits;
+}
+
+/* ============================================================
+ * Batched prefill — process N consecutive tokens in one call.
+ *
+ * Strategy: walk the layers exactly like tq_forward does, but with the
+ * matmul calls replaced by tq_batched_matmul_q4 over an [N, D] activation
+ * matrix. Per-token operations (RoPE, attention against history) are
+ * still sequential — this is fine because attention is small for short
+ * context; the matmul gains dominate. KV cache writes are per-token but
+ * to consecutive positions [pos_start..pos_start+N).
+ *
+ * Currently supported: standard Llama family with load-time Q4 conversion
+ * (use_q4_weights=1, separate Q/K/V/O + gate/up/down). Returns -1 for
+ * unsupported architectures so the caller falls back to a per-token loop.
+ *
+ * Output: KV cache populated for [pos_start..pos_start+N). Logits NOT
+ * computed (would require an extra batched lm_head matmul; the caller
+ * can still tq_forward(token[N-1], pos_start+N-1) for the final token).
+ * ============================================================ */
+int tq_forward_batch(tq_model_t* model, tq_state_t* s,
+                     const int* tokens, int N, int pos_start) {
+    if (N <= 0) return pos_start;
+    /* SANITY CHECK MODE: just call tq_forward N times. If THIS gives
+     * different results than the per-token tq_generate loop, the bug
+     * is in the orchestration outside the matmul work. Set
+     * TQ_BATCH_SANITY=1 to enable. */
+    if (getenv("TQ_BATCH_SANITY")) {
+        for (int n = 0; n < N; n++) {
+            tq_forward(model, s, tokens[n], pos_start + n);
+        }
+        return pos_start + N;
+    }
+    tq_model_config_t* c = &model->config;
+
+    /* Architectural gating: only standard Llama for now. */
+    int dbg = (getenv("TQ_DEBUG_PREFILL") != NULL);
+    if (!model->use_q4_weights)               { if (dbg) fprintf(stderr, "[batch] bail: !use_q4_weights\n"); return -1; }
+    if (c->is_moe || c->is_gemma4)             { if (dbg) fprintf(stderr, "[batch] bail: moe/gemma4\n"); return -1; }
+    if (c->has_fused_qkv || c->has_fused_up_gate) { if (dbg) fprintf(stderr, "[batch] bail: fused qkv/up\n"); return -1; }
+    if (c->n_kv_shared_layers > 0)             { if (dbg) fprintf(stderr, "[batch] bail: kv_shared\n"); return -1; }
+    if (s->delta_kv_enabled)                   { if (dbg) fprintf(stderr, "[batch] bail: delta_kv\n"); return -1; }
+    /* k_highres_window supported — circular FP32 buffer for recent keys. */
+    if (s->value_quant_bits != 0)              { if (dbg) fprintf(stderr, "[batch] bail: quant_V\n"); return -1; }
+    /* DeltaNet: hybrid batched is WIP. Default bail to per-token; opt-in
+     * via TQ_DELTANET_BATCH=1 for development. Known issue: FFN handling
+     * for DeltaNet layers in Qwen3.5 still produces empty output. */
+    if (!getenv("TQ_DELTANET_BATCH")) {
+        for (int l = 0; l < c->n_layers; l++) {
+            if (model->layers[l].delta_a_log) {
+                if (dbg) fprintf(stderr, "[batch] bail: deltanet l=%d\n", l);
+                return -1;
+            }
+        }
+    }
+
+    int dim = c->hidden_dim;
+    int q_dim = c->n_heads * c->head_dim;
+    int kv_dim = c->n_kv_heads * c->head_dim;
+    int inter = c->intermediate_dim;
+
+    /* Allocate batch scratch (N×{dim, q_dim, kv_dim, inter} FP32).
+     * For Phi-3.5 N=32: 7 buffers × 32 × 8192 × 4 = 7 MB. Trivial. */
+    size_t bytes_x  = (size_t)N * dim   * sizeof(float);
+    size_t bytes_q  = (size_t)N * q_dim * sizeof(float);
+    size_t bytes_kv = (size_t)N * kv_dim * sizeof(float);
+    size_t bytes_h  = (size_t)N * inter * sizeof(float);
+
+    float* X     = (float*)malloc(bytes_x);
+    float* Xres  = (float*)malloc(bytes_x);  /* residual stream */
+    float* XBN   = (float*)malloc(bytes_x);  /* normed for matmul */
+    float* QB    = (float*)malloc(bytes_q);
+    float* KB    = (float*)malloc(bytes_kv);
+    float* VB    = (float*)malloc(bytes_kv);
+    float* OB    = (float*)malloc(bytes_x);
+    float* GB    = (float*)malloc(bytes_h);
+    float* UB    = (float*)malloc(bytes_h);
+    if (!X || !Xres || !XBN || !QB || !KB || !VB || !OB || !GB || !UB) {
+        free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+        free(OB); free(GB); free(UB);
+        return -1;
+    }
+
+    /* Step 1: token embeddings (per-token). Mirror tq_forward's lookup.
+     * Three sources: BF16 mmap, GGUF on-demand dequant, or FP32 table. */
+    for (int n = 0; n < N; n++) {
+        int tok = tokens[n];
+        float* dst = Xres + (size_t)n * dim;
+        if (model->embed_bf16) {
+            const uint16_t* src = model->embed_bf16 + (size_t)tok * dim;
+            for (int i = 0; i < dim; i++) {
+                uint32_t bits = ((uint32_t)src[i]) << 16;
+                memcpy(&dst[i], &bits, 4);
+            }
+        } else if (model->embed_gguf && !model->token_embedding) {
+            int block_elems = tq_ggml_type_blck(model->embed_gguf_type);
+            int block_bytes = (int)tq_ggml_type_size(model->embed_gguf_type);
+            int n_blocks = dim / block_elems;
+            size_t row_bytes = (size_t)n_blocks * block_bytes;
+            const uint8_t* row_ptr = (const uint8_t*)model->embed_gguf + (size_t)tok * row_bytes;
+            tq_dequant_row_gguf(model->embed_gguf_type, row_ptr, dst, dim);
+        } else if (model->token_embedding) {
+            memcpy(dst, model->token_embedding + (size_t)tok * dim,
+                   (size_t)dim * sizeof(float));
+        } else {
+            if (dbg) fprintf(stderr, "[batch] bail: no embed source (n=%d tok=%d)\n", n, tok);
+            free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+            free(OB); free(GB); free(UB);
+            return -1;
+        }
+    }
+
+    /* Per-layer KV cache stride (FP32 K and V). */
+    size_t kv_layer_stride = (size_t)c->max_seq_len * (size_t)kv_dim;
+
+    for (int l = 0; l < c->n_layers; l++) {
+        tq_layer_weights_t* layer = &model->layers[l];
+
+        /* DeltaNet layer (Qwen3.5 hybrid): recurrent state can't be batched
+         * across the sequence dim, so drive each token through the existing
+         * tq_forward per-layer path that updates s->delta_state and
+         * s->conv_state in sequence order. FFN for this layer is still done
+         * per-token because deltanet_forward writes residual into s->x and
+         * we continue from there. */
+        if (layer->delta_a_log) {
+            /* DeltaNet: SSM recurrent state can't be batched. Process each
+             * token in order so state advances correctly; no final
+             * tq_forward runs after this function (logits computed below). */
+            extern void deltanet_forward(tq_model_t* model, tq_state_t* s, int l);
+            for (int n = 0; n < N; n++) {
+                memcpy(s->x, Xres + (size_t)n * dim, (size_t)dim * sizeof(float));
+                tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
+                deltanet_forward(model, s, l);
+                /* deltanet_forward adds residual into s->x. Copy back. */
+                memcpy(Xres + (size_t)n * dim, s->x, (size_t)dim * sizeof(float));
+
+                /* FFN for this token — use the existing tq_forward's logic
+                 * inline. Most Qwen3.5 layers have FFN norm → gate+up → silu
+                 * → down → residual. */
+                if (layer->w_gate_q4 && layer->w_up_q4 && layer->w_down_q4) {
+                    tq_rmsnorm(s->xb, s->x, layer->ffn_norm, dim, c->rms_norm_eps);
+                    /* Use tq_matmul_q4 via per-token path */
+                    int inter_l = c->intermediate_dim;
+                    float* tmp_g = (float*)malloc((size_t)inter_l * sizeof(float));
+                    float* tmp_u = (float*)malloc((size_t)inter_l * sizeof(float));
+                    float* tmp_d = (float*)malloc((size_t)dim * sizeof(float));
+                    if (tmp_g && tmp_u && tmp_d) {
+                        tq_quantize_row_q8(s->xb, s->xb_q8, s->xb_q8s, dim);
+                        tq_matmul_q4_preq(tmp_g, layer->w_gate_q4, layer->w_gate_q4s, s->xb_q8, s->xb_q8s, inter_l, dim);
+                        tq_matmul_q4_preq(tmp_u, layer->w_up_q4, layer->w_up_q4s, s->xb_q8, s->xb_q8s, inter_l, dim);
+                        for (int i = 0; i < inter_l; i++) {
+                            float g = tmp_g[i];
+                            tmp_g[i] = (g / (1.0f + expf(-g))) * tmp_u[i];
+                        }
+                        tq_quantize_row_q8(tmp_g, s->xb_q8, s->xb_q8s, inter_l);
+                        tq_matmul_q4_preq(tmp_d, layer->w_down_q4, layer->w_down_q4s, s->xb_q8, s->xb_q8s, dim, inter_l);
+                        for (int i = 0; i < dim; i++) s->x[i] += tmp_d[i];
+                        memcpy(Xres + (size_t)n * dim, s->x, (size_t)dim * sizeof(float));
+                    }
+                    free(tmp_g); free(tmp_u); free(tmp_d);
+                }
+            }
+            continue;  /* skip the self-attention layer code below */
+        }
+
+        /* Required Q4 weights for this fast path (self_attn layers). */
+        if (!layer->wq_q4 || !layer->wk_q4 || !layer->wv_q4 || !layer->wo_q4 ||
+            !layer->w_gate_q4 || !layer->w_up_q4 || !layer->w_down_q4) {
+            if (dbg) fprintf(stderr, "[batch] bail: layer %d missing q4 weights (wq=%p wk=%p wv=%p wo=%p g=%p u=%p d=%p)\n",
+                l, (void*)layer->wq_q4, (void*)layer->wk_q4, (void*)layer->wv_q4,
+                (void*)layer->wo_q4, (void*)layer->w_gate_q4, (void*)layer->w_up_q4, (void*)layer->w_down_q4);
+            free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+            free(OB); free(GB); free(UB);
+            return -1;
+        }
+
+        /* 1. attn RMSNorm (per-row) */
+        for (int n = 0; n < N; n++) {
+            tq_rmsnorm(XBN + (size_t)n * dim, Xres + (size_t)n * dim,
+                       layer->attn_norm, dim, c->rms_norm_eps);
+        }
+
+        /* 2. Q, K, V batched matmul (Q4 main weights) */
+        tq_batched_matmul_q4(QB, layer->wq_q4, layer->wq_q4s, XBN, q_dim,  dim, N, NULL);
+        tq_batched_matmul_q4(KB, layer->wk_q4, layer->wk_q4s, XBN, kv_dim, dim, N, NULL);
+        tq_batched_matmul_q4(VB, layer->wv_q4, layer->wv_q4s, XBN, kv_dim, dim, N, NULL);
+
+        if (l == 0 && dbg) {
+            fprintf(stderr, "[batch] L0 VB (post-matmul) tok0 [0:8] = ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", VB[i]);
+            fprintf(stderr, "\n");
+        }
+        /* 2-r. Add Q2 residual correction per-token (matches tq_matmul_q4q2_preq).
+         * Load-time Q4 conversion stores BOTH Q4 main + Q2 residual. Skipping the
+         * Q2 part causes large numerical drift. We do the Q2 part per-token using
+         * the existing primitive — Q2 is small (2 bits) so the per-token cost is
+         * a fraction of the Q4 batched savings. */
+        if (layer->wq_q2 || layer->wk_q2 || layer->wv_q2) {
+            int n_blocks_d = dim / 32;
+            int8_t* xq = s->xb_q8;     /* reuse state's per-token Q8 buffer */
+            float*  xs = s->xb_q8s;
+            float* tmp_q = (float*)malloc((size_t)q_dim  * sizeof(float));
+            float* tmp_k = (float*)malloc((size_t)kv_dim * sizeof(float));
+            float* tmp_v = (float*)malloc((size_t)kv_dim * sizeof(float));
+            for (int n = 0; n < N; n++) {
+                /* Quantize this row's XBN to Q8 once. */
+                tq_quantize_row_q8(XBN + (size_t)n * dim, xq, xs, dim);
+                if (layer->wq_q2) {
+                    tq_matmul_q2_preq(tmp_q, layer->wq_q2, layer->wq_q2s, xq, xs, q_dim, dim);
+                    for (int i = 0; i < q_dim; i++) QB[(size_t)n * q_dim + i] += tmp_q[i];
+                }
+                if (layer->wk_q2) {
+                    tq_matmul_q2_preq(tmp_k, layer->wk_q2, layer->wk_q2s, xq, xs, kv_dim, dim);
+                    for (int i = 0; i < kv_dim; i++) KB[(size_t)n * kv_dim + i] += tmp_k[i];
+                }
+                if (layer->wv_q2) {
+                    tq_matmul_q2_preq(tmp_v, layer->wv_q2, layer->wv_q2s, xq, xs, kv_dim, dim);
+                    for (int i = 0; i < kv_dim; i++) VB[(size_t)n * kv_dim + i] += tmp_v[i];
+                }
+            }
+            free(tmp_q); free(tmp_k); free(tmp_v);
+            (void)n_blocks_d;
+        }
+
+        /* 2a. Apply Q/K/V biases (Qwen2/2.5/3 — NULL for Llama). */
+        if (layer->q_bias) {
+            for (int n = 0; n < N; n++)
+                for (int i = 0; i < q_dim; i++) QB[(size_t)n * q_dim + i] += layer->q_bias[i];
+        }
+        if (layer->k_bias) {
+            for (int n = 0; n < N; n++)
+                for (int i = 0; i < kv_dim; i++) KB[(size_t)n * kv_dim + i] += layer->k_bias[i];
+        }
+        if (layer->v_bias) {
+            for (int n = 0; n < N; n++)
+                for (int i = 0; i < kv_dim; i++) VB[(size_t)n * kv_dim + i] += layer->v_bias[i];
+        }
+        /* 2b. QK-norm (Qwen3 — NULL for Llama). */
+        if (layer->q_norm) {
+            for (int n = 0; n < N; n++) {
+                for (int h = 0; h < c->n_heads; h++) {
+                    float* qh = QB + (size_t)n * q_dim + h * c->head_dim;
+                    tq_rmsnorm(qh, qh, layer->q_norm, c->head_dim, c->rms_norm_eps);
+                }
+            }
+        }
+        if (layer->k_norm) {
+            for (int n = 0; n < N; n++) {
+                for (int h = 0; h < c->n_kv_heads; h++) {
+                    float* kh = KB + (size_t)n * kv_dim + h * c->head_dim;
+                    tq_rmsnorm(kh, kh, layer->k_norm, c->head_dim, c->rms_norm_eps);
+                }
+            }
+        }
+
+        /* 3. RoPE + KV cache write (per-token).
+         * Mirror tq_forward's RoPE selection: if model->rope_freqs is set
+         * (Llama 3.x learned RoPE scaling, 64 freq factors), apply per-pair
+         * factor; otherwise plain interleaved RoPE. */
+        for (int n = 0; n < N; n++) {
+            float* qn = QB + (size_t)n * q_dim;
+            float* kn = KB + (size_t)n * kv_dim;
+            int pos = pos_start + n;
+            if (model->rope_freqs && model->rope_freqs_len > 0) {
+                /* Match tq_forward's rope_n_dims selection: c->rope_n_dims may
+                 * differ from head_dim (e.g., Gemma partial RoPE). */
+                int rope_n_dims = (c->rope_n_dims > 0) ? c->rope_n_dims : c->head_dim;
+                int rope_pairs = rope_n_dims / 2;
+                if (rope_pairs > model->rope_freqs_len) rope_pairs = model->rope_freqs_len;
+                for (int h = 0; h < c->n_heads; h++) {
+                    float* qh = qn + h * c->head_dim;
+                    for (int i = 0; i < rope_pairs; i++) {
+                        float base = 1.0f / powf(c->rope_freq_base, 2.0f * i / (float)rope_n_dims);
+                        float freq = base / model->rope_freqs[i];
+                        float theta = pos * freq;
+                        float ct = cosf(theta), st = sinf(theta);
+                        float q0 = qh[2*i], q1 = qh[2*i+1];
+                        qh[2*i]   = q0 * ct - q1 * st;
+                        qh[2*i+1] = q0 * st + q1 * ct;
+                    }
+                }
+                for (int h = 0; h < c->n_kv_heads; h++) {
+                    float* kh = kn + h * c->head_dim;
+                    for (int i = 0; i < rope_pairs; i++) {
+                        float base = 1.0f / powf(c->rope_freq_base, 2.0f * i / (float)rope_n_dims);
+                        float freq = base / model->rope_freqs[i];
+                        float theta = pos * freq;
+                        float ct = cosf(theta), st = sinf(theta);
+                        float k0 = kh[2*i], k1 = kh[2*i+1];
+                        kh[2*i]   = k0 * ct - k1 * st;
+                        kh[2*i+1] = k0 * st + k1 * ct;
+                    }
+                }
+            } else {
+                tq_rope(qn, kn, pos, c->head_dim, c->n_heads, c->n_kv_heads,
+                        c->rope_freq_base);
+            }
+            if (n == 0 && l == 0 && dbg) {
+                fprintf(stderr, "[batch] L0 QB (post-RoPE) tok0 [0:8] = ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", qn[i]);
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[batch] L0 KB (post-RoPE) tok0 [0:8] = ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", kn[i]);
+                fprintf(stderr, "\n");
+            }
+            int use_quant_kv_batch = (s->quant_key_cache && s->kv_quant_type < TQ_TYPE_COUNT);
+            /* Always write FP32 K to s->key_cache — the batched attention
+             * loop below reads from it. Baseline with use_quant_kv ONLY writes
+             * to quant cache (saves memory) but we need the FP32 for our
+             * batched attention (which doesn't call the traits dequantize).
+             * The extra memory is negligible (same size as already-allocated
+             * cache). */
+            memcpy(s->key_cache + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim,
+                   kn, (size_t)kv_dim * sizeof(float));
+            /* Also populate highres FP32 circular buffer when active. */
+            if (use_quant_kv_batch && s->k_highres_window > 0 && s->key_highres_fp32) {
+                int win_idx = pos % s->k_highres_window;
+                size_t hr_layer_stride = (size_t)s->k_highres_window * kv_dim;
+                float* hr_dst = s->key_highres_fp32
+                    + (size_t)l * hr_layer_stride + (size_t)win_idx * kv_dim;
+                memcpy(hr_dst, kn, (size_t)kv_dim * sizeof(float));
+            }
+            /* quant_key_cache write for baseline's attention to read later. */
+            if (use_quant_kv_batch && !s->delta_kv_enabled) {
+                const tq_type_traits_t* traits = &TQ_TRAITS[s->kv_quant_type];
+                int cache_n_kv_heads = c->n_kv_heads;
+                if (c->full_n_kv_heads > cache_n_kv_heads) cache_n_kv_heads = c->full_n_kv_heads;
+                for (int kh = 0; kh < c->n_kv_heads; kh++) {
+                    const float* key_src = kn + kh * c->head_dim;
+                    uint8_t* quant_dst = (uint8_t*)s->quant_key_cache
+                        + (size_t)l * s->quant_kv_stride
+                        + (size_t)pos * cache_n_kv_heads * s->quant_head_stride
+                        + (size_t)kh * s->quant_head_stride;
+                    for (int blk = 0; blk < c->head_dim; blk += TQ_BK) {
+                        int blen = c->head_dim - blk;
+                        if (blen > TQ_BK) blen = TQ_BK;
+                        traits->quantize(key_src + blk,
+                                         quant_dst + (blk / TQ_BK) * traits->type_size,
+                                         blen);
+                    }
+                }
+            }
+            if (s->value_cache) {
+                memcpy(s->value_cache + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim,
+                       VB + (size_t)n * kv_dim, (size_t)kv_dim * sizeof(float));
+            } else if (s->value_cache_fp16) {
+                uint16_t* dst = s->value_cache_fp16
+                              + (size_t)l * kv_layer_stride + (size_t)pos * kv_dim;
+                f32_to_fp16_vec(VB + (size_t)n * kv_dim, dst, kv_dim);
+            } else {
+                if (dbg) fprintf(stderr, "[batch] bail: no FP32/FP16 V cache\n");
+                free(X); free(Xres); free(XBN); free(QB); free(KB); free(VB);
+                free(OB); free(GB); free(UB);
+                return -1;
+            }
+        }
+
+        /* 4. Attention (per-token, sequential — needs all preceding KV). */
+        int n_kv_heads = c->n_kv_heads;
+        int head_dim   = c->head_dim;
+        int n_heads    = c->n_heads;
+        int kv_mul     = n_heads / n_kv_heads;
+        float*    K_layer = s->key_cache + (size_t)l * kv_layer_stride;
+        float*    V_layer = s->value_cache ? (s->value_cache + (size_t)l * kv_layer_stride) : NULL;
+        uint16_t* V_layer_fp16 = s->value_cache_fp16
+                               ? (s->value_cache_fp16 + (size_t)l * kv_layer_stride) : NULL;
+
+        for (int n = 0; n < N; n++) {
+            int pos = pos_start + n;
+            float* qn = QB + (size_t)n * q_dim;
+            float* on = OB + (size_t)n * dim;
+            for (int h = 0; h < n_heads; h++) {
+                int kvh = h / kv_mul;
+                float* qh = qn + h * head_dim;
+                float* att = s->att + (size_t)h * c->max_seq_len;
+                float scale = 1.0f / sqrtf((float)head_dim);
+                for (int t = 0; t <= pos; t++) {
+                    float* kh = K_layer + (size_t)t * kv_dim + kvh * head_dim;
+                    float score = 0.0f;
+#ifdef __ARM_NEON
+                    float32x4_t vsum = vdupq_n_f32(0.0f);
+                    int d = 0;
+                    for (; d + 3 < head_dim; d += 4) {
+                        float32x4_t vq = vld1q_f32(qh + d);
+                        float32x4_t vk = vld1q_f32(kh + d);
+                        vsum = vfmaq_f32(vsum, vq, vk);
+                    }
+                    score = vaddvq_f32(vsum);
+                    for (; d < head_dim; d++) score += qh[d] * kh[d];
+#else
+                    for (int i = 0; i < head_dim; i++) score += qh[i] * kh[i];
+#endif
+                    att[t] = score * scale;
+                }
+                tq_softmax(att, pos + 1);
+                float* oh = on + h * head_dim;
+                memset(oh, 0, (size_t)head_dim * sizeof(float));
+                if (V_layer) {
+                    for (int t = 0; t <= pos; t++) {
+                        float* vh = V_layer + (size_t)t * kv_dim + kvh * head_dim;
+                        float w = att[t];
+                        for (int i = 0; i < head_dim; i++) oh[i] += w * vh[i];
+                    }
+                } else {
+                    /* FP16 V cache: use NEON vcvt_f32_f16 to exactly match the
+                     * per-token attention path. */
+                    for (int t = 0; t <= pos; t++) {
+                        uint16_t* vh = V_layer_fp16 + (size_t)t * kv_dim + kvh * head_dim;
+                        float w = att[t];
+                        if (w == 0.0f) continue;
+#ifdef __ARM_NEON
+                        float32x4_t va = vdupq_n_f32(w);
+                        int i = 0;
+                        for (; i + 3 < head_dim; i += 4) {
+                            uint16x4_t vh4 = vld1_u16(vh + i);
+                            float32x4_t vf = vcvt_f32_f16(vreinterpret_f16_u16(vh4));
+                            float32x4_t vx = vld1q_f32(oh + i);
+                            vst1q_f32(oh + i, vfmaq_f32(vx, va, vf));
+                        }
+                        for (; i < head_dim; i++) {
+                            uint16_t h16 = vh[i];
+                            __fp16 hf = *(const __fp16*)&h16;
+                            oh[i] += w * (float)hf;
+                        }
+#else
+                        for (int i = 0; i < head_dim; i++) {
+                            uint16_t h16 = vh[i];
+                            __fp16 hf = *(const __fp16*)&h16;
+                            oh[i] += w * (float)hf;
+                        }
+#endif
+                    }
+                }
+            }
+        }
+
+        if (l == 3 && dbg) {
+            /* Compute hash over OB to detect drift anywhere in the vector */
+            for (int tn = 0; tn < N && tn < 2; tn++) {
+                float* obr = OB + (size_t)tn * dim;
+                double s=0, sabs=0;
+                for (int i = 0; i < dim; i++) { s += obr[i]; sabs += (obr[i]<0?-obr[i]:obr[i]); }
+                fprintf(stderr, "[batch] L3 OB tok%d sum=%.6f sumabs=%.6f [0:4]=%.6f,%.6f,%.6f,%.6f [dim/2]=%.6f\n",
+                    tn, s, sabs, obr[0], obr[1], obr[2], obr[3], obr[dim/2]);
+            }
+        }
+        /* 5. O matmul batched + Q2 residual */
+        tq_batched_matmul_q4(X, layer->wo_q4, layer->wo_q4s, OB, dim, q_dim, N, NULL);
+        if (layer->wo_q2) {
+            int8_t* xq = s->xb_q8;
+            float*  xs = s->xb_q8s;
+            float* tmp = (float*)malloc((size_t)dim * sizeof(float));
+            for (int n = 0; n < N; n++) {
+                tq_quantize_row_q8(OB + (size_t)n * q_dim, xq, xs, q_dim);
+                tq_matmul_q2_preq(tmp, layer->wo_q2, layer->wo_q2s, xq, xs, dim, q_dim);
+                for (int i = 0; i < dim; i++) X[(size_t)n * dim + i] += tmp[i];
+            }
+            free(tmp);
+        }
+
+        if (l == 0 && dbg) {
+            fprintf(stderr, "[batch] L0 X (after wo matmul) tok0 [0:8] = ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", X[i]);
+            fprintf(stderr, "\n");
+        }
+        /* 6. Residual: Xres += X */
+        for (size_t i = 0; i < (size_t)N * dim; i++) Xres[i] += X[i];
+
+        if (l <= 3 && dbg) {
+            for (int tn = 0; tn < N && tn < 2; tn++) {
+                fprintf(stderr, "[batch] L%d after-attn-residual tok%d [0:8] = ", l, tn);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.4f ", Xres[(size_t)tn * dim + i]);
+                fprintf(stderr, "\n");
+            }
+        }
+
+        /* 7. ffn_norm */
+        for (int n = 0; n < N; n++) {
+            tq_rmsnorm(XBN + (size_t)n * dim, Xres + (size_t)n * dim,
+                       layer->ffn_norm, dim, c->rms_norm_eps);
+        }
+
+        /* 8. gate, up batched matmul + Q2 residuals */
+        tq_batched_matmul_q4(GB, layer->w_gate_q4, layer->w_gate_q4s, XBN, inter, dim, N, NULL);
+        tq_batched_matmul_q4(UB, layer->w_up_q4,   layer->w_up_q4s,   XBN, inter, dim, N, NULL);
+        if (layer->w_gate_q2 || layer->w_up_q2) {
+            int8_t* xq = s->xb_q8;
+            float*  xs = s->xb_q8s;
+            float* tmp = (float*)malloc((size_t)inter * sizeof(float));
+            for (int n = 0; n < N; n++) {
+                tq_quantize_row_q8(XBN + (size_t)n * dim, xq, xs, dim);
+                if (layer->w_gate_q2) {
+                    tq_matmul_q2_preq(tmp, layer->w_gate_q2, layer->w_gate_q2s, xq, xs, inter, dim);
+                    for (int i = 0; i < inter; i++) GB[(size_t)n * inter + i] += tmp[i];
+                }
+                if (layer->w_up_q2) {
+                    tq_matmul_q2_preq(tmp, layer->w_up_q2, layer->w_up_q2s, xq, xs, inter, dim);
+                    for (int i = 0; i < inter; i++) UB[(size_t)n * inter + i] += tmp[i];
+                }
+            }
+            free(tmp);
+        }
+
+        /* 9. SiLU(gate) * up (per-element) */
+        for (size_t i = 0; i < (size_t)N * inter; i++) {
+            float g = GB[i];
+            float silu = g / (1.0f + expf(-g));
+            GB[i] = silu * UB[i];
+        }
+
+        /* 10. down matmul batched (output back into X) + Q2 residual */
+        tq_batched_matmul_q4(X, layer->w_down_q4, layer->w_down_q4s, GB, dim, inter, N, NULL);
+        if (layer->w_down_q2) {
+            int8_t* xq = s->xb_q8;
+            float*  xs = s->xb_q8s;
+            float* tmp = (float*)malloc((size_t)dim * sizeof(float));
+            for (int n = 0; n < N; n++) {
+                tq_quantize_row_q8(GB + (size_t)n * inter, xq, xs, inter);
+                tq_matmul_q2_preq(tmp, layer->w_down_q2, layer->w_down_q2s, xq, xs, dim, inter);
+                for (int i = 0; i < dim; i++) X[(size_t)n * dim + i] += tmp[i];
+            }
+            free(tmp);
+        }
+
+        /* 11. Residual: Xres += X */
+        for (size_t i = 0; i < (size_t)N * dim; i++) Xres[i] += X[i];
+
+        if ((l <= 3) && dbg) {
+            for (int tn = 0; tn < N && tn < 2; tn++) {
+                float* row = Xres + (size_t)tn * dim;
+                double s=0, sabs=0;
+                for (int i = 0; i < dim; i++) { s += row[i]; sabs += (row[i]<0?-row[i]:row[i]); }
+                fprintf(stderr, "[batch] L%d final Xres tok%d sum=%.9f sumabs=%.9f\n",
+                    l, tn, s, sabs);
+            }
+        }
+    }
+
+    /* Compute logits for the LAST token in the batch so the caller can
+     * skip running tq_forward again. For non-DeltaNet models this is just
+     * a convenience; for DeltaNet it's required to avoid double-advancing
+     * the recurrent state. */
+    {
+        int last = N - 1;
+        float* x_last = Xres + (size_t)last * dim;
+        memcpy(s->x, x_last, (size_t)dim * sizeof(float));
+        tq_rmsnorm(s->x, s->x, model->output_norm, dim, c->rms_norm_eps);
+        if (model->output_gguf) {
+            tq_matmul_gguf(s->logits, s->x, model->output_gguf,
+                            model->output_gguf_type, c->vocab_size, dim);
+        } else if (model->output_qs) {
+            tq_matmul_q4(s->logits, s->x, model->output_qs, model->output_scales,
+                          c->vocab_size, dim);
+        } else if (model->output_weight_bf16) {
+            tq_matmul_bf16(s->logits, s->x, model->output_weight_bf16, c->vocab_size, dim);
+        } else if (model->output_weight) {
+            tq_matmul(s->logits, s->x, model->output_weight, c->vocab_size, dim);
+        }
+    }
+
+    free(X); free(XBN); free(QB); free(KB); free(VB); free(OB); free(GB); free(UB);
+    free(Xres);
+    return pos_start + N;
 }

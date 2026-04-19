@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -192,6 +193,19 @@ static void dequant_bf16(const void* src, float* dst, int n) {
 static void dequant_q8_0(const void* src, float* dst, int n) {
     const int nb = n / 32;
     const block_q8_0* blk = (const block_q8_0*)src;
+
+    for (int b = 0; b < nb; b++) {
+        const float d = fp16_to_fp32(blk[b].d);
+        for (int j = 0; j < 32; j++) {
+            dst[b * 32 + j] = d * blk[b].qs[j];
+        }
+    }
+}
+
+/* --- Q8_1: 36 bytes, 32 elements --- */
+static void dequant_q8_1(const void* src, float* dst, int n) {
+    const int nb = n / 32;
+    const block_q8_1* blk = (const block_q8_1*)src;
 
     for (int b = 0; b < nb; b++) {
         const float d = fp16_to_fp32(blk[b].d);
@@ -1155,6 +1169,9 @@ void tq_dequant_row_gguf(tq_ggml_dtype type, const void* src, float* dst, int n)
         case TQ_GGML_TYPE_Q8_0:
             dequant_q8_0(src, dst, n);
             break;
+        case TQ_GGML_TYPE_Q8_1:
+            dequant_q8_1(src, dst, n);
+            break;
         case TQ_GGML_TYPE_Q2_K:
             dequant_q2_k(src, dst, n);
             break;
@@ -1536,6 +1553,69 @@ static float fused_dot_q8_0(const void* row, const float* x, int n) {
     return sum;
 }
 
+/* Fused Q8_1 dot product: 36 bytes per 32 elements.
+ * Same math as Q8_0 (val = d * qs[i]) but different block layout.
+ * The `s` (sum) field is only used for Q4×Q8_1 mixed-type dot products. */
+static float fused_dot_q8_1(const void* row, const float* x, int n) {
+    const int nb = n / 32;
+    const block_q8_1* blk = (const block_q8_1*)row;
+    float sum = 0.0f;
+
+#if TQ_HAS_NEON
+    float32x4_t vtotal0 = vdupq_n_f32(0.0f);
+    float32x4_t vtotal1 = vdupq_n_f32(0.0f);
+
+    int b = 0;
+    for (; b + 1 < nb; b += 2) {
+        if (b + 3 < nb) __builtin_prefetch(&blk[b + 2], 0, 3);
+
+        const float d0 = fp16_to_fp32(blk[b].d);
+        const float* xp0 = x + b * 32;
+        float32x4_t vs0 = vdupq_n_f32(0.0f), vs1 = vdupq_n_f32(0.0f);
+        for (int j = 0; j < 32; j += 8) {
+            int8x8_t vq = vld1_s8(blk[b].qs + j);
+            int16x8_t vq16 = vmovl_s8(vq);
+            vs0 = vfmaq_f32(vs0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(vq16))),  vld1q_f32(xp0 + j));
+            vs1 = vfmaq_f32(vs1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(vq16))), vld1q_f32(xp0 + j + 4));
+        }
+        vtotal0 = vfmaq_n_f32(vtotal0, vaddq_f32(vs0, vs1), d0);
+
+        const float d1 = fp16_to_fp32(blk[b + 1].d);
+        const float* xp1 = x + (b + 1) * 32;
+        float32x4_t vs2 = vdupq_n_f32(0.0f), vs3 = vdupq_n_f32(0.0f);
+        for (int j = 0; j < 32; j += 8) {
+            int8x8_t vq = vld1_s8(blk[b + 1].qs + j);
+            int16x8_t vq16 = vmovl_s8(vq);
+            vs2 = vfmaq_f32(vs2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(vq16))),  vld1q_f32(xp1 + j));
+            vs3 = vfmaq_f32(vs3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(vq16))), vld1q_f32(xp1 + j + 4));
+        }
+        vtotal1 = vfmaq_n_f32(vtotal1, vaddq_f32(vs2, vs3), d1);
+    }
+    for (; b < nb; b++) {
+        const float d = fp16_to_fp32(blk[b].d);
+        const float* xp = x + b * 32;
+        float32x4_t vs0 = vdupq_n_f32(0.0f), vs1 = vdupq_n_f32(0.0f);
+        for (int j = 0; j < 32; j += 8) {
+            int8x8_t vq = vld1_s8(blk[b].qs + j);
+            int16x8_t vq16 = vmovl_s8(vq);
+            vs0 = vfmaq_f32(vs0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(vq16))),  vld1q_f32(xp + j));
+            vs1 = vfmaq_f32(vs1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(vq16))), vld1q_f32(xp + j + 4));
+        }
+        vtotal0 = vfmaq_n_f32(vtotal0, vaddq_f32(vs0, vs1), d);
+    }
+    sum = vaddvq_f32(vaddq_f32(vtotal0, vtotal1));
+#else
+    for (int b = 0; b < nb; b++) {
+        const float d = fp16_to_fp32(blk[b].d);
+        const float* xp = x + b * 32;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 32; j++) block_sum += (float)blk[b].qs[j] * xp[j];
+        sum += d * block_sum;
+    }
+#endif
+    return sum;
+}
+
 /* Fused IQ4_NL dot product: 18 bytes per 32 elements */
 static float fused_dot_iq4_nl(const void* row, const float* x, int n) {
     const int nb = n / 32;
@@ -1736,6 +1816,105 @@ static float fused_dot_iq3_xxs(const void* row, const float* x, int n) {
  *   First 32 elements: d1 * (q[l] & 0xF) - m1  (low nibble, scale pair[0])
  *   Next 32 elements:  d2 * (q[l] >> 4)  - m2   (high nibble, scale pair[1])
  */
+/* Fused Q2_K dot product: 84 bytes per 256 elements.
+ * 2-bit values packed 4-per-byte in qs[64]. scales[16] holds:
+ *   low 4 bits = sub-block scale (× d)
+ *   high 4 bits = sub-block min (× dmin)
+ * 16 sub-blocks of 16 elements each. Formula per sub-block:
+ *   sum += dl * dot(q2_values, x) - ml * sum(x)
+ * where q2_values are unsigned 2-bit values in [0, 3]. */
+static float fused_dot_q2_k(const void* row, const float* x, int n) {
+    const int nb = n / 256;
+    const block_q2_K* blk = (const block_q2_K*)row;
+    float sum = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        const float d    = fp16_to_fp32(blk[b].d);
+        const float dmin = fp16_to_fp32(blk[b].dmin);
+        const uint8_t* q = blk[b].qs;
+        const float* xp = x + b * 256;
+
+        int is = 0;
+        /* 2 halves, 4 shifts per half, 2 sub-blocks per shift */
+        for (int half = 0; half < 2; half++) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                /* Sub-block 0: q[0..15] >> shift & 3 */
+                uint8_t sc0 = blk[b].scales[is++];
+                float dl0 = d * (sc0 & 0x0F);
+                float ml0 = dmin * (sc0 >> 4);
+
+                /* Sub-block 1: q[16..31] >> shift & 3 */
+                uint8_t sc1 = blk[b].scales[is++];
+                float dl1 = d * (sc1 & 0x0F);
+                float ml1 = dmin * (sc1 >> 4);
+
+#if TQ_HAS_NEON
+                /* Load 16 packed bytes, extract 2-bit values, dot with x.
+                 * Mask is uint8x16_t of 0x03; shift applied via vshrq_n_u8. */
+                uint8x16_t qv0 = vld1q_u8(q);        /* sub-block 0 bytes */
+                uint8x16_t qv1 = vld1q_u8(q + 16);   /* sub-block 1 bytes */
+                uint8x16_t m03 = vdupq_n_u8(0x03);
+                uint8x16_t v0, v1;
+                switch (shift) {
+                    case 0: v0 = vandq_u8(qv0, m03); v1 = vandq_u8(qv1, m03); break;
+                    case 2: v0 = vandq_u8(vshrq_n_u8(qv0, 2), m03); v1 = vandq_u8(vshrq_n_u8(qv1, 2), m03); break;
+                    case 4: v0 = vandq_u8(vshrq_n_u8(qv0, 4), m03); v1 = vandq_u8(vshrq_n_u8(qv1, 4), m03); break;
+                    default: v0 = vshrq_n_u8(qv0, 6); v1 = vshrq_n_u8(qv1, 6); break;
+                }
+                /* Expand u8 → float32, accumulate dot and sum_x */
+                #define TQ_Q2K_ACC(nv, off, dl_v, ml_v)                                        \
+                    do {                                                                        \
+                        uint16x8_t w16_l = vmovl_u8(vget_low_u8(nv));                           \
+                        uint16x8_t w16_h = vmovl_u8(vget_high_u8(nv));                          \
+                        float32x4_t wf0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16_l)));        \
+                        float32x4_t wf1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16_l)));       \
+                        float32x4_t wf2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16_h)));        \
+                        float32x4_t wf3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16_h)));       \
+                        float32x4_t x0 = vld1q_f32(xp + (off));                                 \
+                        float32x4_t x1 = vld1q_f32(xp + (off) + 4);                             \
+                        float32x4_t x2 = vld1q_f32(xp + (off) + 8);                             \
+                        float32x4_t x3 = vld1q_f32(xp + (off) + 12);                            \
+                        float32x4_t vd = vdupq_n_f32(0.0f);                                     \
+                        vd = vfmaq_f32(vd, wf0, x0);                                            \
+                        vd = vfmaq_f32(vd, wf1, x1);                                            \
+                        vd = vfmaq_f32(vd, wf2, x2);                                            \
+                        vd = vfmaq_f32(vd, wf3, x3);                                            \
+                        float dot_s = vaddvq_f32(vd);                                           \
+                        float sum_s = vaddvq_f32(vaddq_f32(vaddq_f32(x0, x1), vaddq_f32(x2, x3))); \
+                        sum += (dl_v) * dot_s - (ml_v) * sum_s;                                 \
+                    } while (0)
+
+                int yi = half * 128 + j * 32;
+                TQ_Q2K_ACC(v0, yi, dl0, ml0);
+                TQ_Q2K_ACC(v1, yi + 16, dl1, ml1);
+                #undef TQ_Q2K_ACC
+#else
+                int yi = half * 128 + j * 32;
+                float dot0 = 0, sumx0 = 0;
+                for (int l = 0; l < 16; l++) {
+                    float xv = xp[yi + l];
+                    dot0 += (float)((q[l] >> shift) & 3) * xv;
+                    sumx0 += xv;
+                }
+                sum += dl0 * dot0 - ml0 * sumx0;
+
+                float dot1 = 0, sumx1 = 0;
+                for (int l = 0; l < 16; l++) {
+                    float xv = xp[yi + 16 + l];
+                    dot1 += (float)((q[l + 16] >> shift) & 3) * xv;
+                    sumx1 += xv;
+                }
+                sum += dl1 * dot1 - ml1 * sumx1;
+#endif
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+    return sum;
+}
+
 static float fused_dot_q4_k(const void* row, const float* x, int n) {
     const int nb = n / 256;
     const block_q4_K* blk = (const block_q4_K*)row;
@@ -1767,14 +1946,72 @@ static float fused_dot_q4_k(const void* row, const float* x, int n) {
         const float* xp = x + b * 256;
         int is = 0;
 
-        /* 4 groups of 64 elements */
+#if TQ_HAS_NEON
+        /* 4 groups of 64 elements, NEON-accelerated */
+        const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
         for (int j = 0; j < 256; j += 64) {
             const float d1 = d * sc[is + 0];
             const float m1 = dmin * mn[is + 0];
             const float d2 = d * sc[is + 1];
             const float m2 = dmin * mn[is + 1];
 
-            /* First 32 elements: low nibble */
+            /* Load 32 bytes = 32 pairs of nibbles covering 64 elements */
+            uint8x16_t qa = vld1q_u8(q);
+            uint8x16_t qb = vld1q_u8(q + 16);
+            /* Extract low nibbles (→ elements 0..31) and high nibbles (→ 32..63) */
+            uint8x16_t lo_a = vandq_u8(qa, mask_lo);
+            uint8x16_t lo_b = vandq_u8(qb, mask_lo);
+            uint8x16_t hi_a = vshrq_n_u8(qa, 4);
+            uint8x16_t hi_b = vshrq_n_u8(qb, 4);
+
+            /* Convert u8 nibbles [0..15] to float32 and dot with xp[...] */
+            float32x4_t vdot1 = vdupq_n_f32(0.0f);
+            float32x4_t vsum1 = vdupq_n_f32(0.0f);
+            float32x4_t vdot2 = vdupq_n_f32(0.0f);
+            float32x4_t vsum2 = vdupq_n_f32(0.0f);
+            /* Helper: process 16 elements of x[off:off+16] with nibble vector `nv` */
+            #define TQ_Q4K_ACC(nv, off, vdot, vsum)                                              \
+                do {                                                                             \
+                    uint16x8_t w16_l = vmovl_u8(vget_low_u8(nv));                                \
+                    uint16x8_t w16_h = vmovl_u8(vget_high_u8(nv));                               \
+                    float32x4_t wf0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16_l)));             \
+                    float32x4_t wf1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16_l)));            \
+                    float32x4_t wf2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16_h)));             \
+                    float32x4_t wf3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16_h)));            \
+                    float32x4_t x0 = vld1q_f32(xp + (off));                                      \
+                    float32x4_t x1 = vld1q_f32(xp + (off) + 4);                                  \
+                    float32x4_t x2 = vld1q_f32(xp + (off) + 8);                                  \
+                    float32x4_t x3 = vld1q_f32(xp + (off) + 12);                                 \
+                    (vdot) = vfmaq_f32((vdot), wf0, x0);                                         \
+                    (vdot) = vfmaq_f32((vdot), wf1, x1);                                         \
+                    (vdot) = vfmaq_f32((vdot), wf2, x2);                                         \
+                    (vdot) = vfmaq_f32((vdot), wf3, x3);                                         \
+                    (vsum) = vaddq_f32((vsum), vaddq_f32(vaddq_f32(x0, x1), vaddq_f32(x2, x3))); \
+                } while (0)
+            TQ_Q4K_ACC(lo_a, j +  0, vdot1, vsum1);
+            TQ_Q4K_ACC(lo_b, j + 16, vdot1, vsum1);
+            TQ_Q4K_ACC(hi_a, j + 32, vdot2, vsum2);
+            TQ_Q4K_ACC(hi_b, j + 48, vdot2, vsum2);
+            #undef TQ_Q4K_ACC
+
+            float dot1_s = vaddvq_f32(vdot1);
+            float sum1_s = vaddvq_f32(vsum1);
+            float dot2_s = vaddvq_f32(vdot2);
+            float sum2_s = vaddvq_f32(vsum2);
+            sum += d1 * dot1_s - m1 * sum1_s;
+            sum += d2 * dot2_s - m2 * sum2_s;
+
+            q += 32;
+            is += 2;
+        }
+#else
+        /* Scalar fallback (non-ARM) */
+        for (int j = 0; j < 256; j += 64) {
+            const float d1 = d * sc[is + 0];
+            const float m1 = dmin * mn[is + 0];
+            const float d2 = d * sc[is + 1];
+            const float m2 = dmin * mn[is + 1];
+
             float dot1 = 0.0f, sum_x1 = 0.0f;
             for (int l = 0; l < 32; l++) {
                 dot1  += (float)(q[l] & 0x0F) * xp[j + l];
@@ -1782,7 +2019,6 @@ static float fused_dot_q4_k(const void* row, const float* x, int n) {
             }
             sum += d1 * dot1 - m1 * sum_x1;
 
-            /* Next 32 elements: high nibble */
             float dot2 = 0.0f, sum_x2 = 0.0f;
             for (int l = 0; l < 32; l++) {
                 dot2  += (float)(q[l] >> 4) * xp[j + 32 + l];
@@ -1793,6 +2029,7 @@ static float fused_dot_q4_k(const void* row, const float* x, int n) {
             q += 32;
             is += 2;
         }
+#endif
     }
     return sum;
 }
@@ -2094,13 +2331,75 @@ typedef struct {
 
 void* q8_int_dot_worker(void* arg) {
     q8_int_task_t* t = (q8_int_task_t*)arg;
-    for (int d = t->start_row; d < t->end_row; d++) {
+    int d = t->start_row;
+    /* 2-row inner loop: pair rows share x_qs / x_ds. ILP hides weight load
+     * latency. Same trick as the q4k_int worker. */
+    for (; d + 1 < t->end_row; d += 2) {
+        const block_q8_0* wblk0 = (const block_q8_0*)((const uint8_t*)t->weight + (size_t)d * t->row_bytes);
+        const block_q8_0* wblk1 = (const block_q8_0*)((const uint8_t*)t->weight + (size_t)(d + 1) * t->row_bytes);
+        if (d + 2 < t->end_row) {
+            const uint8_t* next = (const uint8_t*)t->weight + (size_t)(d + 2) * t->row_bytes;
+            __builtin_prefetch(next +   0, 0, 0);
+            __builtin_prefetch(next +  64, 0, 0);
+            __builtin_prefetch(next + 128, 0, 0);
+            __builtin_prefetch(next + 192, 0, 0);
+        }
+        float row_sum0 = 0.0f, row_sum1 = 0.0f;
+        for (int b = 0; b < t->n_blocks; b++) {
+            const float wd0 = fp16_to_fp32(wblk0[b].d);
+            const float wd1 = fp16_to_fp32(wblk1[b].d);
+            const int8_t* wqs0 = wblk0[b].qs;
+            const int8_t* wqs1 = wblk1[b].qs;
+            const int8_t* xqs = t->x_qs + b * 32;
+            int8x16_t xq0 = vld1q_s8(xqs +  0);
+            int8x16_t xq1 = vld1q_s8(xqs + 16);
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t vd0 = vdupq_n_s32(0);
+            int32x4_t vd1 = vdupq_n_s32(0);
+            vd0 = vdotq_s32(vd0, vld1q_s8(wqs0 +  0), xq0);
+            vd0 = vdotq_s32(vd0, vld1q_s8(wqs0 + 16), xq1);
+            vd1 = vdotq_s32(vd1, vld1q_s8(wqs1 +  0), xq0);
+            vd1 = vdotq_s32(vd1, vld1q_s8(wqs1 + 16), xq1);
+            float xd = t->x_ds[b];
+            row_sum0 += wd0 * xd * (float)vaddvq_s32(vd0);
+            row_sum1 += wd1 * xd * (float)vaddvq_s32(vd1);
+#else
+            int32x4_t vd0a = vdupq_n_s32(0), vd0b = vdupq_n_s32(0);
+            int32x4_t vd1a = vdupq_n_s32(0), vd1b = vdupq_n_s32(0);
+            int8x16_t vw0a = vld1q_s8(wqs0);
+            int8x16_t vw0b = vld1q_s8(wqs0 + 16);
+            int8x16_t vw1a = vld1q_s8(wqs1);
+            int8x16_t vw1b = vld1q_s8(wqs1 + 16);
+            vd0a = vpadalq_s16(vd0a, vmull_s8(vget_low_s8(vw0a), vget_low_s8(xq0)));
+            vd0a = vpadalq_s16(vd0a, vmull_s8(vget_high_s8(vw0a), vget_high_s8(xq0)));
+            vd0b = vpadalq_s16(vd0b, vmull_s8(vget_low_s8(vw0b), vget_low_s8(xq1)));
+            vd0b = vpadalq_s16(vd0b, vmull_s8(vget_high_s8(vw0b), vget_high_s8(xq1)));
+            vd1a = vpadalq_s16(vd1a, vmull_s8(vget_low_s8(vw1a), vget_low_s8(xq0)));
+            vd1a = vpadalq_s16(vd1a, vmull_s8(vget_high_s8(vw1a), vget_high_s8(xq0)));
+            vd1b = vpadalq_s16(vd1b, vmull_s8(vget_low_s8(vw1b), vget_low_s8(xq1)));
+            vd1b = vpadalq_s16(vd1b, vmull_s8(vget_high_s8(vw1b), vget_high_s8(xq1)));
+            float xd = t->x_ds[b];
+            row_sum0 += wd0 * xd * (float)vaddvq_s32(vaddq_s32(vd0a, vd0b));
+            row_sum1 += wd1 * xd * (float)vaddvq_s32(vaddq_s32(vd1a, vd1b));
+#endif
+        }
+        t->out[d] = row_sum0;
+        t->out[d + 1] = row_sum1;
+    }
+    /* Tail: single row */
+    for (; d < t->end_row; d++) {
         const block_q8_0* wblk = (const block_q8_0*)((const uint8_t*)t->weight + (size_t)d * t->row_bytes);
         float row_sum = 0.0f;
         for (int b = 0; b < t->n_blocks; b++) {
             const float wd = fp16_to_fp32(wblk[b].d);
             const int8_t* wqs = wblk[b].qs;
             const int8_t* xqs = t->x_qs + b * 32;
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t vd = vdupq_n_s32(0);
+            vd = vdotq_s32(vd, vld1q_s8(wqs +  0), vld1q_s8(xqs +  0));
+            vd = vdotq_s32(vd, vld1q_s8(wqs + 16), vld1q_s8(xqs + 16));
+            row_sum += wd * t->x_ds[b] * (float)vaddvq_s32(vd);
+#else
             int32x4_t vd0 = vdupq_n_s32(0), vd1 = vdupq_n_s32(0);
             for (int j = 0; j < 32; j += 16) {
                 int8x16_t vw = vld1q_s8(wqs + j);
@@ -2109,12 +2408,438 @@ void* q8_int_dot_worker(void* arg) {
                 vd1 = vpadalq_s16(vd1, vmull_s8(vget_high_s8(vw), vget_high_s8(vx)));
             }
             row_sum += wd * t->x_ds[b] * (float)vaddvq_s32(vaddq_s32(vd0, vd1));
+#endif
+        }
+        t->out[d] = row_sum;
+    }
+    return NULL;
+}
+
+/* Q4_K int8 dot worker — same idea as q8_int but with on-the-fly nibble unpack.
+ * Pre-quantized x: int8 array (x_qs), per-32-element scales (x_ds), and
+ * pre-summed int sums per 32-element block (x_isums) so the dmin*mn correction
+ * doesn't recompute sum(x_int8) per output row. */
+typedef struct {
+    float* out; const void* weight; const int8_t* x_qs; const float* x_ds;
+    const int32_t* x_isums; size_t row_bytes; int nb_super; int start_row; int end_row;
+} q4k_int_task_t;
+
+/* Q5_K int8 dot worker — same pattern as Q4_K, plus 5th bit from qh.
+ * The qh array has 1 bit per element across 8 sub-blocks; bit position
+ * shifts by 2 per j-iteration (u1 = 1<<(2*iter), u2 = 2<<(2*iter)). */
+typedef q4k_int_task_t q5k_int_task_t;
+
+void* q5k_int_dot_worker(void* arg) {
+    q5k_int_task_t* t = (q5k_int_task_t*)arg;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    for (int d = t->start_row; d < t->end_row; d++) {
+        const block_q5_K* wblk = (const block_q5_K*)((const uint8_t*)t->weight + (size_t)d * t->row_bytes);
+        if (d + 1 < t->end_row) {
+            const uint8_t* next = (const uint8_t*)t->weight + (size_t)(d + 1) * t->row_bytes;
+            __builtin_prefetch(next +   0, 0, 0);
+            __builtin_prefetch(next +  64, 0, 0);
+            __builtin_prefetch(next + 128, 0, 0);
+            __builtin_prefetch(next + 192, 0, 0);
+        }
+        float row_sum = 0.0f;
+        for (int sb = 0; sb < t->nb_super; sb++) {
+            const block_q5_K* blk = wblk + sb;
+            const float dW    = fp16_to_fp32(blk->d);
+            const float dminW = fp16_to_fp32(blk->dmin);
+
+            uint8_t sc[8], mn[8];
+            sc[0] = blk->scales[0] & 63;
+            sc[1] = blk->scales[1] & 63;
+            sc[2] = blk->scales[2] & 63;
+            sc[3] = blk->scales[3] & 63;
+            mn[0] = blk->scales[4] & 63;
+            mn[1] = blk->scales[5] & 63;
+            mn[2] = blk->scales[6] & 63;
+            mn[3] = blk->scales[7] & 63;
+            sc[4] = (blk->scales[8]  & 0x0F) | ((blk->scales[0] >> 6) << 4);
+            sc[5] = (blk->scales[9]  & 0x0F) | ((blk->scales[1] >> 6) << 4);
+            sc[6] = (blk->scales[10] & 0x0F) | ((blk->scales[2] >> 6) << 4);
+            sc[7] = (blk->scales[11] & 0x0F) | ((blk->scales[3] >> 6) << 4);
+            mn[4] = (blk->scales[8]  >> 4) | ((blk->scales[4] >> 6) << 4);
+            mn[5] = (blk->scales[9]  >> 4) | ((blk->scales[5] >> 6) << 4);
+            mn[6] = (blk->scales[10] >> 4) | ((blk->scales[6] >> 6) << 4);
+            mn[7] = (blk->scales[11] >> 4) | ((blk->scales[7] >> 6) << 4);
+
+            const uint8_t* ql = blk->qs;   /* 128 bytes of low nibbles */
+            const uint8_t* qh = blk->qh;   /* 32 bytes of high bits */
+            int sub_base = sb * 8;
+            int is = 0;
+            uint8_t u1 = 1, u2 = 2;
+
+            for (int j = 0; j < 256; j += 64) {
+                int sub_idx_a = sub_base + is;
+                int sub_idx_b = sub_base + is + 1;
+
+                /* Low 4 bits of weights */
+                uint8x16_t qa = vld1q_u8(ql);
+                uint8x16_t qb = vld1q_u8(ql + 16);
+                uint8x16_t lo_a = vandq_u8(qa, mask_lo);
+                uint8x16_t lo_b = vandq_u8(qb, mask_lo);
+                uint8x16_t hi_a = vshrq_n_u8(qa, 4);
+                uint8x16_t hi_b = vshrq_n_u8(qb, 4);
+
+                /* 5th bit from qh: extract bit u1 (sub-block A) and u2 (B).
+                 * qh[0..15] covers elements 0..15, qh[16..31] covers 16..31.
+                 * For sub-block A (low nibbles), bit position = log2(u1).
+                 * Convert "bit set" → byte value 16 by shifting to bit 4. */
+                uint8x16_t qh_a = vld1q_u8(qh);
+                uint8x16_t qh_b = vld1q_u8(qh + 16);
+                uint8x16_t u1v = vdupq_n_u8(u1);
+                uint8x16_t u2v = vdupq_n_u8(u2);
+                /* Test bit, then convert to 0 or 16:
+                 *   masked_a = qh & u1  →  0 or u1 (in {1,4,16,64})
+                 *   want bit 4 set when u1 bit set → multiply masked_a by (16/u1)
+                 * For u1 in {1,4,16,64}: 16/u1 in {16,4,1,1/4}.
+                 * Easier: vceqq + select between 0 and 16. */
+                uint8x16_t bit_a_lo = vceqq_u8(vandq_u8(qh_a, u1v), u1v);  /* 0xFF or 0x00 */
+                uint8x16_t bit_a_hi = vceqq_u8(vandq_u8(qh_b, u1v), u1v);
+                uint8x16_t bit_b_lo = vceqq_u8(vandq_u8(qh_a, u2v), u2v);
+                uint8x16_t bit_b_hi = vceqq_u8(vandq_u8(qh_b, u2v), u2v);
+                uint8x16_t v16 = vdupq_n_u8(16);
+                /* And with 16 to get 0 or 16 */
+                lo_a = vorrq_u8(lo_a, vandq_u8(bit_a_lo, v16));
+                lo_b = vorrq_u8(lo_b, vandq_u8(bit_a_hi, v16));
+                hi_a = vorrq_u8(hi_a, vandq_u8(bit_b_lo, v16));
+                hi_b = vorrq_u8(hi_b, vandq_u8(bit_b_hi, v16));
+
+                int8x16_t wa_lo = vreinterpretq_s8_u8(lo_a);
+                int8x16_t wa_hi = vreinterpretq_s8_u8(lo_b);
+                int8x16_t wb_lo = vreinterpretq_s8_u8(hi_a);
+                int8x16_t wb_hi = vreinterpretq_s8_u8(hi_b);
+
+                const int8_t* xa = t->x_qs + (size_t)sub_idx_a * 32;
+                int8x16_t xa_lo = vld1q_s8(xa);
+                int8x16_t xa_hi = vld1q_s8(xa + 16);
+                const int8_t* xb = t->x_qs + (size_t)sub_idx_b * 32;
+                int8x16_t xb_lo = vld1q_s8(xb);
+                int8x16_t xb_hi = vld1q_s8(xb + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+                int32x4_t accA = vdotq_s32(vdupq_n_s32(0), wa_lo, xa_lo);
+                accA = vdotq_s32(accA, wa_hi, xa_hi);
+                int32_t isumA = vaddvq_s32(accA);
+                int32x4_t accB = vdotq_s32(vdupq_n_s32(0), wb_lo, xb_lo);
+                accB = vdotq_s32(accB, wb_hi, xb_hi);
+                int32_t isumB = vaddvq_s32(accB);
+#else
+                int32x4_t accA = vpadalq_s16(vdupq_n_s32(0),
+                                              vmull_s8(vget_low_s8(wa_lo), vget_low_s8(xa_lo)));
+                accA = vpadalq_s16(accA, vmull_s8(vget_high_s8(wa_lo), vget_high_s8(xa_lo)));
+                accA = vpadalq_s16(accA, vmull_s8(vget_low_s8(wa_hi), vget_low_s8(xa_hi)));
+                accA = vpadalq_s16(accA, vmull_s8(vget_high_s8(wa_hi), vget_high_s8(xa_hi)));
+                int32_t isumA = vaddvq_s32(accA);
+                int32x4_t accB = vpadalq_s16(vdupq_n_s32(0),
+                                              vmull_s8(vget_low_s8(wb_lo), vget_low_s8(xb_lo)));
+                accB = vpadalq_s16(accB, vmull_s8(vget_high_s8(wb_lo), vget_high_s8(xb_lo)));
+                accB = vpadalq_s16(accB, vmull_s8(vget_low_s8(wb_hi), vget_low_s8(xb_hi)));
+                accB = vpadalq_s16(accB, vmull_s8(vget_high_s8(wb_hi), vget_high_s8(xb_hi)));
+                int32_t isumB = vaddvq_s32(accB);
+#endif
+
+                float xdA = t->x_ds[sub_idx_a];
+                float xdB = t->x_ds[sub_idx_b];
+                int32_t xisA = t->x_isums[sub_idx_a];
+                int32_t xisB = t->x_isums[sub_idx_b];
+
+                row_sum += (dW * sc[is + 0] * xdA) * (float)isumA
+                         - (dminW * mn[is + 0] * xdA) * (float)xisA;
+                row_sum += (dW * sc[is + 1] * xdB) * (float)isumB
+                         - (dminW * mn[is + 1] * xdB) * (float)xisB;
+
+                ql += 32;
+                is += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+        t->out[d] = row_sum;
+    }
+    return NULL;
+}
+
+/* 2-row inner loop helper for q4k_int worker — processes 2 output rows
+ * in parallel for instruction-level parallelism. The two rows share the
+ * same x_qs / x_ds / x_isums (read-only activation), but have different
+ * weight rows. Parallelism hides load latency on the weight reads. */
+static inline void q4k_int_dot_two_rows(
+    const block_q4_K* blk0, const block_q4_K* blk1,
+    const int8_t* x_qs, const float* x_ds, const int32_t* x_isums,
+    int nb_super, float* out0, float* out1)
+{
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (int sb = 0; sb < nb_super; sb++) {
+        const block_q4_K* b0 = blk0 + sb;
+        const block_q4_K* b1 = blk1 + sb;
+        const float dW0    = fp16_to_fp32(b0->d);
+        const float dminW0 = fp16_to_fp32(b0->dmin);
+        const float dW1    = fp16_to_fp32(b1->d);
+        const float dminW1 = fp16_to_fp32(b1->dmin);
+
+        uint8_t sc0[8], mn0[8], sc1[8], mn1[8];
+        #define UNPACK(SC, MN, BLK)                                              \
+            do {                                                                  \
+                SC[0] = BLK->scales[0] & 63;                                      \
+                SC[1] = BLK->scales[1] & 63;                                      \
+                SC[2] = BLK->scales[2] & 63;                                      \
+                SC[3] = BLK->scales[3] & 63;                                      \
+                MN[0] = BLK->scales[4] & 63;                                      \
+                MN[1] = BLK->scales[5] & 63;                                      \
+                MN[2] = BLK->scales[6] & 63;                                      \
+                MN[3] = BLK->scales[7] & 63;                                      \
+                SC[4] = (BLK->scales[8]  & 0x0F) | ((BLK->scales[0] >> 6) << 4);  \
+                SC[5] = (BLK->scales[9]  & 0x0F) | ((BLK->scales[1] >> 6) << 4);  \
+                SC[6] = (BLK->scales[10] & 0x0F) | ((BLK->scales[2] >> 6) << 4);  \
+                SC[7] = (BLK->scales[11] & 0x0F) | ((BLK->scales[3] >> 6) << 4);  \
+                MN[4] = (BLK->scales[8]  >> 4) | ((BLK->scales[4] >> 6) << 4);    \
+                MN[5] = (BLK->scales[9]  >> 4) | ((BLK->scales[5] >> 6) << 4);    \
+                MN[6] = (BLK->scales[10] >> 4) | ((BLK->scales[6] >> 6) << 4);    \
+                MN[7] = (BLK->scales[11] >> 4) | ((BLK->scales[7] >> 6) << 4);    \
+            } while (0)
+        UNPACK(sc0, mn0, b0);
+        UNPACK(sc1, mn1, b1);
+        #undef UNPACK
+
+        const uint8_t* q0 = b0->qs;
+        const uint8_t* q1 = b1->qs;
+        int sub_base = sb * 8;
+        int is = 0;
+
+        for (int j = 0; j < 256; j += 64) {
+            int sub_idx_a = sub_base + is;
+            int sub_idx_b = sub_base + is + 1;
+
+            /* Load both rows' nibbles in parallel */
+            uint8x16_t qa0 = vld1q_u8(q0);
+            uint8x16_t qb0 = vld1q_u8(q0 + 16);
+            uint8x16_t qa1 = vld1q_u8(q1);
+            uint8x16_t qb1 = vld1q_u8(q1 + 16);
+            int8x16_t wa_lo0 = vreinterpretq_s8_u8(vandq_u8(qa0, mask_lo));
+            int8x16_t wa_hi0 = vreinterpretq_s8_u8(vandq_u8(qb0, mask_lo));
+            int8x16_t wb_lo0 = vreinterpretq_s8_u8(vshrq_n_u8(qa0, 4));
+            int8x16_t wb_hi0 = vreinterpretq_s8_u8(vshrq_n_u8(qb0, 4));
+            int8x16_t wa_lo1 = vreinterpretq_s8_u8(vandq_u8(qa1, mask_lo));
+            int8x16_t wa_hi1 = vreinterpretq_s8_u8(vandq_u8(qb1, mask_lo));
+            int8x16_t wb_lo1 = vreinterpretq_s8_u8(vshrq_n_u8(qa1, 4));
+            int8x16_t wb_hi1 = vreinterpretq_s8_u8(vshrq_n_u8(qb1, 4));
+
+            const int8_t* xa = x_qs + (size_t)sub_idx_a * 32;
+            int8x16_t xa_lo = vld1q_s8(xa);
+            int8x16_t xa_hi = vld1q_s8(xa + 16);
+            const int8_t* xb = x_qs + (size_t)sub_idx_b * 32;
+            int8x16_t xb_lo = vld1q_s8(xb);
+            int8x16_t xb_hi = vld1q_s8(xb + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+            int32x4_t accA0 = vdotq_s32(vdupq_n_s32(0), wa_lo0, xa_lo);
+            accA0 = vdotq_s32(accA0, wa_hi0, xa_hi);
+            int32x4_t accA1 = vdotq_s32(vdupq_n_s32(0), wa_lo1, xa_lo);
+            accA1 = vdotq_s32(accA1, wa_hi1, xa_hi);
+            int32x4_t accB0 = vdotq_s32(vdupq_n_s32(0), wb_lo0, xb_lo);
+            accB0 = vdotq_s32(accB0, wb_hi0, xb_hi);
+            int32x4_t accB1 = vdotq_s32(vdupq_n_s32(0), wb_lo1, xb_lo);
+            accB1 = vdotq_s32(accB1, wb_hi1, xb_hi);
+            int32_t isumA0 = vaddvq_s32(accA0);
+            int32_t isumA1 = vaddvq_s32(accA1);
+            int32_t isumB0 = vaddvq_s32(accB0);
+            int32_t isumB1 = vaddvq_s32(accB1);
+#else
+            /* Fallback: same as single-row but doubled; relies on compiler
+             * to find ILP. Already a win on M1 if vmull/vpadalq saturate. */
+            int32x4_t accA0 = vpadalq_s16(vdupq_n_s32(0), vmull_s8(vget_low_s8(wa_lo0), vget_low_s8(xa_lo)));
+            accA0 = vpadalq_s16(accA0, vmull_s8(vget_high_s8(wa_lo0), vget_high_s8(xa_lo)));
+            accA0 = vpadalq_s16(accA0, vmull_s8(vget_low_s8(wa_hi0),  vget_low_s8(xa_hi)));
+            accA0 = vpadalq_s16(accA0, vmull_s8(vget_high_s8(wa_hi0), vget_high_s8(xa_hi)));
+            int32x4_t accA1 = vpadalq_s16(vdupq_n_s32(0), vmull_s8(vget_low_s8(wa_lo1), vget_low_s8(xa_lo)));
+            accA1 = vpadalq_s16(accA1, vmull_s8(vget_high_s8(wa_lo1), vget_high_s8(xa_lo)));
+            accA1 = vpadalq_s16(accA1, vmull_s8(vget_low_s8(wa_hi1),  vget_low_s8(xa_hi)));
+            accA1 = vpadalq_s16(accA1, vmull_s8(vget_high_s8(wa_hi1), vget_high_s8(xa_hi)));
+            int32x4_t accB0 = vpadalq_s16(vdupq_n_s32(0), vmull_s8(vget_low_s8(wb_lo0), vget_low_s8(xb_lo)));
+            accB0 = vpadalq_s16(accB0, vmull_s8(vget_high_s8(wb_lo0), vget_high_s8(xb_lo)));
+            accB0 = vpadalq_s16(accB0, vmull_s8(vget_low_s8(wb_hi0),  vget_low_s8(xb_hi)));
+            accB0 = vpadalq_s16(accB0, vmull_s8(vget_high_s8(wb_hi0), vget_high_s8(xb_hi)));
+            int32x4_t accB1 = vpadalq_s16(vdupq_n_s32(0), vmull_s8(vget_low_s8(wb_lo1), vget_low_s8(xb_lo)));
+            accB1 = vpadalq_s16(accB1, vmull_s8(vget_high_s8(wb_lo1), vget_high_s8(xb_lo)));
+            accB1 = vpadalq_s16(accB1, vmull_s8(vget_low_s8(wb_hi1),  vget_low_s8(xb_hi)));
+            accB1 = vpadalq_s16(accB1, vmull_s8(vget_high_s8(wb_hi1), vget_high_s8(xb_hi)));
+            int32_t isumA0 = vaddvq_s32(accA0);
+            int32_t isumA1 = vaddvq_s32(accA1);
+            int32_t isumB0 = vaddvq_s32(accB0);
+            int32_t isumB1 = vaddvq_s32(accB1);
+#endif
+
+            float xdA = x_ds[sub_idx_a];
+            float xdB = x_ds[sub_idx_b];
+            int32_t xisA = x_isums[sub_idx_a];
+            int32_t xisB = x_isums[sub_idx_b];
+
+            sum0 += (dW0 * sc0[is + 0] * xdA) * (float)isumA0
+                  - (dminW0 * mn0[is + 0] * xdA) * (float)xisA;
+            sum0 += (dW0 * sc0[is + 1] * xdB) * (float)isumB0
+                  - (dminW0 * mn0[is + 1] * xdB) * (float)xisB;
+            sum1 += (dW1 * sc1[is + 0] * xdA) * (float)isumA1
+                  - (dminW1 * mn1[is + 0] * xdA) * (float)xisA;
+            sum1 += (dW1 * sc1[is + 1] * xdB) * (float)isumB1
+                  - (dminW1 * mn1[is + 1] * xdB) * (float)xisB;
+
+            q0 += 32;
+            q1 += 32;
+            is += 2;
+        }
+    }
+    *out0 = sum0;
+    *out1 = sum1;
+}
+
+void* q4k_int_dot_worker(void* arg) {
+    q4k_int_task_t* t = (q4k_int_task_t*)arg;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    int d = t->start_row;
+    /* 2-row inner loop while we have pairs */
+    for (; d + 1 < t->end_row; d += 2) {
+        const block_q4_K* wblk0 = (const block_q4_K*)((const uint8_t*)t->weight + (size_t)d * t->row_bytes);
+        const block_q4_K* wblk1 = (const block_q4_K*)((const uint8_t*)t->weight + (size_t)(d + 1) * t->row_bytes);
+        if (d + 2 < t->end_row) {
+            const uint8_t* next = (const uint8_t*)t->weight + (size_t)(d + 2) * t->row_bytes;
+            __builtin_prefetch(next +   0, 0, 0);
+            __builtin_prefetch(next +  64, 0, 0);
+            __builtin_prefetch(next + 128, 0, 0);
+            __builtin_prefetch(next + 192, 0, 0);
+        }
+        q4k_int_dot_two_rows(wblk0, wblk1, t->x_qs, t->x_ds, t->x_isums,
+                             t->nb_super, &t->out[d], &t->out[d + 1]);
+    }
+    /* Tail: single row */
+    for (; d < t->end_row; d++) {
+        const block_q4_K* wblk = (const block_q4_K*)((const uint8_t*)t->weight + (size_t)d * t->row_bytes);
+        float row_sum = 0.0f;
+        for (int sb = 0; sb < t->nb_super; sb++) {
+            const block_q4_K* blk = wblk + sb;
+            const float dW    = fp16_to_fp32(blk->d);
+            const float dminW = fp16_to_fp32(blk->dmin);
+
+            /* 6-bit packed sub-block scales (sc) and mins (mn).
+             * Layout matches fused_dot_q4_k. */
+            uint8_t sc[8], mn[8];
+            sc[0] = blk->scales[0] & 63;
+            sc[1] = blk->scales[1] & 63;
+            sc[2] = blk->scales[2] & 63;
+            sc[3] = blk->scales[3] & 63;
+            mn[0] = blk->scales[4] & 63;
+            mn[1] = blk->scales[5] & 63;
+            mn[2] = blk->scales[6] & 63;
+            mn[3] = blk->scales[7] & 63;
+            sc[4] = (blk->scales[8]  & 0x0F) | ((blk->scales[0] >> 6) << 4);
+            sc[5] = (blk->scales[9]  & 0x0F) | ((blk->scales[1] >> 6) << 4);
+            sc[6] = (blk->scales[10] & 0x0F) | ((blk->scales[2] >> 6) << 4);
+            sc[7] = (blk->scales[11] & 0x0F) | ((blk->scales[3] >> 6) << 4);
+            mn[4] = (blk->scales[8]  >> 4) | ((blk->scales[4] >> 6) << 4);
+            mn[5] = (blk->scales[9]  >> 4) | ((blk->scales[5] >> 6) << 4);
+            mn[6] = (blk->scales[10] >> 4) | ((blk->scales[6] >> 6) << 4);
+            mn[7] = (blk->scales[11] >> 4) | ((blk->scales[7] >> 6) << 4);
+
+            const uint8_t* q = blk->qs;
+            int sub_base = sb * 8;
+            int is = 0;
+
+            /* 4 j-iterations × 64 elements = 256-element super-block.
+             * Each iteration handles two 32-element sub-blocks (lo+hi nibbles). */
+            for (int j = 0; j < 256; j += 64) {
+                int sub_idx_a = sub_base + is;     /* offset j..j+31  */
+                int sub_idx_b = sub_base + is + 1; /* offset j+32..j+63 */
+
+                /* Load 32 bytes of packed nibbles */
+                uint8x16_t qa = vld1q_u8(q);
+                uint8x16_t qb = vld1q_u8(q + 16);
+                /* lo_a: weights j..j+15, lo_b: weights j+16..j+31 */
+                int8x16_t wa_lo = vreinterpretq_s8_u8(vandq_u8(qa, mask_lo));
+                int8x16_t wa_hi = vreinterpretq_s8_u8(vandq_u8(qb, mask_lo));
+                /* hi_a: weights j+32..j+47, hi_b: weights j+48..j+63 */
+                int8x16_t wb_lo = vreinterpretq_s8_u8(vshrq_n_u8(qa, 4));
+                int8x16_t wb_hi = vreinterpretq_s8_u8(vshrq_n_u8(qb, 4));
+
+                /* x for sub-block A: 32 int8 values starting at sub_idx_a*32 */
+                const int8_t* xa = t->x_qs + (size_t)sub_idx_a * 32;
+                int8x16_t xa_lo = vld1q_s8(xa);
+                int8x16_t xa_hi = vld1q_s8(xa + 16);
+                /* x for sub-block B */
+                const int8_t* xb = t->x_qs + (size_t)sub_idx_b * 32;
+                int8x16_t xb_lo = vld1q_s8(xb);
+                int8x16_t xb_hi = vld1q_s8(xb + 16);
+
+#ifdef __ARM_FEATURE_DOTPROD
+                /* ARMv8.2 dotprod: 16 int8 MACs per call. 2 calls = full sub-block. */
+                int32x4_t accA = vdotq_s32(vdupq_n_s32(0), wa_lo, xa_lo);
+                accA = vdotq_s32(accA, wa_hi, xa_hi);
+                int32_t isumA = vaddvq_s32(accA);
+                int32x4_t accB = vdotq_s32(vdupq_n_s32(0), wb_lo, xb_lo);
+                accB = vdotq_s32(accB, wb_hi, xb_hi);
+                int32_t isumB = vaddvq_s32(accB);
+#else
+                /* int8 dot for sub-block A: 4 widening multiplies, padalq accumulates */
+                int32x4_t accA = vpadalq_s16(vdupq_n_s32(0),
+                                              vmull_s8(vget_low_s8(wa_lo),  vget_low_s8(xa_lo)));
+                accA = vpadalq_s16(accA, vmull_s8(vget_high_s8(wa_lo), vget_high_s8(xa_lo)));
+                accA = vpadalq_s16(accA, vmull_s8(vget_low_s8(wa_hi),  vget_low_s8(xa_hi)));
+                accA = vpadalq_s16(accA, vmull_s8(vget_high_s8(wa_hi), vget_high_s8(xa_hi)));
+                int32_t isumA = vaddvq_s32(accA);
+
+                int32x4_t accB = vpadalq_s16(vdupq_n_s32(0),
+                                              vmull_s8(vget_low_s8(wb_lo),  vget_low_s8(xb_lo)));
+                accB = vpadalq_s16(accB, vmull_s8(vget_high_s8(wb_lo), vget_high_s8(xb_lo)));
+                accB = vpadalq_s16(accB, vmull_s8(vget_low_s8(wb_hi),  vget_low_s8(xb_hi)));
+                accB = vpadalq_s16(accB, vmull_s8(vget_high_s8(wb_hi), vget_high_s8(xb_hi)));
+                int32_t isumB = vaddvq_s32(accB);
+#endif
+
+                /* Combine: weight_i = q_i * (d*sc) - (dmin*mn)
+                 *   dot = sum(w_i * x_i)
+                 *       = (d*sc) * sum(q_i * x_int8_i) * x_d
+                 *         - (dmin*mn) * sum(x_int8_i) * x_d
+                 *   First term uses isum (just computed). Second term uses
+                 *   precomputed x_isums to avoid re-summing per row. */
+                float xdA = t->x_ds[sub_idx_a];
+                float xdB = t->x_ds[sub_idx_b];
+                int32_t xisA = t->x_isums[sub_idx_a];
+                int32_t xisB = t->x_isums[sub_idx_b];
+
+                row_sum += (dW * sc[is + 0] * xdA) * (float)isumA
+                         - (dminW * mn[is + 0] * xdA) * (float)xisA;
+                row_sum += (dW * sc[is + 1] * xdB) * (float)isumB
+                         - (dminW * mn[is + 1] * xdB) * (float)xisB;
+
+                q += 32;
+                is += 2;
+            }
         }
         t->out[d] = row_sum;
     }
     return NULL;
 }
 #endif
+
+/* Force-CPU variant: skips Metal dispatch entirely. Used for fused QKV
+ * matmuls (Phi-3) where the Metal buffer management has a bug with the
+ * large output dimension (out_dim = 3 * hidden_dim). The CPU NEON path
+ * handles it correctly. */
+void tq_matmul_gguf_cpu(float* out, const float* x,
+                         const void* weight, tq_ggml_dtype weight_type,
+                         int out_dim, int in_dim);
+
+/* Thread-local flag to force CPU path in tq_matmul_gguf. Set to 1
+ * before calling tq_matmul_gguf to skip Metal dispatch. Used for
+ * Phi-3 fused QKV/FFN matmuls where Metal has a buffer sizing bug
+ * with the unusually large output dimensions. */
+/* Global flag (NOT thread-local) — worker threads in the matmul thread pool
+ * must see the same value set by the main thread. Prior _Thread_local version
+ * silently allowed Metal dispatch from worker threads despite the main thread
+ * setting the flag to 1 (observed as Phi-3.5 Q4_K_M garbage output under Metal). */
+int tq_matmul_force_cpu = 0;
 
 void tq_matmul_gguf(float* out, const float* x,
                     const void* weight, tq_ggml_dtype weight_type,
@@ -2139,7 +2864,7 @@ void tq_matmul_gguf(float* out, const float* x,
                                         tq_ggml_dtype, int, int);
         extern int tq_metal_batch_active(void);
 
-        if (tq_metal_available()) {
+        if (!tq_matmul_force_cpu && tq_metal_available()) {
             /* In batch mode, always dispatch to GPU (overhead is amortized).
              * In immediate mode, only for types that have Metal pipelines
              * AND large matrices where GPU wins. */
@@ -2210,13 +2935,23 @@ void tq_matmul_gguf(float* out, const float* x,
     }
 #endif
 
-    /* ---- Q8_0×Q8 integer dot fast path — DISABLED (per-call overhead > benefit) ---- */
-#if 0 /* TQ_HAS_NEON */
-    if (weight_type == TQ_GGML_TYPE_Q8_0 && in_dim >= 32) {
-        /* Step 1: Quantize input x[in_dim] to Q8 blocks on stack */
-        int8_t  x_qs[4096];  /* max in_dim=4096 for attention */
-        float   x_ds[128];   /* max 128 blocks of 32 */
-        if (in_dim <= 4096) {
+    /* ---- Q8_0×Q8 integer dot fast path (auto-quantize activation) ----
+     * When g_preq_qs is not set (most callers), quantize the input
+     * activation inline and use the NEON int8×int8 path. Cost of
+     * one-time activation quantization is O(in_dim); matmul is
+     * O(in_dim * out_dim), so quantization overhead is negligible
+     * for typical out_dim >= 256.
+     *
+     * Previously disabled with false claim "per-call overhead > benefit"
+     * — actually this is 3-4x faster than float fused_dot for Q8_0. */
+#if TQ_HAS_NEON
+    if (weight_type == TQ_GGML_TYPE_Q8_0 && in_dim >= 32 && in_dim <= 16384) {
+        /* Step 1: Quantize input x[in_dim] to Q8 blocks on stack.
+         * Buffers sized for max FFN dim (Llama-70B uses 28672, but most
+         * models <= 16384). Stack usage: 16KB + 2KB = 18KB. */
+        int8_t  x_qs[16384];
+        float   x_ds[512];
+        if (in_dim <= 16384) {
             for (int b = 0; b < n_blocks; b++) {
                 const float* xp = x + b * 32;
                 /* Find absmax for this block */
@@ -2292,6 +3027,78 @@ void tq_matmul_gguf(float* out, const float* x,
             return;
         }
     }
+
+    /* ---- Q4_K × int8 dot fast path (auto-quantize activation) ----
+     * Same pattern as Q8_0: quantize x once to int8 (32-element blocks),
+     * precompute per-block int sums for the dmin*mn correction, then
+     * run vmull_s8 + vpadalq_s16 dots over 4-bit nibbles unpacked to int8.
+     * Replaces the float fused_dot_q4_k path on Phi-3.5/Llama Q4_K_M models. */
+    if ((weight_type == TQ_GGML_TYPE_Q4_K || weight_type == TQ_GGML_TYPE_Q5_K)
+        && in_dim >= 256 && in_dim <= 16384 && (in_dim % 256) == 0)
+    {
+        /* Stack buffers: x as int8 (16KB), per-block scales (512 floats =
+         * 2KB), per-block int sums (512 ints = 2KB). Total ~20KB. */
+        int8_t  x_qs[16384];
+        float   x_ds[512];
+        int32_t x_isums[512];
+
+        /* Step 1: Per-32-element-block quantization of x to int8. */
+        const int n_blocks_x = in_dim / 32;
+        for (int b = 0; b < n_blocks_x; b++) {
+            const float* xp = x + b * 32;
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                float a = xp[j] < 0 ? -xp[j] : xp[j];
+                if (a > amax) amax = a;
+            }
+            float d = amax / 127.0f;
+            x_ds[b] = d;
+            int32_t isum = 0;
+            if (d > 0.0f) {
+                float id = 1.0f / d;
+                for (int j = 0; j < 32; j++) {
+                    int v = (int)roundf(xp[j] * id);
+                    int8_t q = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+                    x_qs[b * 32 + j] = q;
+                    isum += q;
+                }
+            } else {
+                memset(x_qs + b * 32, 0, 32);
+            }
+            x_isums[b] = isum;
+        }
+
+        const int nb_super = in_dim / 256; /* number of 256-elem super-blocks */
+        int n_threads = tq_get_threads();
+        if (n_threads > TQ_TP_MAX) n_threads = TQ_TP_MAX;
+        if (n_threads > out_dim) n_threads = out_dim;
+        if (n_threads < 1) n_threads = 1;
+
+        q4k_int_task_t tasks[TQ_TP_MAX];
+        void* ptrs[TQ_TP_MAX];
+        int rows_per = out_dim / n_threads;
+        for (int t = 0; t < n_threads; t++) {
+            tasks[t].out       = out;
+            tasks[t].weight    = weight;
+            tasks[t].x_qs      = x_qs;
+            tasks[t].x_ds      = x_ds;
+            tasks[t].x_isums   = x_isums;
+            tasks[t].row_bytes = row_bytes;
+            tasks[t].nb_super  = nb_super;
+            tasks[t].start_row = t * rows_per;
+            tasks[t].end_row   = (t == n_threads - 1) ? out_dim : (t + 1) * rows_per;
+            ptrs[t] = &tasks[t];
+        }
+        void* (*worker)(void*) = (weight_type == TQ_GGML_TYPE_Q5_K)
+                                  ? q5k_int_dot_worker : q4k_int_dot_worker;
+        if (n_threads == 1) {
+            worker(ptrs[0]);
+        } else {
+            extern void tq_tp_run(void* (*fn)(void*), void** args, int n);
+            tq_tp_run(worker, ptrs, n_threads);
+        }
+        return;
+    }
 #endif
 
     /* ---- Fused fast paths: dequant + dot in one pass, no tmp buffer ---- */
@@ -2312,6 +3119,12 @@ void tq_matmul_gguf(float* out, const float* x,
             break;
         case TQ_GGML_TYPE_Q8_0:
             fused_dot = fused_dot_q8_0;
+            break;
+        case TQ_GGML_TYPE_Q2_K:
+            fused_dot = fused_dot_q2_k;
+            break;
+        case TQ_GGML_TYPE_Q8_1:
+            fused_dot = fused_dot_q8_1;
             break;
         case TQ_GGML_TYPE_Q3_K:
             fused_dot = fused_dot_q3_k;
@@ -2391,6 +3204,20 @@ void tq_matmul_gguf(float* out, const float* x,
     }
 
     tq_tp_run(gguf_matmul_worker, ptrs, n_threads);
+}
+
+void tq_matmul_gguf_cpu(float* out, const float* x,
+                         const void* weight, tq_ggml_dtype weight_type,
+                         int out_dim, int in_dim)
+{
+    /* Save-and-restore, not hard-reset. A caller (e.g., tq_forward for
+     * Phi-3) may have already set the flag to 1 as an invariant for the
+     * entire forward pass; hard-resetting to 0 here would let subsequent
+     * matmuls in the same forward dispatch to Metal and produce garbage. */
+    int prev = tq_matmul_force_cpu;
+    tq_matmul_force_cpu = 1;
+    tq_matmul_gguf(out, x, weight, weight_type, out_dim, in_dim);
+    tq_matmul_force_cpu = prev;
 }
 
 /* ============================================================

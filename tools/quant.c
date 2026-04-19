@@ -36,6 +36,10 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <unistd.h>  /* sysconf for default thread count */
+#if defined(__APPLE__)
+#include <sys/sysctl.h>  /* sysctlbyname for hw.perflevel0.physicalcpu */
+#endif
 
 /* MSVC: clock_gettime compatibility */
 #ifdef _WIN32
@@ -62,9 +66,27 @@ static int clock_gettime(int id, struct timespec* ts) {
 /* Forward-pass profiling flag (defined in tq_transformer.c) */
 extern int g_tq_profile_enabled;
 
-/* Streaming token callback */
+/* Streaming token callback — filters chat-template control tokens that
+ * would otherwise leak into CLI output when --chat is active. */
 static void print_token(const char* text, void* user_data) {
     (void)user_data;
+    if (!text || !text[0]) return;
+
+    /* Skip thinking / template tokens (same list as server). Gemma 4 raw
+     * output contains <|think|>, Qwen3 uses <think>/</think>, chat-templated
+     * models may emit <|end|>/<|im_end|>/<|eot_id|> etc. */
+    if (strstr(text, "<|think|>") || strstr(text, "<think>") ||
+        strstr(text, "</think>") || strstr(text, "<|channel>") ||
+        strstr(text, "<|turn>") || strstr(text, "<turn|>") ||
+        strstr(text, "<|end|>") || strstr(text, "<|assistant|>") ||
+        strstr(text, "<|user|>") || strstr(text, "<|system|>") ||
+        strstr(text, "<|im_end|>") || strstr(text, "<|im_start|>") ||
+        strstr(text, "<start_of_turn>") || strstr(text, "<end_of_turn>") ||
+        strstr(text, "<|begin_of_text|>") || strstr(text, "<|end_of_text|>") ||
+        strstr(text, "<|start_header_id|>") || strstr(text, "<|end_header_id|>") ||
+        strstr(text, "<|eot_id|>"))
+        return;
+
     fputs(text, stdout);
     fflush(stdout);
 }
@@ -176,7 +198,22 @@ int main(int argc, char** argv) {
     float temperature = 0.7f;
     float top_p = 0.9f;
     tq_type kv_type = TQ_TYPE_TURBO_KV_4B;
-    int n_threads = 4;
+    /* Default: P-core count on macOS, total core count elsewhere.
+     * On Apple Silicon, mixing P+E cores at the same priority makes
+     * the slow E threads become stragglers — total throughput drops.
+     * Tests on M1 Pro: 8P-only (8 threads) ≈ 8P+2E (10 threads). */
+    int n_threads;
+#if defined(__APPLE__)
+    {
+        size_t sz = sizeof(int);
+        if (sysctlbyname("hw.perflevel0.physicalcpu", &n_threads, &sz, NULL, 0) != 0)
+            n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    }
+#else
+    n_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (n_threads < 1) n_threads = 4;
+    if (n_threads > 16) n_threads = 16;  /* matches TQ_TP_MAX */
     int quant_mode = 0;   /* 0 = none (default), 2 = Q2, 4 = Q4, 8 = Q8 */
     int value_quant_bits = 0; /* 0 = FP16/FP32 (default), 4 = Q4, 2 = Q2 */
     int info_only = 0;
@@ -192,7 +229,7 @@ int main(int argc, char** argv) {
     int override_ctx = 0;  /* 0 = use model default (capped at 4096) */
     int delta_kv = 0;      /* 1 = delta KV compression (store key deltas) */
     int delta_iframe_int = 0; /* I-frame interval for delta KV (0 = auto = 64) */
-    int k_highres_window = 0; /* age-based: recent N keys at FP32, rest at 2-bit */
+    int k_highres_window = -1; /* -1=auto (128 when KV compressed), 0=off, N=explicit */
     int json_output = 0;     /* 1 = JSON output for --ppl */
     int chat_mode = 0;       /* 1 = auto-wrap prompt with chat template */
     const char* save_logits_file = NULL;
@@ -478,7 +515,14 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Delta KV compression: ENABLED (mixed-precision, I-frame=%d)\n", ifi);
         }
 
-        /* Set up K highres window (age-based progressive K compression) */
+        /* Progressive KV: auto-enable k128 when KV is compressed.
+         * Verified on 3 models: strictly better quality at 1.75 MB cost.
+         * User can override with --k-window 0 to disable. */
+        if (k_highres_window == -1 && state->kv_quant_type < TQ_TYPE_COUNT && state->quant_key_cache) {
+            k_highres_window = 128;
+        } else if (k_highres_window == -1) {
+            k_highres_window = 0;
+        }
         if (k_highres_window > 0 && state->kv_quant_type < TQ_TYPE_COUNT && state->quant_key_cache) {
             int kv_dim_e = model->config.n_kv_heads * model->config.head_dim;
             int cache_kv_dim_e = model->config.n_kv_heads * model->config.head_dim;
@@ -1237,21 +1281,50 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    /* Auto-wrap prompt with chat template when --chat is used */
+    /* Auto-wrap prompt with chat template when --chat is used.
+     * Template detection order:
+     *   1. Gemma 4 → <|turn>...<turn|> + thinking mode
+     *   2. Gemma 2/3 → <start_of_turn>...<end_of_turn>
+     *   3. Phi-3/Phi-4 (by filename) → <|user|>...<|end|>
+     *   4. Llama 3.x (by filename) → <|start_header_id|>...<|eot_id|>
+     *   5. Default → ChatML <|im_start|>...<|im_end|> (Qwen/Qwen3/Qwen3.5) */
     char chat_prompt[8192];
     if (chat_mode) {
         tq_model_config_t* mc = &model->config;
-        if (mc->model_type == 1) {
-            /* Gemma 3/4: <start_of_turn>user\n...\n<end_of_turn>\n<start_of_turn>model\n */
+        const char* mp = model_path ? model_path : "";
+        /* Basename for filename detection */
+        const char* bn = strrchr(mp, '/');
+        bn = bn ? bn + 1 : mp;
+
+        int is_phi = (strstr(bn, "phi-3") || strstr(bn, "phi3") ||
+                      strstr(bn, "Phi-3") || strstr(bn, "Phi3") ||
+                      strstr(bn, "phi-4") || strstr(bn, "phi4") ||
+                      strstr(bn, "Phi-4") || strstr(bn, "Phi4"));
+        int is_llama3 = (strstr(bn, "Llama-3") || strstr(bn, "llama-3") ||
+                         strstr(bn, "Llama3") || strstr(bn, "llama3") ||
+                         strstr(bn, "Meta-Llama-3"));
+
+        if (mc->model_type == 1 && mc->is_gemma4) {
+            /* Skip <|think|> in CLI — the server suppresses it via logit mask,
+             * but the CLI has no such suppression. Without it, the CLI uses
+             * plain Gemma 4 format without thinking mode. */
+            snprintf(chat_prompt, sizeof(chat_prompt),
+                "<|turn>user\n%s<turn|>\n<|turn>model\n", prompt);
+        } else if (mc->model_type == 1) {
             snprintf(chat_prompt, sizeof(chat_prompt),
                 "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", prompt);
-        } else if (strstr(prompt, "<|start_header_id|>") == NULL) {
-            /* Llama 3 / generic: wrap if not already wrapped */
+        } else if (is_phi) {
+            /* Phi-3/4: <|user|>...<|end|>\n<|assistant|>\n */
+            snprintf(chat_prompt, sizeof(chat_prompt),
+                "<|user|>\n%s<|end|>\n<|assistant|>\n", prompt);
+        } else if (is_llama3) {
             snprintf(chat_prompt, sizeof(chat_prompt),
                 "<|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
                 "<|start_header_id|>assistant<|end_header_id|>\n\n", prompt);
         } else {
-            snprintf(chat_prompt, sizeof(chat_prompt), "%s", prompt);
+            /* Default ChatML (Qwen/Qwen3/Qwen3.5) */
+            snprintf(chat_prompt, sizeof(chat_prompt),
+                "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt);
         }
         prompt = chat_prompt;
     }
@@ -1266,6 +1339,10 @@ int main(int argc, char** argv) {
     config.v_highres_window = v_highres_window;
     config.delta_kv = delta_kv;
     config.delta_iframe_interval = delta_iframe_int;
+    /* Auto progressive for generation path too */
+    if (k_highres_window == -1) {
+        k_highres_window = (kv_type < TQ_TYPE_COUNT) ? 128 : 0;
+    }
     config.k_highres_window = k_highres_window;
     config.save_kv_path = save_kv_file;
     config.load_kv_path = load_kv_file;

@@ -58,11 +58,22 @@ typedef struct {
     int full_head_dim;       /* head_dim for full attention layers (e.g., 512 vs sliding 256) */
     int full_n_heads;        /* n_heads for full layers (e.g., 8 vs sliding 16) */
     int full_n_kv_heads;     /* n_kv_heads for full layers (e.g., 2 vs sliding 8) */
+    int n_kv_shared_layers;  /* Gemma 4: last N layers reuse KV from earlier same-type layers */
     int rope_n_dims;         /* RoPE dimension count for sliding/SWA layers (0 = use head_dim) */
     int rope_n_dims_full;    /* RoPE dimension count for full/global layers (0 = use rope_n_dims) */
     float final_logit_softcap; /* logit soft-capping: logits = cap * tanh(logits/cap), 0=disabled */
     float attn_logit_softcap;  /* attention score soft-capping (Gemma): 0=disabled, typically 50.0 */
     int* per_layer_inter_dim;  /* [n_layers] per-layer intermediate_dim (NULL = use intermediate_dim) */
+
+    /* Phi-3 LongRoPE parameters */
+    int rope_orig_ctx_len;             /* original context length (e.g., 4096) */
+    float rope_attn_factor;            /* attention magnitude scaling */
+    const float* rope_factors_short;   /* [head_dim/2] for short context */
+    const float* rope_factors_long;    /* [head_dim/2] for long context */
+
+    /* Phi-3 fused-tensor flags — drive state buffer sizing */
+    int has_fused_qkv;                 /* any layer has gguf_w_qkv */
+    int has_fused_up_gate;             /* any layer has gguf_w_up_gate */
 } tq_model_config_t;
 
 /* ============================================================
@@ -166,6 +177,9 @@ typedef struct {
     const void* gguf_wq;  int gguf_wq_type;  /* Q proj (quantized, mmap'd) */
     const void* gguf_wk;  int gguf_wk_type;  /* K proj */
     const void* gguf_wv;  int gguf_wv_type;  /* V proj */
+    float* q_bias;         /* Q proj bias (Qwen2) — NULL if not present */
+    float* k_bias;         /* K proj bias */
+    float* v_bias;         /* V proj bias */
     const void* gguf_wo;  int gguf_wo_type;  /* O proj */
     /* GGUF on-the-fly for DeltaNet weights */
     const void* gguf_delta_qkv;  int gguf_delta_qkv_type;
@@ -173,6 +187,10 @@ typedef struct {
     const void* gguf_delta_a;    int gguf_delta_a_type;
     const void* gguf_delta_b;    int gguf_delta_b_type;
     const void* gguf_delta_out;  int gguf_delta_out_type;
+    /* Phi-3 fused projections — one matmul + memcpy split */
+    const void* gguf_w_qkv;     int gguf_w_qkv_type;     /* [hidden, q+k+v] fused QKV */
+    const void* gguf_w_up_gate; int gguf_w_up_gate_type;  /* [hidden, 2*inter] fused gate||up */
+
     /* GGUF FFN (dense layers in MoE models) */
     const void* gguf_w_gate; int gguf_w_gate_type;
     const void* gguf_w_up;   int gguf_w_up_type;
@@ -217,6 +235,10 @@ typedef struct {
 
     /* Gemma3 sliding window support */
     int* layer_is_sliding;    /* [n_layers] per-layer flag: 1=sliding, 0=global (NULL if not used) */
+    int* kv_source_layer;     /* [n_layers] KV-shared: maps each layer to its KV cache source layer.
+                               * For non-shared layers: kv_source_layer[l] = l (uses own cache).
+                               * For shared layers: kv_source_layer[l] = last non-shared same-type layer.
+                               * NULL if KV sharing is not used. */
 
     /* Learned RoPE frequencies (Gemma 4) — NULL if using computed frequencies */
     float* rope_freqs;        /* [rope_dim/2] learned inv_freq values (F32) */
@@ -234,8 +256,10 @@ typedef struct {
     float* output_scales;     /* [vocab_size * n_blocks] Q4 block scales */
 
     /* GGUF output weight — keep quantized for fused dot output projection */
-    const void* output_gguf;  /* mmap'd quantized weight, or NULL */
+    const void* output_gguf;  /* mmap'd quantized weight for lm_head, or NULL */
     int output_gguf_type;     /* tq_ggml_dtype */
+    const void* embed_gguf;   /* mmap'd quantized embedding for token lookup (may differ from output_gguf) */
+    int embed_gguf_type;      /* tq_ggml_dtype */
 
     /* Q8 weight quantization */
     int use_q8_weights;       /* 1 if layer weights are Q8-quantized */
@@ -504,6 +528,22 @@ void tq_free_state(tq_state_t* state);
 /* Inference — returns pointer to logits (owned by state) */
 float* tq_forward(tq_model_t* model, tq_state_t* state, int token, int pos);
 
+/* Batched prefill — process N consecutive tokens in one call, sharing
+ * weight reads across the batch via tq_batched_matmul_q4. Supports the
+ * standard Llama architecture (Q/K/V/O + gate/up/down, RoPE, RMSNorm).
+ * For unsupported architectures (Phi-3 fused QKV, Gemma 4 dual-FFN,
+ * DeltaNet hybrids, MoE) returns -1 and the caller should fall back to
+ * a per-token loop of tq_forward.
+ *
+ * On success returns pos_start + N (the next position to write).
+ * The KV cache is updated in place. Logits are NOT computed (prefill
+ * only needs them for the very last token, and the caller can still
+ * call tq_forward(token, pos_start+N-1) for that purpose if needed).
+ *
+ * Requires: model->use_q4_weights (load-time Q4 conversion). */
+int tq_forward_batch(tq_model_t* model, tq_state_t* state,
+                     const int* tokens, int N, int pos_start);
+
 /* Generation */
 int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
                 const char* prompt, tq_gen_config_t* config,
@@ -540,6 +580,13 @@ void tq_matmul_q4q2_preq(float* out,
                           int n, int d);
 void tq_matmul_q4_preq(float* out, const uint8_t* w_qs, const float* w_scales,
                         const int8_t* x_q8, const float* x_scales, int n, int d);
+/* Batched Q4 matmul for prefill (N >= 2). Out is row-major [N, n_rows].
+ * X is row-major [N, d] FP32. Internally dequants W to FP32 once into the
+ * provided scratch buffer (must be at least n_rows*d floats), then dispatches
+ * cblas_sgemm via Apple Accelerate / AMX. Falls back to N×tq_matmul_q4_preq
+ * on non-Apple platforms. Pass scratch=NULL to allocate internally. */
+void tq_batched_matmul_q4(float* out, const uint8_t* w_qs, const float* w_scales,
+                           const float* x, int n_rows, int d, int N, float* scratch);
 void tq_quantize_row_q4(const float* src, uint8_t* dst_qs, float* dst_scales, int n);
 void tq_dequantize_row_q4(const uint8_t* qs, const float* scales, float* dst, int n);
 void tq_quantize_weights_q4(tq_model_t* model);

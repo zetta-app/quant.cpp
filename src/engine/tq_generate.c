@@ -219,12 +219,32 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
 
     if (tokenizer && prompt) {
         /* BOS token handling:
-         * Gemma 3/4: BOS=2 (required)
-         * LLaMA 3: BOS=128000 (<|begin_of_text|>) — but tokenizer usually adds it
-         * Qwen3.5: no BOS needed */
+         * Gemma 3/4: model_type==1, BOS=2 (required)
+         * Phi-3 / LLaMA 2: vocab has <s> as BOS (required)
+         * LLaMA 3: BOS=128000 (<|begin_of_text|>) — tq_encode lookup chain handles it
+         * Qwen3.5 / GPT-2 BPE: no native BOS, skip */
         int add_bos = 0;
         if (model->config.model_type == 1) {
             add_bos = 1; /* Gemma: always prepend BOS=2 */
+        } else {
+            /* Auto-detect BOS: check if vocab contains <s> (LLaMA 2, Phi-3)
+             * or <|begin_of_text|> (LLaMA 3). Both require BOS prepending. */
+            for (int i = 0; i < tokenizer->vocab_size && i < 8; i++) {
+                if (tokenizer->vocab[i] && strcmp(tokenizer->vocab[i], "<s>") == 0) {
+                    add_bos = 1; break;
+                }
+            }
+            /* LLaMA 3: <|begin_of_text|> is at high token ID (128000+), not in first 8.
+             * Use direct lookup instead of scanning. */
+            if (!add_bos) {
+                int bos_id = -1;
+                for (int i = 128000; i < tokenizer->vocab_size && i < 128010; i++) {
+                    if (tokenizer->vocab[i] && strcmp(tokenizer->vocab[i], "<|begin_of_text|>") == 0) {
+                        bos_id = i; break;
+                    }
+                }
+                if (bos_id >= 0) add_bos = 1;
+            }
         }
         n_prompt = tq_encode(tokenizer, prompt, prompt_tokens, 4096, add_bos);
     } else {
@@ -284,8 +304,28 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     if (config->load_kv_path && pos_after_prefill > 0) {
         prefill_start = pos_after_prefill;
     }
-    for (int i = 0; i < n_prompt; i++) {
-        tq_forward(model, state, prompt_tokens[i], prefill_start + i);
+    /* Batched prefill: enabled by default for supported architectures.
+     * Populates both FP32 K cache and quant_key_cache (if active) so that
+     * the final tq_forward's attention sees baseline-equivalent history.
+     * Set TQ_NO_BATCH_PREFILL=1 to force per-token (for A/B testing). */
+    int batch_ok = 0;
+    int want_batched = (n_prompt >= 2) && !getenv("TQ_NO_BATCH_PREFILL");
+    if (want_batched) {
+        int rc = tq_forward_batch(model, state, prompt_tokens, n_prompt, prefill_start);
+        if (getenv("TQ_DEBUG_PREFILL"))
+            fprintf(stderr, "[batch_prefill] rc=%d expected=%d (N=%d)\n",
+                    rc, prefill_start + n_prompt, n_prompt);
+        if (rc == prefill_start + n_prompt) {
+            /* tq_forward_batch now produces logits for the last position
+             * itself (so we don't double-advance DeltaNet SSM state). No
+             * final tq_forward needed. */
+            batch_ok = 1;
+        }
+    }
+    if (!batch_ok) {
+        for (int i = 0; i < n_prompt; i++) {
+            tq_forward(model, state, prompt_tokens[i], prefill_start + i);
+        }
     }
     pos_after_prefill = prefill_start + n_prompt;
 
@@ -603,12 +643,17 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
 }
 
 /* ============================================================================
- * tq_generate_continue — chat-mode generation with KV cache reuse.
+ * tq_generate_continue — chat-mode generation with KV cache reuse (token LCP).
  *
  * Caller-managed state: state and cached_tokens persist across calls.
  * Each call computes the longest common prefix between cached_tokens and
  * the new prompt, prefills only the diverging suffix, and updates the
  * cache record. Turns chat from O(history^2) into O(new_tokens_per_turn).
+ *
+ * NOTE: This is a lower-level API. It does NOT track cached_text. If a
+ * sliding window triggers (n_cached_io is reset to 0), any out-of-band
+ * cached_text the caller maintains becomes stale. Higher-level callers
+ * should use tq_generate_chat_text instead, which handles this safely.
  * ============================================================================ */
 static int tq_lcp_int(const int* a, int na, const int* b, int nb) {
     int lim = na < nb ? na : nb;
@@ -640,7 +685,23 @@ int tq_generate_continue(tq_model_t* model,
     if (!new_tokens) return -1;
     int n_new = 0;
     if (tokenizer && prompt) {
-        int add_bos = (model->config.model_type == 1) ? 1 : 0;
+        int add_bos = 0;
+        if (model->config.model_type == 1) {
+            add_bos = 1;
+        } else {
+            for (int i = 0; i < tokenizer->vocab_size && i < 8; i++) {
+                if (tokenizer->vocab[i] && strcmp(tokenizer->vocab[i], "<s>") == 0) {
+                    add_bos = 1; break;
+                }
+            }
+            if (!add_bos) {
+                for (int i = 128000; i < tokenizer->vocab_size && i < 128010; i++) {
+                    if (tokenizer->vocab[i] && strcmp(tokenizer->vocab[i], "<|begin_of_text|>") == 0) {
+                        add_bos = 1; break;
+                    }
+                }
+            }
+        }
         n_new = tq_encode(tokenizer, prompt, new_tokens, max_prompt, add_bos);
     }
     if (n_new <= 0) {
@@ -648,20 +709,23 @@ int tq_generate_continue(tq_model_t* model,
         n_new = 1;
     }
 
-    /* Sliding window: if the new prompt + reserved generation room would
-     * exceed max_seq_len, drop the oldest tokens from the front of the
-     * prompt. We keep the most recent (max_seq_len - max_tokens - 32) tokens.
-     * Note: this discards conversation history; ideally callers send
-     * pre-trimmed prompts, but this prevents catastrophic failure. */
+    /* Overflow check: reject prompts that won't fit. The previous
+     * behavior was to silently drop oldest tokens via a sliding window,
+     * but that desynced any cached_text the higher-level wrapper held
+     * (cached_text claimed the full prompt, while cached_tokens only
+     * had the truncated tail — next turn's text-prefix match would
+     * map text bytes to the wrong KV positions). Returning -2 lets the
+     * caller decide (reset chat, show error). */
     int reserve = config->max_tokens > 0 ? config->max_tokens : 256;
     int budget  = max_prompt - reserve - 32;
     if (budget < 64) budget = 64;
     if (n_new > budget) {
-        int drop = n_new - budget;
-        memmove(new_tokens, new_tokens + drop, (size_t)budget * sizeof(int));
-        n_new = budget;
-        /* Force full reprefill since the prefix shifted */
-        *n_cached_io = 0;
+        free(new_tokens);
+        if (getenv("TQ_CHAT_DEBUG")) {
+            fprintf(stderr, "[chat] OVERFLOW n_new=%d budget=%d max=%d\n",
+                    n_new, budget, max_prompt);
+        }
+        return -2;
     }
 
     int n_cached = *n_cached_io;
@@ -800,5 +864,458 @@ int tq_generate_continue(tq_model_t* model,
     }
 
     free(new_tokens);
+    return generated;
+}
+
+/* ============================================================================
+ * tq_generate_chat_text — text-prefix matching for chat reuse
+ *
+ * Solves the BPE re-tokenization issue: when the model generates response
+ * tokens via sample_topp, those token IDs may not match what tq_encode()
+ * produces from the same response text in the next turn's prompt. The
+ * token-level LCP in tq_generate_continue truncates at that boundary.
+ *
+ * This function tracks the *text* of the last prompt (which includes the
+ * model's response from previous turns, accumulated by the caller). On the
+ * next call, if the new prompt starts with cached_text byte-for-byte, the
+ * entire cached state is valid — we tokenize only the new SUFFIX text and
+ * prefill those tokens at positions [n_cached..]. No LCP, no truncation.
+ *
+ * After generation, *cached_text_io is updated to:
+ *   prompt + (generated tokens decoded back to text)
+ * so the next call can fast-path again.
+ *
+ * Caller owns *cached_text_io (must free with free()).
+ * Pass cached_text_io == NULL to disable text-prefix tracking and behave
+ * exactly like tq_generate_continue.
+ * ============================================================================ */
+
+/* ChatML / template-marker filter ----------------------------------------
+ *
+ * The model can generate template tokens like `<|im_start|>`, `<|im_end|>`,
+ * `<end_of_turn>`, etc. as REGULAR text bytes (not special tokens). When
+ * that happens the BPE tokenizer fragments them across multiple tokens,
+ * and a per-token strstr check (like the existing `should_stop` logic)
+ * never matches. The user sees the marker leak into their stream.
+ *
+ * This filter holds the most recent CHAT_LOOKAHEAD bytes of generated
+ * text in `pending` and only flushes bytes that are guaranteed to NOT
+ * be the start of a marker. When a full marker is matched:
+ *   - `<|im_start|>` at the very beginning of the response → header
+ *     skip mode (drop until next '\n').
+ *   - any END marker → emit prefix, drop the rest, set stop_requested.
+ *
+ * Mirrored byte-for-byte with the version in quant.h. ---------------------- */
+#define CHAT_PENDING_CAP 128
+#define CHAT_LOOKAHEAD   32
+
+typedef struct {
+    char*  buf;
+    size_t len;
+    size_t cap;
+    int    tainted;
+    char   pending[CHAT_PENDING_CAP];
+    int    pending_len;
+    int    in_header;
+    int    stop_requested;
+    void (*user_cb)(const char*, void*);
+    void*  user_data;
+} chat_accum_t;
+
+static void chat_accum_emit(chat_accum_t* ctx, const char* p, int n) {
+    if (n <= 0) return;
+    char tmp[CHAT_PENDING_CAP + 1];
+    if (n > CHAT_PENDING_CAP) n = CHAT_PENDING_CAP;
+    memcpy(tmp, p, (size_t)n);
+    tmp[n] = '\0';
+    if (ctx->user_cb) ctx->user_cb(tmp, ctx->user_data);
+    if (ctx->tainted) return;
+    if (ctx->len + (size_t)n + 1 > ctx->cap) {
+        size_t new_cap = (ctx->cap + (size_t)n + 64) * 2;
+        char* nb = (char*)realloc(ctx->buf, new_cap);
+        if (!nb) { ctx->tainted = 1; return; }
+        ctx->buf = nb; ctx->cap = new_cap;
+    }
+    memcpy(ctx->buf + ctx->len, tmp, (size_t)n);
+    ctx->len += (size_t)n;
+    ctx->buf[ctx->len] = '\0';
+}
+
+static void chat_accum_drop(chat_accum_t* ctx, int n) {
+    if (n <= 0) return;
+    if (n > ctx->pending_len) n = ctx->pending_len;
+    memmove(ctx->pending, ctx->pending + n,
+            (size_t)(ctx->pending_len - n));
+    ctx->pending_len -= n;
+}
+
+static int chat_find_marker(const char* h, int hlen, const char* m) {
+    int mlen = (int)strlen(m);
+    if (hlen < mlen) return -1;
+    for (int p = 0; p + mlen <= hlen; p++) {
+        if (h[p] == m[0] && memcmp(h + p, m, (size_t)mlen) == 0) return p;
+    }
+    return -1;
+}
+
+static const char* const CHAT_END_MARKERS[] = {
+    "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|endoftext|>",
+    "<|im_start|>", "<|start_header_id|>", "<|eom_id|>",
+    "</s>", "<|end|>",
+    NULL,
+};
+
+static void chat_accum_callback(const char* tok, void* u) {
+    chat_accum_t* ctx = (chat_accum_t*)u;
+    if (!tok || ctx->stop_requested) return;
+    int tlen = (int)strlen(tok);
+    if (tlen == 0) return;
+
+    if (ctx->pending_len + tlen > CHAT_PENDING_CAP) {
+        int emit = ctx->pending_len - CHAT_LOOKAHEAD;
+        if (emit > 0) {
+            if (!ctx->in_header) chat_accum_emit(ctx, ctx->pending, emit);
+            chat_accum_drop(ctx, emit);
+        }
+    }
+    if (tlen > CHAT_PENDING_CAP) {
+        if (!ctx->in_header) {
+            chat_accum_emit(ctx, ctx->pending, ctx->pending_len);
+            chat_accum_emit(ctx, tok, tlen);
+        }
+        ctx->pending_len = 0;
+        return;
+    }
+    memcpy(ctx->pending + ctx->pending_len, tok, (size_t)tlen);
+    ctx->pending_len += tlen;
+
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        if (ctx->in_header) {
+            int nl = -1;
+            for (int i = 0; i < ctx->pending_len; i++) {
+                if (ctx->pending[i] == '\n') { nl = i; break; }
+            }
+            if (nl >= 0) {
+                chat_accum_drop(ctx, nl + 1);
+                ctx->in_header = 0;
+                progress = 1;
+            } else {
+                ctx->pending_len = 0;
+                return;
+            }
+        }
+        int em_pos = -1;
+        const char* em_str = NULL;
+        for (int i = 0; CHAT_END_MARKERS[i]; i++) {
+            int p = chat_find_marker(ctx->pending, ctx->pending_len,
+                                       CHAT_END_MARKERS[i]);
+            if (p >= 0 && (em_pos < 0 || p < em_pos)) {
+                em_pos = p; em_str = CHAT_END_MARKERS[i];
+            }
+        }
+        if (em_pos >= 0) {
+            if (em_pos == 0 && ctx->len == 0 && em_str &&
+                strcmp(em_str, "<|im_start|>") == 0) {
+                chat_accum_drop(ctx, 12);
+                ctx->in_header = 1;
+                progress = 1;
+                continue;
+            }
+            if (em_pos > 0) {
+                chat_accum_emit(ctx, ctx->pending, em_pos);
+            }
+            ctx->pending_len = 0;
+            ctx->stop_requested = 1;
+            return;
+        }
+    }
+
+    if (!ctx->in_header && ctx->pending_len > CHAT_LOOKAHEAD) {
+        int emit = ctx->pending_len - CHAT_LOOKAHEAD;
+        chat_accum_emit(ctx, ctx->pending, emit);
+        chat_accum_drop(ctx, emit);
+    }
+}
+
+static void chat_accum_finish(chat_accum_t* ctx) {
+    if (ctx->in_header) {
+        ctx->pending_len = 0;
+        return;
+    }
+    if (ctx->pending_len > 0) {
+        chat_accum_emit(ctx, ctx->pending, ctx->pending_len);
+        ctx->pending_len = 0;
+    }
+}
+
+int tq_generate_chat_text(tq_model_t* model,
+                           tq_tokenizer_t* tokenizer,
+                           tq_state_t* state,
+                           const char* prompt,
+                           tq_gen_config_t* config,
+                           char** cached_text_io,
+                           int** cached_tokens_io,
+                           int*  n_cached_io,
+                           int*  cached_capacity_io,
+                           char* output, int output_size) {
+    if (!model || !state || !config || !cached_tokens_io || !n_cached_io || !cached_capacity_io || !prompt) {
+        return -1;
+    }
+
+    /* --- 1. Check for text-level prefix match --- */
+    int matched_text_len = 0;
+    int prefix_pos = 0;  /* tokens already in KV cache that we trust */
+
+    if (cached_text_io && *cached_text_io && *n_cached_io > 0) {
+        size_t cached_len = strlen(*cached_text_io);
+        if (cached_len > 0 && strncmp(*cached_text_io, prompt, cached_len) == 0) {
+            matched_text_len = (int)cached_len;
+            prefix_pos = *n_cached_io;
+        } else if (getenv("TQ_CHAT_DEBUG")) {
+            /* Find where they diverge to help diagnose */
+            size_t diverge = 0;
+            size_t plen = strlen(prompt);
+            size_t lim = cached_len < plen ? cached_len : plen;
+            while (diverge < lim && (*cached_text_io)[diverge] == prompt[diverge]) diverge++;
+            fprintf(stderr,
+                "[chat-text] no match: cached_len=%zu prompt_len=%zu diverge_at=%zu\n"
+                "  cached[%zu..]: %.40s\n"
+                "  prompt[%zu..]: %.40s\n",
+                cached_len, plen, diverge,
+                diverge, *cached_text_io + diverge,
+                diverge, prompt + diverge);
+        }
+    }
+
+    /* Wrap user callback to capture generated text into a buffer for the
+     * next call's cached_text update. */
+    chat_accum_t accum;
+    memset(&accum, 0, sizeof(accum));
+    accum.user_cb = config->on_token;
+    accum.user_data = config->user_data;
+    void (*orig_cb)(const char*, void*) = config->on_token;
+    void*  orig_ud = config->user_data;
+    config->on_token = chat_accum_callback;
+    config->user_data = &accum;
+
+    int generated = 0;
+
+    if (matched_text_len > 0) {
+        /* --- Fast path: text prefix matches --- */
+        const char* suffix = prompt + matched_text_len;
+        int max_prompt = model->config.max_seq_len > 0
+                           ? model->config.max_seq_len : 4096;
+        int* suffix_toks = (int*)malloc((size_t)max_prompt * sizeof(int));
+        if (!suffix_toks) {
+            config->on_token = orig_cb; config->user_data = orig_ud;
+            return -1;
+        }
+        int n_suffix = 0;
+        if (*suffix != '\0') {
+            n_suffix = tq_encode(tokenizer, suffix, suffix_toks, max_prompt, 0);
+            if (n_suffix < 0) n_suffix = 0;
+        }
+
+        /* Context overflow check.
+         * The previous "fall back to tq_generate_continue with full
+         * reprefill" approach was UNSAFE: state already had the previous
+         * KV at positions [0..prefix_pos), and tq_generate_continue would
+         * write new positions [0..n_new), leaving stale KV at positions
+         * [n_new..prefix_pos) that subsequent generation might read.
+         *
+         * Correct behavior: return -2 (overflow) and let the caller
+         * decide — most callers should reset the chat and retry with a
+         * shorter prompt. Server can return HTTP 413, Python can raise
+         * an exception, WASM can show an error to the user. */
+        int reserve = config->max_tokens > 0 ? config->max_tokens : 256;
+        if (prefix_pos + n_suffix + reserve + 32 > max_prompt) {
+            free(suffix_toks);
+            config->on_token = orig_cb; config->user_data = orig_ud;
+            if (accum.buf) free(accum.buf);
+            if (getenv("TQ_CHAT_DEBUG")) {
+                fprintf(stderr,
+                    "[chat-text] OVERFLOW prefix_pos=%d n_suffix=%d reserve=%d max=%d\n",
+                    prefix_pos, n_suffix, reserve, max_prompt);
+            }
+            return -2;
+        }
+
+        /* Grow cache buffer */
+        int needed = prefix_pos + n_suffix + reserve + 16;
+        if (*cached_capacity_io < needed) {
+            int new_cap = needed < 4096 ? 4096 : needed;
+            int* nb = (int*)realloc(*cached_tokens_io, (size_t)new_cap * sizeof(int));
+            if (!nb) { free(suffix_toks); config->on_token = orig_cb; config->user_data = orig_ud; return -1; }
+            *cached_tokens_io = nb;
+            *cached_capacity_io = new_cap;
+        }
+
+        /* Append suffix tokens to cache + prefill at correct positions */
+        int* cached = *cached_tokens_io;
+        for (int i = 0; i < n_suffix; i++) {
+            cached[prefix_pos + i] = suffix_toks[i];
+            tq_forward(model, state, suffix_toks[i], prefix_pos + i);
+        }
+        *n_cached_io = prefix_pos + n_suffix;
+        free(suffix_toks);
+
+        if (getenv("TQ_CHAT_DEBUG")) {
+            fprintf(stderr, "[chat-text] FAST text_match=%d new_suffix_tokens=%d\n",
+                    matched_text_len, n_suffix);
+        }
+
+        /* --- Run generation loop directly. Mirrors tq_generate_continue
+         *     including rep_penalty (the fast path was silently dropping
+         *     it before, leaving rep_penalty inconsistent across turns). */
+        int vocab_size = model->config.vocab_size;
+        int n_cached = *n_cached_io;
+        int pos = n_cached;
+        int prev_token = n_cached > 0 ? cached[n_cached - 1] : 1;
+
+        float rep_penalty = config->rep_penalty;
+        int rep_window = config->rep_window;
+        if (rep_window > 64) rep_window = 64;
+        int recent_tokens[64];
+        int recent_count = 0;
+        for (int i = (n_cached > rep_window ? n_cached - rep_window : 0); i < n_cached; i++) {
+            recent_tokens[recent_count % 64] = cached[i];
+            recent_count++;
+        }
+        if (rep_penalty > 1.0f) {
+            int window = recent_count < rep_window ? recent_count : rep_window;
+            for (int r = 0; r < window; r++) {
+                int idx = (recent_count - 1 - r) % 64;
+                if (idx < 0) idx += 64;
+                int tok = recent_tokens[idx];
+                if (tok >= 0 && tok < vocab_size && state->logits) {
+                    if (state->logits[tok] > 0) state->logits[tok] /= rep_penalty;
+                    else                         state->logits[tok] *= rep_penalty;
+                }
+            }
+        }
+
+        unsigned long long rng_state = config->rng_seed
+            ? (unsigned long long)config->rng_seed : (unsigned long long)time(NULL);
+        int next_token = tq_sample_topp(state->logits, vocab_size,
+                                         config->temperature, config->top_p,
+                                         &rng_state);
+
+        int output_pos = 0;
+        int eos_tokens[] = { 1, 2, 106, 128001, 128006, 128007, 128008, 128009, 248044, 248046 };
+        int n_eos = sizeof(eos_tokens) / sizeof(eos_tokens[0]);
+
+        while (generated < config->max_tokens) {
+            int is_eos = 0;
+            for (int e = 0; e < n_eos; e++) {
+                if (next_token == eos_tokens[e]) { is_eos = 1; break; }
+            }
+            if (is_eos) break;
+            if (pos >= model->config.max_seq_len) break;
+
+            const char* piece = tokenizer ? tq_decode(tokenizer, prev_token, next_token) : "";
+            int should_stop = 0;
+            if (piece) {
+                if (strstr(piece, "<|im_end|>") || strstr(piece, "<|eot_id|>") ||
+                    strstr(piece, "<|start_header_id|>")) {
+                    should_stop = 1; piece = "";
+                }
+            }
+            if (should_stop) break;
+
+            int piece_len = (int)strlen(piece ? piece : "");
+            if (config->on_token && piece) config->on_token(piece, config->user_data);
+            /* The chat_accum filter may have detected an end marker
+             * spanning multiple tokens — break before forwarding more. */
+            if (accum.stop_requested) break;
+            if (output && piece && output_pos + piece_len < output_size - 1) {
+                memcpy(output + output_pos, piece, piece_len);
+                output_pos += piece_len;
+            }
+
+            if (n_cached < *cached_capacity_io) {
+                cached[n_cached++] = next_token;
+                *n_cached_io = n_cached;
+            }
+
+            prev_token = next_token;
+            tq_forward(model, state, next_token, pos);
+            pos++;
+            generated++;
+
+            if (rep_penalty > 1.0f) {
+                int window = recent_count < rep_window ? recent_count : rep_window;
+                for (int r = 0; r < window; r++) {
+                    int idx = (recent_count - 1 - r) % 64;
+                    if (idx < 0) idx += 64;
+                    int tok = recent_tokens[idx];
+                    if (tok >= 0 && tok < vocab_size) {
+                        if (state->logits[tok] > 0) state->logits[tok] /= rep_penalty;
+                        else                         state->logits[tok] *= rep_penalty;
+                    }
+                }
+            }
+
+            next_token = tq_sample_topp(state->logits, vocab_size,
+                                         config->temperature, config->top_p,
+                                         &rng_state);
+            recent_tokens[recent_count % 64] = next_token;
+            recent_count++;
+        }
+
+        if (output && output_size > 0) {
+            output[output_pos < output_size ? output_pos : output_size - 1] = '\0';
+        }
+    } else {
+        /* --- Slow path: no text-prefix match, use token LCP fallback --- */
+        if (getenv("TQ_CHAT_DEBUG")) {
+            fprintf(stderr, "[chat-text] SLOW no text-prefix match, full tokenize\n");
+        }
+        generated = tq_generate_continue(
+            model, tokenizer, state, prompt, config,
+            cached_tokens_io, n_cached_io, cached_capacity_io,
+            output, output_size);
+    }
+
+    /* Drain the marker filter's lookahead buffer before reading
+     * accum.buf for the cached_text update. Without this, the last
+     * ~32 bytes of clean output would be silently lost. */
+    chat_accum_finish(&accum);
+
+    /* Restore the original callback before returning to caller */
+    config->on_token = orig_cb;
+    config->user_data = orig_ud;
+
+    /* Update cached_text only if we know the KV state corresponds
+     * EXACTLY to (prompt + accum.buf):
+     *   - generated >= 0: generation didn't error out
+     *   - !accum.tainted: every generated token was captured
+     * On any failure, clear cached_text so the next call falls through
+     * to the slow path with a clean slate instead of trusting bytes
+     * that don't match the KV cache. */
+    if (cached_text_io) {
+        if (generated < 0 || accum.tainted) {
+            if (*cached_text_io) { free(*cached_text_io); *cached_text_io = NULL; }
+        } else {
+            size_t plen = strlen(prompt);
+            size_t glen = accum.len;
+            size_t new_len = plen + glen;
+            char* nt = (char*)malloc(new_len + 1);
+            if (nt) {
+                memcpy(nt, prompt, plen);
+                if (glen > 0 && accum.buf) memcpy(nt + plen, accum.buf, glen);
+                nt[new_len] = '\0';
+                if (*cached_text_io) free(*cached_text_io);
+                *cached_text_io = nt;
+            } else {
+                /* malloc failed → can't refresh cached_text. Clearing it
+                 * is safer than leaving the previous (now stale) value. */
+                if (*cached_text_io) { free(*cached_text_io); *cached_text_io = NULL; }
+            }
+        }
+    }
+    if (accum.buf) free(accum.buf);
+
     return generated;
 }

@@ -11,9 +11,11 @@ question (server, model loaded once).
 Enforces the cliff invariant: every prompt must be smaller than the
 model's effective working memory (see docs/phase3_rlv_challenge.md §3.2).
 """
+import atexit
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -23,15 +25,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent.parent
-DEFAULT_MODEL = REPO / "models" / "Llama-3.2-3B-Instruct-Q8_0.gguf"
-DEFAULT_SERVER_BINARY = REPO / "build_metal" / "quant-server"
+# Day 4: Phi-3.5-mini via quant-server-unified (built on quant.h directly).
+# The old libturboquant-based server had a forward-pass sync divergence
+# that produced garbage for Phi-3.5/SmolLM2. The unified server compiles
+# quant.h as a single translation unit — no sync issues.
+# Phi-3.5: ~1.15 tok/s (CPU NEON), ~6.5 tok/s reported in PR #79.
+# Q8_0 is 2x faster than Q4_K_M on NEON (simpler dequant, 3.0 vs 1.5 tok/s).
+DEFAULT_MODEL = REPO / "models" / "Phi-3.5-mini-instruct-Q8_0.gguf"
+DEFAULT_SERVER_BINARY = REPO / "build_metal" / "quant-server-unified"
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 8421  # arbitrary, avoid conflicts with 8080
 
 # Phase 1B cliff measurements. NEVER set a stage prompt larger than this.
+# Phi-3.5-mini has LongRoPE (128K nominal context) and is Q4_K_M with
+# turbo_kv_4b compression — its cliff should be at least as large as
+# Llama-3.2-3B's (1024 tokens). Conservative estimate: keep 1024 until
+# we measure it directly on Phi-3.5.
 CLIFF_BUDGET = {
     "models/Llama-3.2-3B-Instruct-Q8_0.gguf": 1024,
     "models/Llama-3.2-1B-Instruct-Q8_0.gguf": 512,
+    "models/Phi-3.5-mini-instruct-Q8_0.gguf": 1024,
+    "models/Phi-3.5-mini-instruct-Q4_K_M.gguf": 1024,
 }
 
 
@@ -41,6 +55,7 @@ class LLMResult:
     raw: str           # the full CLI stdout+stderr
     n_tokens: int      # generated token count
     elapsed: float     # wall seconds
+    is_error: bool = False  # True if the call failed (text contains error message)
 
 
 def estimate_tokens(text: str) -> int:
@@ -75,6 +90,7 @@ class BudgetExceededError(Exception):
 _server_proc: subprocess.Popen | None = None
 _server_url: str | None = None
 _server_model: str | None = None
+_atexit_registered = False
 
 
 def _port_in_use(host: str, port: int) -> bool:
@@ -97,29 +113,42 @@ def start_server(
     threads: int = 8,
     kv_type: str = "turbo_kv_4b",
     v_quant: str = "q4",
-    startup_timeout: float = 120.0,
+    startup_timeout: float = 180.0,
     verbose: bool = True,
 ) -> str:
     """Start a long-running quant-server. Returns the base URL."""
-    global _server_proc, _server_url, _server_model
+    global _server_proc, _server_url, _server_model, _atexit_registered
 
     if _server_proc is not None and _server_proc.poll() is None:
         if verbose:
             print(f"[server] already running at {_server_url}")
         return _server_url
 
+    # Validate model and binary exist before starting
+    if not Path(model).exists():
+        raise FileNotFoundError(f"Model not found: {model}")
+    if not Path(binary).exists():
+        raise FileNotFoundError(f"Server binary not found: {binary}")
+
+    # Register atexit handler to clean up server process on exit
+    if not _atexit_registered:
+        atexit.register(stop_server)
+        _atexit_registered = True
+
     # Pick an unused port
     while _port_in_use(host, port):
         port += 1
 
-    cmd = [
-        str(binary), str(model),
-        "-p", str(port),
-        "-H", host,
-        "-j", str(threads),
-        "-k", kv_type,
-        "-v", v_quant,
-    ]
+    # Build command — unified server only supports -p and -j (no -k/-v/-H)
+    is_unified = str(Path(binary).name).startswith("quant-server-unified")
+    if is_unified:
+        cmd = [str(binary), str(model), "-p", str(port), "-j", str(threads)]
+    else:
+        cmd = [
+            str(binary), str(model),
+            "-p", str(port), "-H", host,
+            "-j", str(threads), "-k", kv_type, "-v", v_quant,
+        ]
     if verbose:
         print(f"[server] starting: {' '.join(cmd)}")
 
@@ -183,10 +212,31 @@ def stop_server():
 DEFAULT_SYSTEM_PROMPT = "Answer in one short sentence. No reasoning steps."
 
 
+MAX_LLM_RETRIES = 2  # retry once on transient server errors
+
+
+def _check_server_alive() -> bool:
+    """Check if the server process is still running (J11: crash detection)."""
+    if _server_proc is None:
+        return False
+    return _server_proc.poll() is None
+
+
+def _restart_server_if_dead(model: str | Path = DEFAULT_MODEL, verbose: bool = True):
+    """Auto-restart server if it crashed (J4/J11: recovery)."""
+    global _server_url
+    if _server_proc is not None and _server_proc.poll() is not None:
+        exit_code = _server_proc.returncode
+        if verbose:
+            print(f"[server] crashed (exit code {exit_code}), restarting...")
+        stop_server()  # clean up
+        start_server(model=model, verbose=verbose)
+
+
 def llm_call(
     prompt: str,
     *,
-    max_tokens: int = 64,
+    max_tokens: int = 16,
     temperature: float = 0.0,
     model: str | Path = DEFAULT_MODEL,
     enforce_budget: bool = True,
@@ -197,6 +247,11 @@ def llm_call(
     The cliff invariant is enforced when enforce_budget=True (default):
     if the estimated prompt size exceeds the model's measured cliff
     budget, raises BudgetExceededError BEFORE invoking the model.
+
+    Resilience features (audit batch 1):
+    - Auto-restart server if it crashed between calls (J11)
+    - Retry once on transient network errors (B2)
+    - Distinguish network vs server vs timeout errors (B2)
     """
     global _server_url
 
@@ -209,9 +264,9 @@ def llm_call(
                 f"larger working memory."
             )
 
-    # Lazy server start if no server is running yet
-    if _server_url is None:
-        start_server(model=model)
+    # Validate max_tokens
+    if max_tokens <= 0:
+        max_tokens = 16
 
     messages = []
     if system:
@@ -226,27 +281,86 @@ def llm_call(
         "stream": False,
     }
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        f"{_server_url}/v1/chat/completions",
-        data=data,
-        headers={"Content-Type": "application/json"},
-    )
 
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+    last_error = None
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        # Lazy start or auto-restart if crashed (J4, J11)
+        if _server_url is None:
+            start_server(model=model)
+        _restart_server_if_dead(model=model)
+
+        req = urllib.request.Request(
+            f"{_server_url}/v1/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break  # success
+        except urllib.error.HTTPError as e:
+            elapsed = time.time() - t0
+            # 429 = server busy (retryable), others = server error
+            if e.code == 429 and attempt < MAX_LLM_RETRIES:
+                last_error = e
+                time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
+                continue
+            return LLMResult(text=f"[ERROR: HTTP {e.code}: {e.reason}]",
+                             raw=str(e), n_tokens=0, elapsed=elapsed, is_error=True)
+        except (ConnectionResetError, ConnectionRefusedError) as e:
+            # Server likely crashed — try restart (B13)
+            elapsed = time.time() - t0
+            if attempt < MAX_LLM_RETRIES:
+                last_error = e
+                _restart_server_if_dead(model=model)
+                continue
+            return LLMResult(text=f"[ERROR: server connection lost: {e}]",
+                             raw=str(e), n_tokens=0, elapsed=elapsed, is_error=True)
+        except TimeoutError as e:
+            elapsed = time.time() - t0
+            return LLMResult(text=f"[ERROR: timeout after {elapsed:.0f}s]",
+                             raw=str(e), n_tokens=0, elapsed=elapsed, is_error=True)
+        except (urllib.error.URLError, OSError) as e:
+            elapsed = time.time() - t0
+            if attempt < MAX_LLM_RETRIES:
+                last_error = e
+                time.sleep(1)
+                continue
+            return LLMResult(text=f"[ERROR: network: {e}]",
+                             raw=str(e), n_tokens=0, elapsed=elapsed, is_error=True)
+    else:
+        # All retries exhausted
         elapsed = time.time() - t0
-        return LLMResult(text=f"[ERROR: {e}]", raw=str(e), n_tokens=0, elapsed=elapsed)
+        return LLMResult(text=f"[ERROR: {MAX_LLM_RETRIES+1} attempts failed: {last_error}]",
+                         raw=str(last_error), n_tokens=0, elapsed=elapsed, is_error=True)
     elapsed = time.time() - t0
 
+    # Robust JSON response parsing — handle malformed/incomplete responses
     text = ""
     n_tokens = 0
-    if "choices" in payload and payload["choices"]:
-        msg = payload["choices"][0].get("message", {})
-        text = msg.get("content", "").strip()
-    if "usage" in payload:
-        n_tokens = payload["usage"].get("completion_tokens", 0)
+    is_error = False
+    try:
+        choices = payload.get("choices")
+        if choices and isinstance(choices, list) and len(choices) > 0:
+            msg = choices[0].get("message") or choices[0].get("delta") or {}
+            text = (msg.get("content") or "").strip()
+        usage = payload.get("usage")
+        if usage and isinstance(usage, dict):
+            n_tokens = usage.get("completion_tokens", 0)
+    except (KeyError, TypeError, IndexError, AttributeError):
+        is_error = True
+        text = f"[ERROR: malformed response: {str(payload)[:200]}]"
 
-    return LLMResult(text=text, raw=json.dumps(payload), n_tokens=n_tokens, elapsed=elapsed)
+    if not text and not is_error:
+        # Server returned empty content — likely state corruption.
+        # Restart server to get a clean state for next call.
+        is_error = True
+        text = "[ERROR: empty response from server]"
+        if _server_proc is not None:
+            stop_server()
+            # Next call will auto-restart via lazy start
+
+    return LLMResult(text=text, raw=json.dumps(payload) if isinstance(payload, dict) else str(payload),
+                     n_tokens=n_tokens, elapsed=elapsed, is_error=is_error)

@@ -72,7 +72,15 @@ int quant_chat(quant_ctx* ctx, const char* prompt,
 // Generate and return full response as string. Caller must free().
 char* quant_ask(quant_ctx* ctx, const char* prompt);
 
-// Free a string returned by quant_ask.
+// Generate answer with built-in coherence verification.
+// Answers the question from the given context, then verifies the answer
+// actually addresses the question (not just related information).
+// Sets *out_confidence to 0.0-1.0. Returns NULL if verification fails
+// after retries. Caller must free the returned string via quant_free_string().
+char* quant_ask_verified(quant_ctx* ctx, const char* context,
+                          const char* question, float* out_confidence);
+
+// Free a string returned by quant_ask / quant_ask_verified.
 void quant_free_string(char* str);
 
 // Save/load KV cache context to/from disk. Enables "read once, query forever":
@@ -538,6 +546,7 @@ typedef struct {
     int model_type;          /* 0=qwen35, 1=gemma3, 2=qwen2moe */
     int is_gemma4;           /* 1 if Gemma 4 (STEP35): uses SwiGLU, no post-norms */
     int sliding_window;      /* sliding window size (512 for gemma3, 0 for unlimited) */
+    int n_kv_shared_layers;  /* Gemma 4: last N layers share KV from earlier same-type layers (0=disabled) */
     float rope_local_base_freq; /* RoPE base freq for local/sliding layers (10000.0 for gemma3) */
     int n_norms_per_block;   /* 2 for qwen35, 4 for gemma3 */
     float query_pre_attn_scalar; /* attention scaling: 1/sqrt(this) instead of 1/sqrt(head_dim), 0=use head_dim */
@@ -553,6 +562,44 @@ typedef struct {
     float final_logit_softcap; /* logit soft-capping: logits = cap * tanh(logits/cap), 0=disabled */
     float attn_logit_softcap;  /* attention score soft-capping (Gemma): 0=disabled, typically 50.0 */
     int* per_layer_inter_dim;  /* [n_layers] per-layer intermediate_dim (NULL = use intermediate_dim) */
+
+    /* Phi-3 LongRoPE config -----------------------------------------------
+     * Phi-3.5 / Phi-3 long-context variants ship two per-frequency-pair
+     * rescaling tables: short_factor used while pos < rope_orig_ctx_len,
+     * long_factor used past that point. The standard RoPE frequency
+     * `1 / base^(2i/head_dim)` becomes `1 / (base^(2i/head_dim) * factor[i])`.
+     *
+     * rope_attn_factor multiplies Q (or rolls into the attention scale)
+     * to compensate for variance changes when the model is run past the
+     * original context length.
+     *
+     * All zero / NULL on non-Phi-3 models. */
+    int rope_orig_ctx_len;             /* original context length (e.g., 4096) */
+    float rope_attn_factor;            /* attention magnitude scaling */
+    const float* rope_factors_short;   /* [head_dim/2] for short context */
+    const float* rope_factors_long;    /* [head_dim/2] for long context */
+
+    /* Phi-3 fused-tensor flag — set during load if any layer has the
+     * fused QKV / FFN tensors. Drives state buffer sizing. */
+    int has_fused_qkv;                 /* any layer has gguf_w_qkv */
+    int has_fused_up_gate;             /* any layer has gguf_w_up_gate */
+
+    /* NeoX-style RoPE flag.
+     *
+     * When set, the RoPE rotation uses non-interleaved pair layout:
+     *   pairs are (q[i], q[i + half]) where half = head_dim/2
+     * instead of the standard interleaved layout:
+     *   pairs are (q[2i], q[2i+1])
+     *
+     * Required when n_heads * head_dim != hidden_dim (e.g., Qwen3-4B:
+     * 32×128=4096 ≠ 2560). The GGUF converter's weight permutation
+     * uses `n_head = head_count // head_count_kv` for K weights, which
+     * for GQA models produces cross-head interleaving instead of
+     * per-head interleaving. NeoX rotation avoids the permutation
+     * dependency entirely.
+     *
+     * Also used by Phi-3 (fused QKV, unpermuted). */
+    int use_neox_rope;                 /* 1 = NeoX-style, 0 = interleaved */
 } tq_model_config_t;
 
 /* ============================================================
@@ -657,6 +704,9 @@ typedef struct {
     const void* gguf_wk;  int gguf_wk_type;  /* K proj */
     const void* gguf_wv;  int gguf_wv_type;  /* V proj */
     const void* gguf_wo;  int gguf_wo_type;  /* O proj */
+    float* q_bias;        /* Q proj bias (Qwen2/2.5) — NULL if not present */
+    float* k_bias;        /* K proj bias */
+    float* v_bias;        /* V proj bias */
     /* GGUF on-the-fly for DeltaNet weights */
     const void* gguf_delta_qkv;  int gguf_delta_qkv_type;
     const void* gguf_delta_z;    int gguf_delta_z_type;
@@ -667,6 +717,23 @@ typedef struct {
     const void* gguf_w_gate; int gguf_w_gate_type;
     const void* gguf_w_up;   int gguf_w_up_type;
     const void* gguf_w_down; int gguf_w_down_type;
+
+    /* Phi-3 fused projections.
+     *
+     * Phi-3 / Phi-3.5 ships fused weight tensors instead of the standard
+     * llama-style separate ones:
+     *
+     *   gguf_w_qkv      shape [hidden, q_dim + k_dim + v_dim] — concatenated
+     *                   along the OUTPUT axis. We dispatch a single matmul
+     *                   into a temp buffer, then split into s->q/s->k/s->v.
+     *   gguf_w_up_gate  shape [hidden, 2 * intermediate_dim] — concatenated
+     *                   gate||up along the OUTPUT axis. Same one-shot
+     *                   matmul + split pattern.
+     *
+     * When these are non-NULL, the corresponding gguf_wq / gguf_w_gate
+     * pointers are NULL and the forward path takes the fused branch. */
+    const void* gguf_w_qkv;     int gguf_w_qkv_type;
+    const void* gguf_w_up_gate; int gguf_w_up_gate_type;
 
     /* MoE expert weights (NULL for dense FFN layers) */
     void* moe;               /* tq_moe_layer_t* (from tq_gguf.h), NULL if dense */
@@ -743,8 +810,10 @@ typedef struct {
     void* gguf_ctx;           /* tq_gguf_ctx_t* */
 
     /* GGUF embedding for output projection (large-vocab models keep quantized) */
-    const void* output_gguf;  /* raw GGUF quantized embedding data (NULL if using FP32/BF16) */
+    const void* output_gguf;  /* raw GGUF quantized weight for lm_head (may differ from embedding) */
     int output_gguf_type;     /* tq_ggml_dtype of output_gguf */
+    const void* embed_gguf;   /* raw GGUF quantized embedding for token lookup (may differ from output) */
+    int embed_gguf_type;      /* tq_ggml_dtype of embed_gguf */
 
     /* MoE config (valid when config.is_moe) */
     void* moe_config;         /* tq_moe_config_t* */
@@ -1745,6 +1814,10 @@ struct quant_ctx {
     int* cached_tokens;
     int  n_cached;
     int  cached_capacity;
+    /* Text-prefix cache: stores the entire prompt + generated response
+     * text from the last call, allowing the next call to bypass BPE
+     * re-tokenization issues by matching at the byte level. */
+    char* cached_text;
 };
 
 // ============================================================================
@@ -8302,17 +8375,93 @@ int tq_encode(const tq_tokenizer_t* tok, const char* text,
     int n_tokens = 0;
 
     /* Add BOS token if requested.
-     * Gemma: BOS=2, Qwen: no BOS (uses <|im_start|> instead) */
+     *
+     * Different model families use different BOS strings:
+     *   Gemma:           <bos>     (id 2)
+     *   Llama / Phi-3:   <s>       (id 1)  ← SentencePiece convention
+     *   Qwen / ChatML:   <|im_start|>
+     *
+     * Try them in priority order. Without this, Phi-3 prefill misses
+     * the BOS token and the entire response degrades into garbage. */
     if (add_bos) {
-        /* Look up <bos> token in vocab; default to id 2 (Gemma convention) */
         int bos_id = str_lookup(tok, "<bos>");
-        if (bos_id < 0) { bos_id = str_lookup(tok, "<|im_start|>"); }
+        if (bos_id < 0) bos_id = str_lookup(tok, "<s>");
+        if (bos_id < 0) bos_id = str_lookup(tok, "<|im_start|>");
+        if (bos_id < 0) bos_id = str_lookup(tok, "<|begin_of_text|>");
         if (bos_id >= 0) {
             tokens[n_tokens++] = bos_id;
         }
     }
 
     if (*text == '\0') return n_tokens;
+
+    /* Pre-pass: split text on special tokens BEFORE BPE encoding.
+     *
+     * GPT-2/Qwen tokenizers have "added_tokens" (e.g., <|im_start|>,
+     * <|im_end|>, <|endoftext|>) that must be matched as WHOLE strings
+     * and mapped to their token IDs directly — NOT decomposed by BPE.
+     *
+     * Without this, `<|im_start|>` gets BPE'd into `<`, `|`, `im`,
+     * `_start`, `|`, `>` (6 tokens) instead of a single ID (151644).
+     * The model was trained to see the single ID, so BPE fragments
+     * produce garbage output. */
+    {
+        /* Known special tokens that must be matched verbatim.
+         * We scan for ANY vocab entry that starts with `<|` and ends
+         * with `|>` — this covers all Qwen/GPT added_tokens without
+         * a hardcoded list. For SentencePiece models (Gemma, Phi-3)
+         * this also handles `<bos>`, `<eos>`, etc. */
+        const char* p = text;
+        while (*p && n_tokens < max_tokens) {
+            /* Check if position p starts a special token */
+            if (*p == '<') {
+                int best_len = 0;
+                int best_id = -1;
+                /* Try matching known patterns: <|...|>, <...> */
+                for (int slen = 3; slen <= 32 && p + slen <= text + strlen(text); slen++) {
+                    if (p[slen - 1] == '>') {
+                        char buf[64];
+                        if (slen >= (int)sizeof(buf)) break;
+                        memcpy(buf, p, (size_t)slen);
+                        buf[slen] = '\0';
+                        int id = str_lookup(tok, buf);
+                        if (id >= 0 && slen > best_len) {
+                            best_len = slen;
+                            best_id = id;
+                        }
+                    }
+                }
+                if (best_id >= 0) {
+                    /* Found a special token — emit it directly and
+                     * recursively encode any text before/after it. */
+                    if (p > text) {
+                        /* Encode the prefix (normal text before this special token) */
+                        char* prefix = (char*)malloc((size_t)(p - text) + 1);
+                        if (prefix) {
+                            memcpy(prefix, text, (size_t)(p - text));
+                            prefix[p - text] = '\0';
+                            n_tokens += tq_encode(tok, prefix,
+                                                   tokens + n_tokens,
+                                                   max_tokens - n_tokens, 0);
+                            free(prefix);
+                        }
+                    }
+                    tokens[n_tokens++] = best_id;
+                    /* Recurse on the remaining text after the special token */
+                    const char* rest = p + best_len;
+                    if (*rest) {
+                        n_tokens += tq_encode(tok, rest,
+                                               tokens + n_tokens,
+                                               max_tokens - n_tokens, 0);
+                    }
+                    return n_tokens;
+                }
+            }
+            p++;
+        }
+    }
+
+    /* No special tokens found — proceed with standard BPE encoding */
 
     /* Detect tokenizer style: Gemma uses ▁ (U+2581) for spaces in vocab,
      * GPT2/Qwen uses byte-level BPE with Ġ/ĉ encoding.
@@ -8363,21 +8512,56 @@ int tq_encode(const tq_tokenizer_t* tok, const char* text,
         }
         free(norm);
     } else {
-        /* GPT2/Qwen byte-level BPE: each byte maps to a BPE character token */
-        for (int i = 0; i < text_len && n_tokens < max_tokens; i++) {
-            unsigned char byte = (unsigned char)text[i];
-            char bpe_char[4];
-            encode_byte_to_bpe_char(byte, bpe_char);
+        /* GPT2/Qwen/Gemma4 byte-level BPE.
+         *
+         * Pre-pass: match special/control tokens BEFORE byte-level decomposition.
+         * Special tokens like <|turn>, <turn|>, <|think|>, <|im_start|>, etc.
+         * must be emitted as single token IDs (not byte-decomposed). */
+        int i = 0;
+        while (i < text_len && n_tokens < max_tokens) {
+            int matched = 0;
+            if (text[i] == '<') {
+                /* Greedy longest-match: scan for '>' to find token end */
+                int best_len = 0;
+                int best_id = -1;
+                for (int end = i + 2; end < text_len && end - i <= 32; end++) {
+                    if (text[end] == '>' || text[end] == '\n') {
+                        int try_len = (text[end] == '>') ? end - i + 1 : end - i;
+                        char buf[64];
+                        if (try_len > 0 && try_len < 64) {
+                            memcpy(buf, text + i, (size_t)try_len);
+                            buf[try_len] = '\0';
+                            int id = str_lookup(tok, buf);
+                            if (id >= 0 && try_len > best_len) {
+                                best_len = try_len;
+                                best_id = id;
+                            }
+                        }
+                        if (text[end] == '>') break;
+                    }
+                }
+                if (best_id >= 0) {
+                    tokens[n_tokens++] = best_id;
+                    i += best_len;
+                    matched = 1;
+                }
+            }
+            if (!matched) {
+                unsigned char byte = (unsigned char)text[i];
+                char bpe_char[4];
+                encode_byte_to_bpe_char(byte, bpe_char);
 
-            int id = str_lookup(tok, bpe_char);
-            if (id >= 0) {
-                tokens[n_tokens++] = id;
-            } else {
-                char direct[2] = { (char)byte, '\0' };
-                id = str_lookup(tok, direct);
+                int id = str_lookup(tok, bpe_char);
                 if (id >= 0) {
                     tokens[n_tokens++] = id;
+                } else {
+                    char direct[2] = { (char)byte, '\0' };
+                    id = str_lookup(tok, direct);
+                    if (id >= 0) {
+                        tokens[n_tokens++] = id;
+                    }
                 }
+                i++;
             }
         }
     }
@@ -11338,20 +11522,63 @@ tq_model_t* tq_load_gguf(const char* path) {
 
     /* Sliding window + local RoPE base */
     c->sliding_window = (int)tq_gguf_get_u32(gguf, GGUF_KEY("attention.sliding_window"), 0);
+    c->n_kv_shared_layers = (int)tq_gguf_get_u32(gguf, GGUF_KEY("attention.shared_kv_layers"), 0);
+    if (c->n_kv_shared_layers > 0) {
+        fprintf(stderr, "tq_load_gguf: KV sharing enabled — last %d layers reuse KV from earlier same-type layers\n",
+                c->n_kv_shared_layers);
+    }
     /* Local/sliding RoPE base: try Gemma4 naming first, then generic */
     c->rope_local_base_freq = tq_gguf_get_f32(gguf, GGUF_KEY("rope.freq_base_swa"),
                                tq_gguf_get_f32(gguf, GGUF_KEY("rope.local.freq_base"),
                                tq_gguf_get_f32(gguf, GGUF_KEY("rope.freq_base"), 10000.0f)));
     c->final_logit_softcap = tq_gguf_get_f32(gguf, GGUF_KEY("final_logit_softcapping"), 0.0f);
     c->attn_logit_softcap = tq_gguf_get_f32(gguf, GGUF_KEY("attn_logit_softcapping"), 0.0f);
-    /* Gemma 2/3/4 use attention softcap but it may not be in metadata — hardcode */
-    if (c->model_type == 1 && c->attn_logit_softcap == 0.0f) {
+    /* Gemma 2/3 use attention softcap (50.0) but Gemma 4 does NOT.
+     * Only apply hardcoded default for non-Gemma4 Gemma models. */
+    if (c->model_type == 1 && !c->is_gemma4 && c->attn_logit_softcap == 0.0f) {
         c->attn_logit_softcap = 50.0f;
+    }
+
+    /* Phi-3 LongRoPE config + factor tables.
+     *
+     * Phi-3.5-mini ships:
+     *   <arch>.rope.scaling.original_context_length  (e.g., 4096)
+     *   <arch>.rope.scaling.attn_factor              (e.g., 1.19024)
+     *   rope_factors_short.weight  F32 [head_dim/2]
+     *   rope_factors_long.weight   F32 [head_dim/2]
+     *
+     * Inference uses short_factor while pos < orig_ctx_len, long_factor
+     * past that. The factor rescales the per-frequency-pair RoPE rotation:
+     *   freq[i] = 1 / (rope_base^(2i/head_dim) * factor[i])
+     *
+     * On non-Phi-3 models the keys / tensors are absent and the fields
+     * stay zero / NULL — the standard RoPE path runs unchanged. */
+    c->rope_orig_ctx_len = (int)tq_gguf_get_u32(gguf,
+        GGUF_KEY("rope.scaling.original_context_length"), 0);
+    c->rope_attn_factor = tq_gguf_get_f32(gguf,
+        GGUF_KEY("rope.scaling.attn_factor"), 0.0f);
+    {
+        const tq_gguf_tensor_t* rfs = tq_gguf_find_tensor(gguf, "rope_factors_short.weight");
+        const tq_gguf_tensor_t* rfl = tq_gguf_find_tensor(gguf, "rope_factors_long.weight");
+        if (rfs && rfs->type == TQ_GGML_TYPE_F32) c->rope_factors_short = (const float*)rfs->data;
+        if (rfl && rfl->type == TQ_GGML_TYPE_F32) c->rope_factors_long  = (const float*)rfl->data;
+        if (rfs || rfl) {
+            fprintf(stderr,
+                "tq_load_gguf: LongRoPE detected — orig_ctx=%d, attn_factor=%.4f, "
+                "short=%p, long=%p\n",
+                c->rope_orig_ctx_len, c->rope_attn_factor,
+                (const void*)c->rope_factors_short,
+                (const void*)c->rope_factors_long);
+        }
     }
 
     /* Cap context for memory safety on small machines.
      * GGUF models often claim 262K context but we cap at 4096 by default.
-     * Users can override with --ctx flag in quant. */
+     * Users can override with --ctx flag in quant.
+     *
+     * Phi-3.5-mini's "original" context is exactly 4096 — keep it there
+     * so we never trip the LongRoPE switch in this default. Users that
+     * actually want long context can pass --ctx. */
     if (c->max_seq_len > 4096) c->max_seq_len = 4096;
 
     /* Compute head_dim — prefer explicit key_length from metadata.
@@ -11362,10 +11589,15 @@ tq_model_t* tq_load_gguf(const char* path) {
         c->head_dim = c->hidden_dim / c->n_heads;
     }
 
-    /* For hybrid sliding/full attention (Gemma 4):
+    /* For hybrid sliding/full attention (Gemma 3/4 ONLY):
      * Override head_dim from first layer's K tensor shape (sliding layer),
-     * since sliding layers are the majority and determine KV cache layout. */
-    {
+     * since sliding layers are the majority and determine KV cache layout.
+     *
+     * MUST be gated to Gemma arch — running unconditionally breaks Qwen3
+     * (head_dim=128 gets overridden to 64 because 1024/64=16 passes the
+     * "hd < metadata_head_dim" check while 1024/128=8 doesn't). */
+    int is_gemma_arch = (strstr(gguf->arch, "gemma") != NULL);
+    if (is_gemma_arch) {
         const tq_gguf_tensor_t* k0 = tq_gguf_find_tensor(gguf, "blk.0.attn_k.weight");
         if (k0 && k0->n_dims >= 2) {
             int k_out = (int)k0->shape[1];
@@ -11430,13 +11662,9 @@ tq_model_t* tq_load_gguf(const char* path) {
         /* Gemma 4 (STEP35) detection: architecture string is "gemma4" */
         if (strstr(gguf->arch, "gemma4") != NULL) {
             c->is_gemma4 = 1;
-            /* STEP35: full attention layers use half the RoPE dimensions */
-            if (c->rope_n_dims_full > 0) {
-                c->rope_n_dims_full = c->rope_n_dims_full / 2;
-            }
-            fprintf(stderr, "tq_load_gguf: Gemma4 — RoPE dims swa=%d full=%d, "
-                    "GeGLU, rope_freqs for full layers only\n",
-                    c->rope_n_dims, c->rope_n_dims_full);
+            /* Gemma 4 proportional RoPE: deferred to after hybrid attention
+             * detection sets full_head_dim (see below, ~line 12238). */
+            fprintf(stderr, "tq_load_gguf: Gemma4 detected (p-RoPE will be applied after hybrid detection)\n");
         }
         fprintf(stderr, "tq_load_gguf: Gemma family detected (sliding_window=%d)\n", c->sliding_window);
     } else if (c->is_moe) {
@@ -11445,8 +11673,47 @@ tq_model_t* tq_load_gguf(const char* path) {
         c->model_type = 0; /* qwen35 */
     }
 
+    /* Compute partial_rotary_factor from rope.dimension_count / head_dim.
+     * Qwen3.5: rope_n_dims=64, head_dim=256 → factor=0.25 (25% of dims rotated).
+     * Most models: rope_n_dims=0 or == head_dim → factor=0.0 (full rotation). */
+    if (c->rope_n_dims > 0 && c->head_dim > 0 && c->rope_n_dims < c->head_dim) {
+        c->partial_rotary_factor = (float)c->rope_n_dims / (float)c->head_dim;
+        fprintf(stderr, "tq_load_gguf: partial RoPE — %d/%d dims (factor=%.2f)\n",
+                c->rope_n_dims, c->head_dim, c->partial_rotary_factor);
+    }
+
     fprintf(stderr, "tq_load_gguf: config — layers=%d, dim=%d, heads=%d/%d, head_dim=%d, vocab=%d\n",
             c->n_layers, c->hidden_dim, c->n_heads, c->n_kv_heads, c->head_dim, c->vocab_size);
+
+    /* Detect NeoX RoPE requirement.
+     *
+     * When n_heads * head_dim != hidden_dim (Qwen3: 32×128=4096 ≠ 2560),
+     * the GGUF converter's weight permutation for GQA K weights creates
+     * cross-head interleaving instead of per-head interleaving. Standard
+     * interleaved RoPE produces wrong rotations on these weights.
+     *
+     * NeoX-style rotation (q[i], q[i+half]) avoids the permutation
+     * dependency entirely — it works on the RAW weight layout regardless
+     * of how the converter permuted them.
+     *
+     * Also set for Phi-3 (fused QKV, never permuted by converter). */
+    /* NeoX-style RoPE for models where n_heads*head_dim != hidden_dim
+     * (Qwen3: 32×128=4096 ≠ 2560). Exclude Gemma 3 (uses interleaved).
+     * Gemma 4 uses NeoX RoPE (confirmed: llama.cpp returns LLAMA_ROPE_TYPE_NEOX
+     * for LLM_ARCH_GEMMA4; converter generates NeoX-layout rope_freqs). */
+    if (c->n_heads > 0 && c->head_dim > 0 &&
+        c->n_heads * c->head_dim != c->hidden_dim &&
+        c->model_type != 1 /* exclude Gemma 3 */) {
+        c->use_neox_rope = 1;
+        fprintf(stderr, "tq_load_gguf: NeoX RoPE enabled "
+                "(n_heads*head_dim=%d != hidden=%d)\n",
+                c->n_heads * c->head_dim, c->hidden_dim);
+    }
+    /* Gemma 4 always uses NeoX-style RoPE (even though Gemma 3 uses interleaved) */
+    if (c->is_gemma4) {
+        c->use_neox_rope = 1;
+        fprintf(stderr, "tq_load_gguf: NeoX RoPE enabled for Gemma 4\n");
+    }
 
     if (c->n_layers == 0 || c->hidden_dim == 0) {
         fprintf(stderr, "tq_load_gguf: invalid config, aborting\n");
@@ -11486,9 +11753,11 @@ tq_model_t* tq_load_gguf(const char* path) {
     int attn_indices[256]; /* max layers */
 
     /* Detect if GGUF already has Gemma +1.0 norm adjustment baked in.
-     * If first layer's attn_norm has mean > 2.0, it's already adjusted. */
-    int gemma_norms_adjusted = 0;
-    if (c->model_type == 1) {
+     * If first layer's attn_norm has mean > 2.0, it's already adjusted.
+     * Gemma 4 does NOT use the +1 convention (norm_shift=0 in converter),
+     * so skip the adjustment entirely for Gemma 4. */
+    int gemma_norms_adjusted = c->is_gemma4 ? 1 : 0;  /* Gemma4: treat as already adjusted (no +1 needed) */
+    if (c->model_type == 1 && !c->is_gemma4) {
         const tq_gguf_tensor_t* probe = tq_gguf_find_tensor(gguf, "blk.0.attn_norm.weight");
         if (probe && probe->type == TQ_GGML_TYPE_F32 && probe->shape[0] > 0) {
             const float* pw = (const float*)probe->data;
@@ -11629,10 +11898,37 @@ tq_model_t* tq_load_gguf(const char* path) {
             }
         }
 
-        /* Attention weights — keep as GGUF quantized pointers for on-the-fly dequant.
-         * We store the raw data pointer + type info using a small struct packed into
-         * the existing FP32 weight pointer fields. For GGUF models, we use a special
-         * dispatch: if gguf_ctx is non-NULL, the forward pass uses tq_matmul_gguf. */
+        /* Early DeltaNet probe: check if this layer has SSM weights BEFORE
+         * the fused QKV detection. DeltaNet layers also have attn_qkv.weight
+         * (for conv1d input), and we must NOT treat it as a Phi-3 fused QKV. */
+        int layer_is_deltanet = 0;
+        {
+            char ssm_probe[128];
+            snprintf(ssm_probe, sizeof(ssm_probe), "blk.%d.ssm_a", l);
+            if (find_gguf_tensor(gguf, ssm_probe)) layer_is_deltanet = 1;
+        }
+
+        /* Phi-3 fused QKV detection (skip for DeltaNet layers). */
+        snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", l);
+        const tq_gguf_tensor_t* wqkv_t = find_gguf_tensor(gguf, tname);
+        if (wqkv_t && !layer_is_deltanet) {
+            layer->gguf_w_qkv = wqkv_t->data;
+            layer->gguf_w_qkv_type = wqkv_t->type;
+            c->has_fused_qkv = 1;
+
+            snprintf(tname, sizeof(tname), "blk.%d.attn_output.weight", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) { layer->gguf_wo = t->data; layer->gguf_wo_type = t->type; }
+
+            attn_indices[n_attn_layers++] = l;
+            /* Skip the standard attn_q path below — we already loaded
+             * everything we need for this layer's attention block. */
+            goto post_attn_load;
+        }
+
+        /* Standard llama-style attention weights — keep as GGUF quantized
+         * pointers for on-the-fly dequant. The forward pass dispatches
+         * tq_matmul_gguf when gguf_ctx is non-NULL. */
         snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", l);
         const tq_gguf_tensor_t* wq_t = find_gguf_tensor(gguf, tname);
         int is_attn_layer = (wq_t != NULL);
@@ -11672,9 +11968,21 @@ tq_model_t* tq_load_gguf(const char* path) {
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_wo = t->data; layer->gguf_wo_type = t->type; }
 
+            /* Attention biases (Qwen2/2.5): Q, K, V biases (F32) */
+            snprintf(tname, sizeof(tname), "blk.%d.attn_q.bias", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->q_bias = dequant_tensor_fp32(t);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_k.bias", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->k_bias = dequant_tensor_fp32(t);
+            snprintf(tname, sizeof(tname), "blk.%d.attn_v.bias", l);
+            t = find_gguf_tensor(gguf, tname);
+            if (t) layer->v_bias = dequant_tensor_fp32(t);
+
             attn_indices[n_attn_layers++] = l;
         }
 
+post_attn_load:
         /* Check for DeltaNet / SSM weights (Qwen3.5 hybrid) */
         snprintf(tname, sizeof(tname), "blk.%d.ssm_a", l);
         t = find_gguf_tensor(gguf, tname);
@@ -11914,13 +12222,39 @@ tq_model_t* tq_load_gguf(const char* path) {
                 if (t) { layer->gguf_w_down = t->data; layer->gguf_w_down_type = t->type; }
             }
         } else {
-            /* Dense model: use GGUF on-the-fly dequant */
+            /* Dense model: use GGUF on-the-fly dequant.
+             *
+             * Phi-3 fused FFN: when `blk.N.ffn_up.weight` has shape
+             * [hidden, 2*ff] AND there is no separate `ffn_gate.weight`,
+             * the up tensor actually contains [gate || up] concatenated
+             * along the output axis. We mark it as fused; the forward
+             * path does one matmul into a 2*ff buffer and splits.
+             *
+             * The standard llama path (gate + up as separate tensors)
+             * still works because we only flip to fused when ffn_gate
+             * is missing. */
             snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", l);
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_w_gate = t->data; layer->gguf_w_gate_type = t->type; }
+
             snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", l);
             t = find_gguf_tensor(gguf, tname);
-            if (t) { layer->gguf_w_up = t->data; layer->gguf_w_up_type = t->type; }
+            if (t) {
+                if (!layer->gguf_w_gate && t->n_dims >= 2 &&
+                    c->intermediate_dim > 0 &&
+                    (int)t->shape[1] == 2 * c->intermediate_dim) {
+                    /* Fused gate||up — store under the new field, leave
+                     * gguf_w_up NULL so the forward path's standard
+                     * branch doesn't pick it up by accident. */
+                    layer->gguf_w_up_gate = t->data;
+                    layer->gguf_w_up_gate_type = t->type;
+                    c->has_fused_up_gate = 1;
+                } else {
+                    layer->gguf_w_up = t->data;
+                    layer->gguf_w_up_type = t->type;
+                }
+            }
+
             snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", l);
             t = find_gguf_tensor(gguf, tname);
             if (t) { layer->gguf_w_down = t->data; layer->gguf_w_down_type = t->type; }
@@ -11934,6 +12268,39 @@ tq_model_t* tq_load_gguf(const char* path) {
         memcpy(model->attn_layer_indices, attn_indices, (size_t)n_attn_layers * sizeof(int));
         fprintf(stderr, "tq_load_gguf: hybrid architecture — %d attn layers out of %d total\n",
                 n_attn_layers, c->n_layers);
+    }
+
+    /* Hard-fail when neither standard self_attn (`blk.N.attn_q.weight`) nor
+     * DeltaNet (`blk.N.ssm_a`) was detected on any layer. The GGUF loaded
+     * fine but every layer is missing its attention block — typically
+     * because the architecture uses fused QKV (Phi-3 `attn_qkv`) or some
+     * other naming convention we don't recognize yet.
+     *
+     * Without this check the load returns successfully, the forward pass
+     * runs against zero-initialized attention weights, and the user gets
+     * pages of garbage tokens with no clear error to debug. The previous
+     * behavior was reported by an external user (2026-04-12 feedback) as
+     * the worst part of the first-time experience: "loaded 32 layers
+     * (0 self_attn)" looked like a success log.
+     *
+     * Listed architectures that hit this path:
+     *   - phi3 / phi3.5 (uses fused `blk.N.attn_qkv.weight`)
+     *   - any future fused-QKV architecture we haven't ported yet
+     *
+     * Hybrid models with at least ONE self_attn layer (e.g., Qwen3.5
+     * DeltaNet) are NOT affected — they hit the branch above and proceed. */
+    if (n_attn_layers == 0 && c->delta_n_heads == 0) {
+        fprintf(stderr,
+            "tq_load_gguf: ERROR — model architecture '%s' is not supported.\n"
+            "  Detected 0 self_attn layers and no DeltaNet weights.\n"
+            "  This usually means the model uses fused QKV projection\n"
+            "  (e.g., Phi-3 `attn_qkv`) which quant.cpp does not yet handle.\n"
+            "  See docs/supported_models.md for the architecture support matrix.\n",
+            gguf->arch[0] ? gguf->arch : "unknown");
+        /* tq_free_model owns gguf_ctx (set above at line 11463) and will
+         * close it as part of the teardown — do not double-close. */
+        tq_free_model(model);
+        return NULL;
     }
 
     /* Set up layer_is_sliding for Gemma hybrid attention.
@@ -11989,6 +12356,17 @@ tq_model_t* tq_load_gguf(const char* path) {
         }
     }
 
+    /* Gemma 4 proportional RoPE: NOW apply, after hybrid detection set full_head_dim.
+     * HuggingFace config: partial_rotary_factor=0.25 for full attention layers.
+     * GGUF rope.dimension_count=512 is the full head_dim, NOT the rotated dim.
+     * Actual RoPE dims for full layers = full_head_dim / 4 = 128. */
+    if (c->is_gemma4 && c->rope_n_dims_full > 0 && c->full_head_dim > 0) {
+        int partial_rope = c->full_head_dim / 4;  /* 512/4 = 128 */
+        fprintf(stderr, "tq_load_gguf: Gemma4 p-RoPE — full layer RoPE dims %d -> %d "
+                "(partial_rotary_factor=0.25)\n", c->rope_n_dims_full, partial_rope);
+        c->rope_n_dims_full = partial_rope;
+    }
+
     /* Load embedding + output weights */
     const tq_gguf_tensor_t* emb_t = find_gguf_tensor(gguf, "token_embd.weight");
     if (emb_t) {
@@ -11998,7 +12376,12 @@ tq_model_t* tq_load_gguf(const char* path) {
             /* Keep as-is for streaming dequant */
             model->embed_bf16 = (const uint16_t*)emb_t->data;
         } else if (c->vocab_size > 100000 || emb_t->shape[1] > 100000) {
-            /* Large vocab: keep GGUF for output projection, dequant rows on demand */
+            /* Large vocab: keep GGUF pointers for on-demand dequant.
+             * embed_gguf = embedding for token lookup (per-row dequant)
+             * output_gguf = lm_head for output projection (defaults to same tensor for tied weights;
+             *   overridden below if separate output.weight exists with different type) */
+            model->embed_gguf = emb_t->data;
+            model->embed_gguf_type = emb_t->type;
             model->output_gguf = emb_t->data;
             model->output_gguf_type = emb_t->type;
             model->token_embedding = NULL;
@@ -12014,7 +12397,13 @@ tq_model_t* tq_load_gguf(const char* path) {
 
     const tq_gguf_tensor_t* out_t = find_gguf_tensor(gguf, "output.weight");
     if (out_t) {
-        if (out_t->type == TQ_GGML_TYPE_F32) {
+        /* Separate output weight tensor (untied from embedding).
+         * For large vocab: override output_gguf with the actual output weight (not embedding). */
+        if (c->vocab_size > 100000 || (emb_t && emb_t->shape[1] > 100000)) {
+            model->output_gguf = out_t->data;
+            model->output_gguf_type = out_t->type;
+            model->output_weight = NULL;
+        } else if (out_t->type == TQ_GGML_TYPE_F32) {
             model->output_weight = (float*)out_t->data;
         } else if (out_t->type == TQ_GGML_TYPE_BF16 || out_t->type == TQ_GGML_TYPE_F16) {
             model->output_weight_bf16 = (const uint16_t*)out_t->data;
@@ -12769,6 +13158,43 @@ void tq_free_model(tq_model_t* model) {
         }
     }
     free(model->moe_config);
+
+    /* Free dequantized norm/embedding buffers (GGUF path only).
+     * In the GGUF path, dequant_tensor_fp32() individually malloc's each
+     * norm weight. In the SafeTensor path, these point into _converted_data
+     * (freed above), so we must NOT free them again. */
+    if (model->gguf_ctx && model->layers) {
+        for (int l = 0; l < model->config.n_layers; l++) {
+            tq_layer_weights_t* layer = &model->layers[l];
+            free(layer->attn_norm);
+            free(layer->ffn_norm);
+            free(layer->q_norm);
+            free(layer->k_norm);
+            free(layer->post_attn_norm);
+            free(layer->post_ffn_norm);
+            free(layer->pre_ffn_norm);
+            free(layer->post_ffn_norm_1);
+            free(layer->pre_ffn_norm_2);
+            free(layer->post_ffn_norm_2);
+            free(layer->ple_norm);
+            free(layer->delta_a_log);
+            free(layer->delta_conv1d);
+            free(layer->delta_dt_bias);
+            free(layer->delta_in_proj_qkv);
+            free(layer->delta_in_proj_z);
+            free(layer->delta_norm);
+            free(layer->delta_in_proj_a);
+            free(layer->delta_in_proj_b);
+            free(layer->delta_out_proj);
+        }
+        free(model->token_embedding);
+        free(model->output_weight);
+        free(model->output_norm);
+        free(model->rope_freqs);
+        free(model->ple_proj);
+        free(model->ple_proj_norm);
+    }
+
     free(model->layers);
 
     /* Free GGUF context (handles munmap internally) */
@@ -13045,6 +13471,20 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
     if (max_q_dim > max_dim) max_dim = max_q_dim;
     if (q_proj_dim > max_dim) max_dim = q_proj_dim;
     if (delta_qkv_dim > max_dim) max_dim = delta_qkv_dim;
+    /* Phi-3 fused QKV: one matmul writes [Q | K | V] of total
+     * (q_dim + 2 * kv_dim) into a temp buffer that we then split.
+     * The temp buffer reuses s->xb / s->xb2, so max_dim has to cover
+     * the fused output size on top of every existing case. */
+    int fused_qkv_dim = q_dim + 2 * (config->n_kv_heads * config->head_dim);
+    if (config->has_fused_qkv && fused_qkv_dim > max_dim) max_dim = fused_qkv_dim;
+
+    /* Phi-3 fused gate||up FFN: same idea — one matmul writes 2*ff
+     * floats into a temp buffer (s->hb), so s->hb has to be sized
+     * to 2*inter_dim instead of inter_dim. We bump inter_dim_alloc
+     * for the FFN buffers; the rest of the code can keep using
+     * inter_dim as the LOGICAL gate/up dim. */
+    int inter_dim_alloc = inter_dim;
+    if (config->has_fused_up_gate) inter_dim_alloc = 2 * inter_dim;
 
     s->x      = (float*)calloc((size_t)dim, sizeof(float));
     s->xb     = (float*)calloc((size_t)max_dim, sizeof(float));
@@ -13053,7 +13493,7 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
     s->k      = (float*)calloc((size_t)max_kv_dim, sizeof(float));
     s->v      = (float*)calloc((size_t)max_kv_dim, sizeof(float));
     s->att    = (float*)calloc((size_t)n_heads * max_seq, sizeof(float));
-    s->hb     = (float*)calloc((size_t)inter_dim, sizeof(float));
+    s->hb     = (float*)calloc((size_t)inter_dim_alloc, sizeof(float));
     s->hb2    = (float*)calloc((size_t)inter_dim, sizeof(float));
     s->logits = (float*)calloc((size_t)config->vocab_size, sizeof(float));
 
@@ -13130,12 +13570,16 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
         s->delta_dvec = (float*)calloc((size_t)dv, sizeof(float));
     }
 
-    /* Quantization workspace */
+    /* Quantization workspace — use MAX head_dim for hybrid attention (Gemma 4).
+     * Sliding layers have head_dim=256, full layers have head_dim=512.
+     * Quantized cache must accommodate the larger dimension. (issue #61) */
     size_t block_size = tq_type_block_size(kv_type);
     size_t type_size  = tq_type_type_size(kv_type);
     if (block_size == 0) block_size = TQ_BK;
     if (type_size == 0) type_size = sizeof(block_tq_uniform_4b);
-    size_t n_blocks_per_head = ((size_t)config->head_dim + block_size - 1) / block_size;
+    int max_head_dim = config->head_dim;
+    if (config->full_head_dim > max_head_dim) max_head_dim = config->full_head_dim;
+    size_t n_blocks_per_head = ((size_t)max_head_dim + block_size - 1) / block_size;
     /* quant_key_buf is used as a gather buffer for integer attention:
      * we collect quantized key blocks for one KV head across all seq positions.
      * Size needed: max_seq_len * blocks_per_head * type_size */
@@ -13150,7 +13594,10 @@ tq_state_t* tq_create_state_ex(const tq_model_config_t* config, tq_type kv_type,
      * Layout: [n_layers][max_seq_len][n_kv_heads][blocks_per_head * type_size]
      * Each key vector is quantized when stored, then reused for fast Q4xQ8 attention. */
     s->quant_head_stride = n_blocks_per_head * type_size;
-    size_t quant_pos_stride = s->quant_head_stride * (size_t)config->n_kv_heads;
+    /* Use max kv_heads for position stride (hybrid: sliding=8, full=2 but larger heads) */
+    int max_kv_heads = config->n_kv_heads;
+    if (config->full_n_kv_heads > max_kv_heads) max_kv_heads = config->full_n_kv_heads;
+    size_t quant_pos_stride = s->quant_head_stride * (size_t)max_kv_heads;
     s->quant_kv_stride = quant_pos_stride * (size_t)max_seq;
     if (kv_type < TQ_TYPE_COUNT) {
         s->quant_key_cache = calloc((size_t)n_layers * s->quant_kv_stride, 1);
@@ -13512,6 +13959,8 @@ static void deltanet_forward(tq_model_t* model, tq_state_t* s, int l) {
     float* K_all = s->delta_qkv + dn_kv * dk;
     float* V_all = s->delta_qkv + 2 * dn_kv * dk;
 
+    /* L2 normalization of Q/K: REQUIRED for Qwen3.5-4B.
+     * Removing this causes complete output collapse. */
     for (int h = 0; h < dn_kv; h++) {
         l2_normalize(Q_all + h * dk, dk);
         l2_normalize(K_all + h * dk, dk);
@@ -13544,13 +13993,21 @@ static void deltanet_forward(tq_model_t* model, tq_state_t* s, int l) {
         float decay = decay_vals[h]; /* precomputed exp(gate) */
 
 #ifdef __ARM_NEON
-        /* NEON-optimized: fused decay + sk computation.
-         * For each row i of state: decay state, accumulate sk.
-         * sk[j] = sum_i(S[i,j] * K[i]) after decay */
+        /* NEON-optimized: llama.cpp-aligned delta rule.
+         * Formula (matches gated_delta_net.cu):
+         *   sk = S @ K           (BEFORE decay)
+         *   d  = (V - g*sk) * beta
+         *   S  = g*S + K * d
+         *   o  = S @ Q
+         * The key difference from the previous impl: sk is computed
+         * on the ORIGINAL state, then decay is applied to both sk
+         * (in the delta) and S (in the update). This prevents
+         * short-prompt instability where early tokens have near-zero
+         * state and the decay-first approach loses information. */
         float* sk = s->delta_sk;
         memset(sk, 0, (size_t)dv * sizeof(float));
 
-        float32x4_t vdecay = vdupq_n_f32(decay);
+        /* Step A: sk = S @ K (on original state, BEFORE decay) */
         for (int i = 0; i < dk; i++) {
             float* sp = sh + i * dv;
             float ki = kh[i];
@@ -13558,36 +14015,34 @@ static void deltanet_forward(tq_model_t* model, tq_state_t* s, int l) {
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 float32x4_t vs = vld1q_f32(sp + j);
-                vs = vmulq_f32(vs, vdecay);  /* decay */
-                vst1q_f32(sp + j, vs);        /* store decayed state */
                 float32x4_t vsk = vld1q_f32(sk + j);
-                vsk = vfmaq_f32(vsk, vs, vki); /* accumulate sk */
+                vsk = vfmaq_f32(vsk, vs, vki);
                 vst1q_f32(sk + j, vsk);
             }
             for (; j < dv; j++) {
-                sp[j] *= decay;
                 sk[j] += sp[j] * ki;
             }
         }
 
-        /* Delta: d = beta * (V - sk) */
+        /* Step B: d = (V - g*sk) * beta */
         float* d_vec = s->delta_dvec;
         float32x4_t vbeta = vdupq_n_f32(beta_h);
+        float32x4_t vdecay = vdupq_n_f32(decay);
         {
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 float32x4_t vv = vld1q_f32(vh + j);
-                float32x4_t vs = vld1q_f32(sk + j);
-                float32x4_t vd = vmulq_f32(vbeta, vsubq_f32(vv, vs));
+                float32x4_t vsk = vld1q_f32(sk + j);
+                float32x4_t vd = vmulq_f32(vbeta, vsubq_f32(vv, vmulq_f32(vdecay, vsk)));
                 vst1q_f32(d_vec + j, vd);
             }
             for (; j < dv; j++) {
-                d_vec[j] = beta_h * (vh[j] - sk[j]);
+                d_vec[j] = beta_h * (vh[j] - decay * sk[j]);
             }
         }
 
-        /* State update: S[i][j] += K[i] * d[j] (rank-1 outer product)
-         * + Output: o[j] = sum_i(S[i,j] * Q[i]) (simultaneously) */
+        /* Step C: S = g*S + K*d (state update)
+         * + Output: o = S @ Q (simultaneously) */
         float* oh = s->delta_out + h * dv;
         memset(oh, 0, (size_t)dv * sizeof(float));
 
@@ -13600,26 +14055,24 @@ static void deltanet_forward(tq_model_t* model, tq_state_t* s, int l) {
             int j = 0;
             for (; j + 3 < dv; j += 4) {
                 float32x4_t vs = vld1q_f32(sp + j);
+                vs = vmulq_f32(vs, vdecay);           /* S = g*S */
                 float32x4_t vd = vld1q_f32(d_vec + j);
-                vs = vfmaq_f32(vs, vki, vd);  /* S += K[i] * d */
+                vs = vfmaq_f32(vs, vki, vd);           /* S += K[i] * d */
                 vst1q_f32(sp + j, vs);
                 float32x4_t vo = vld1q_f32(oh + j);
-                vo = vfmaq_f32(vo, vs, vqi);   /* o += S * Q[i] */
+                vo = vfmaq_f32(vo, vs, vqi);           /* o += S * Q[i] */
                 vst1q_f32(oh + j, vo);
             }
             for (; j < dv; j++) {
-                sp[j] += ki * d_vec[j];
+                sp[j] = decay * sp[j] + ki * d_vec[j];
                 oh[j] += sp[j] * qi;
             }
         }
 #else
-        /* Scalar fallback */
-        /* Decay: S = S * exp(gate) */
-        for (int i = 0; i < dk * dv; i++) {
-            sh[i] *= decay;
-        }
+        /* Scalar fallback — llama.cpp-aligned formula:
+         * sk = S @ K, d = (V - g*sk) * beta, S = g*S + K*d, o = S @ Q */
 
-        /* Compute sk */
+        /* Compute sk = S @ K (original state, before decay) */
         float* sk = s->delta_sk;
         for (int j = 0; j < dv; j++) {
             float sum = 0.0f;
@@ -13629,20 +14082,20 @@ static void deltanet_forward(tq_model_t* model, tq_state_t* s, int l) {
             sk[j] = sum;
         }
 
-        /* Delta */
+        /* Delta: d = (V - g*sk) * beta */
         float* d_vec = s->delta_dvec;
         for (int j = 0; j < dv; j++) {
-            d_vec[j] = beta_h * (vh[j] - sk[j]);
+            d_vec[j] = beta_h * (vh[j] - decay * sk[j]);
         }
 
-        /* State update */
+        /* State update: S = g*S + K*d */
         for (int i = 0; i < dk; i++) {
             for (int j = 0; j < dv; j++) {
-                sh[i * dv + j] += kh[i] * d_vec[j];
+                sh[i * dv + j] = decay * sh[i * dv + j] + kh[i] * d_vec[j];
             }
         }
 
-        /* Output */
+        /* Output: o = S @ Q */
         float* oh = s->delta_out + h * dv;
         for (int j = 0; j < dv; j++) {
             float sum = 0.0f;
@@ -13775,8 +14228,33 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     int has_q2 = (layer->wq_q2 != NULL);
     int has_q4 = (layer->wq_q4 != NULL);
     int has_gguf = (layer->gguf_wq != NULL);
+    int has_fused_qkv_layer = (layer->gguf_w_qkv != NULL);
     if (has_q2 || has_q4) {
         tq_quantize_row_q8(s->xb, s->xb_q8, s->xb_q8s, dim);
+    }
+
+    /* Gemma 4 KV sharing: last n_kv_shared_layers layers skip K/V projection
+     * and reuse the KV cache from the last non-shared layer of the same
+     * attention type (sliding or full). Only Q is computed fresh. */
+    int kv_shared_skip = 0;
+    int kv_shared_ref_layer = -1;
+    /* KV sharing: enabled for Gemma 4 (required for correct output).
+     * Shared layers skip K/V projection and reuse the KV cache from the
+     * last non-shared layer of the same attention type. */
+    if (c->n_kv_shared_layers > 0) {
+        int shared_start = c->n_layers - c->n_kv_shared_layers;
+        if (l >= shared_start) {
+            kv_shared_skip = 1;
+            /* Find reference layer: last non-shared layer of the same type */
+            int is_sliding_l = (model->layer_is_sliding && model->layer_is_sliding[l]);
+            for (int r = shared_start - 1; r >= 0; r--) {
+                int is_sliding_r = (model->layer_is_sliding && model->layer_is_sliding[r]);
+                if (is_sliding_l == is_sliding_r) {
+                    kv_shared_ref_layer = r;
+                    break;
+                }
+            }
+        }
     }
 
     /* QKV projections (timed as matmul) */
@@ -13789,7 +14267,28 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     if (has_gguf) tq_metal_batch_begin_if_available();
 
     float* gate_q = NULL;
-    if (c->attn_output_gate) {
+    if (has_fused_qkv_layer) {
+        /* Phi-3 fused QKV: one matmul produces [Q | K | V] in a temp
+         * buffer, then memcpy splits into s->q / s->k / s->v.
+         *
+         * Layout (verified against Phi-3.5-mini-Q4_K_M):
+         *   bytes [0          .. q_dim         )  → Q  → s->q
+         *   bytes [q_dim      .. q_dim +   kv  )  → K  → s->k
+         *   bytes [q_dim + kv .. q_dim + 2*kv  )  → V  → s->v
+         *
+         * No GQA in Phi-3.5-mini (n_kv_heads == n_heads), so kv == q,
+         * but we use separate kv_dim variables in case future Phi
+         * variants enable GQA. */
+        int q_out  = n_heads * head_dim;
+        int kv_out = kv_dim;
+        int total_out = q_out + 2 * kv_out;
+        tq_matmul_gguf(s->xb2, s->xb,
+                       layer->gguf_w_qkv, layer->gguf_w_qkv_type,
+                       total_out, dim);
+        memcpy(s->q, s->xb2,                       (size_t)q_out  * sizeof(float));
+        memcpy(s->k, s->xb2 + q_out,               (size_t)kv_out * sizeof(float));
+        memcpy(s->v, s->xb2 + q_out + kv_out,      (size_t)kv_out * sizeof(float));
+    } else if (c->attn_output_gate) {
         int qg_dim = n_heads * head_dim * 2;
         if (layer->wq_q2) {
             TQ_MATMUL_Q2_OR_1BIT(s->xb2, s->xb, layer->wq_q2, layer->wq_q2s, s->xb_q8, s->xb_q8s, qg_dim, dim, model->use_1bit_weights);
@@ -13826,8 +14325,25 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         } else {
             tq_matmul(s->q, s->xb, layer->wq, n_heads * head_dim, dim);
         }
+        /* Apply Q bias (Qwen2/2.5) */
+        if (layer->q_bias) {
+            int q_dim = n_heads * head_dim;
+            for (int i = 0; i < q_dim; i++) s->q[i] += layer->q_bias[i];
+        }
+        if (pos == 0 && l == 0 && getenv("TQ_DEBUG")) {
+            fprintf(stderr, "[DEBUG] layer0 Q[0:4] = %.4f %.4f %.4f %.4f  K[0:4] = ",
+                    s->q[0], s->q[1], s->q[2], s->q[3]);
+        }
     }
-    if (layer->wk_q2) {
+    if (kv_shared_skip && kv_shared_ref_layer >= 0) {
+        /* KV sharing: skip K/V projection for shared layers.
+         * Don't copy K/V — the attention will read directly from the
+         * reference layer's cache (see kv_shared_ref_layer usage below).
+         * This avoids double-applying QK-norm, V-norm, and RoPE on K. */
+    } else if (has_fused_qkv_layer) {
+        /* Already populated s->q/s->k/s->v above — skip the standard
+         * K and V projection blocks. */
+    } else if (layer->wk_q2) {
         TQ_MATMUL_Q2_OR_1BIT(s->k, s->xb, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
     } else if (layer->wk_q4) {
         tq_matmul_q4q2_preq(s->k, layer->wk_q4, layer->wk_q4s, layer->wk_q2, layer->wk_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
@@ -13838,22 +14354,37 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     } else {
         tq_matmul(s->k, s->xb, layer->wk, kv_dim, dim);
     }
-    /* V projection: if V weights are absent (Gemma 4 K=V), copy K to V */
-    int has_v_weights = (layer->wv_q2 || layer->wv_q4 || layer->wv_q8 ||
-                         layer->gguf_wv || layer->wv);
-    if (!has_v_weights) {
-        /* K=V: value is same as key (attention_k_eq_v) */
-        memcpy(s->v, s->k, kv_dim * sizeof(float));
-    } else if (layer->wv_q2) {
-        TQ_MATMUL_Q2_OR_1BIT(s->v, s->xb, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
-    } else if (layer->wv_q4) {
-        tq_matmul_q4q2_preq(s->v, layer->wv_q4, layer->wv_q4s, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
-    } else if (layer->wv_q8) {
-        tq_matmul_q8(s->v, s->xb, layer->wv_q8, layer->wv_q8s, kv_dim, dim);
-    } else if (has_gguf) {
-        tq_matmul_gguf(s->v, s->xb, layer->gguf_wv, layer->gguf_wv_type, kv_dim, dim);
+    /* Apply K bias (Qwen2/2.5) — skip for KV-shared layers (no K projection done) */
+    if (layer->k_bias && !kv_shared_skip && !has_fused_qkv_layer) {
+        for (int i = 0; i < kv_dim; i++) s->k[i] += layer->k_bias[i];
+    }
+    if (pos == 0 && l == 0 && getenv("TQ_DEBUG")) {
+        fprintf(stderr, "%.4f %.4f %.4f %.4f\n", s->k[0], s->k[1], s->k[2], s->k[3]);
+    }
+    if (has_fused_qkv_layer) {
+        /* skip — handled by the fused branch */
     } else {
-        tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
+        /* V projection: if V weights are absent (Gemma 4 K=V), copy K to V */
+        int has_v_weights = (layer->wv_q2 || layer->wv_q4 || layer->wv_q8 ||
+                             layer->gguf_wv || layer->wv);
+        if (!has_v_weights) {
+            /* K=V: value is same as key (attention_k_eq_v) */
+            memcpy(s->v, s->k, kv_dim * sizeof(float));
+        } else if (layer->wv_q2) {
+            TQ_MATMUL_Q2_OR_1BIT(s->v, s->xb, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim, model->use_1bit_weights);
+        } else if (layer->wv_q4) {
+            tq_matmul_q4q2_preq(s->v, layer->wv_q4, layer->wv_q4s, layer->wv_q2, layer->wv_q2s, s->xb_q8, s->xb_q8s, kv_dim, dim);
+        } else if (layer->wv_q8) {
+            tq_matmul_q8(s->v, s->xb, layer->wv_q8, layer->wv_q8s, kv_dim, dim);
+        } else if (has_gguf) {
+            tq_matmul_gguf(s->v, s->xb, layer->gguf_wv, layer->gguf_wv_type, kv_dim, dim);
+        } else {
+            tq_matmul(s->v, s->xb, layer->wv, kv_dim, dim);
+        }
+        /* Apply V bias (Qwen2/2.5) */
+        if (layer->v_bias && has_v_weights) {
+            for (int i = 0; i < kv_dim; i++) s->v[i] += layer->v_bias[i];
+        }
     }
 
     /* Flush batched Q+K+V GPU dispatches before using results */
@@ -13867,41 +14398,63 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                        layer->q_norm, head_dim, c->rms_norm_eps);
         }
     }
-    if (layer->k_norm) {
+    if (layer->k_norm && !kv_shared_skip) {
         for (int h = 0; h < n_kv_heads; h++) {
             tq_rmsnorm(s->k + h * head_dim, s->k + h * head_dim,
                        layer->k_norm, head_dim, c->rms_norm_eps);
         }
     }
 
+    /* Gemma 4: V also gets RMS norm (weight-free, just normalization).
+     * llama.cpp gemma4-iswa.cpp line 92: Vcur = ggml_rms_norm(Vcur, eps)
+     * This is applied when QK-norm is present (same condition). */
+    if (c->is_gemma4 && layer->k_norm && !kv_shared_skip) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            /* Weight-free RMS norm: pass NULL weight → just normalize */
+            float* vh = s->v + h * head_dim;
+            float ss = 0.0f;
+            for (int d = 0; d < head_dim; d++) ss += vh[d] * vh[d];
+            ss = 1.0f / sqrtf(ss / head_dim + c->rms_norm_eps);
+            for (int d = 0; d < head_dim; d++) vh[d] *= ss;
+        }
+    }
+
     /* Apply RoPE (partial or full) */
     if (c->partial_rotary_factor > 0.0f && c->partial_rotary_factor < 1.0f) {
-        /* Partial RoPE: only apply to first partial_rotary_factor * head_dim dims */
+        /* Partial RoPE: only apply to first rope_dim dims of each head.
+         * Qwen3.5: rope_dim=64 out of head_dim=256 → 25% rotation.
+         *
+         * When use_neox_rope is also set (n_heads*head_dim != hidden_dim),
+         * use NeoX pair layout (q[i], q[i+half]) instead of interleaved. */
         int rope_dim = (int)(c->partial_rotary_factor * head_dim);
+        int use_neox = c->use_neox_rope;
+        int half = rope_dim / 2;
         for (int h = 0; h < n_heads; h++) {
             float* qh = s->q + h * head_dim;
-            for (int i = 0; i < rope_dim / 2; i++) {
+            for (int i = 0; i < half; i++) {
                 float freq = 1.0f / powf(c->rope_freq_base, 2.0f * i / rope_dim);
                 float theta = pos * freq;
                 float cos_t = cosf(theta);
                 float sin_t = sinf(theta);
-                float q0 = qh[2 * i];
-                float q1 = qh[2 * i + 1];
-                qh[2 * i]     = q0 * cos_t - q1 * sin_t;
-                qh[2 * i + 1] = q0 * sin_t + q1 * cos_t;
+                int a = use_neox ? i        : 2 * i;
+                int b = use_neox ? i + half  : 2 * i + 1;
+                float q0 = qh[a], q1 = qh[b];
+                qh[a] = q0 * cos_t - q1 * sin_t;
+                qh[b] = q0 * sin_t + q1 * cos_t;
             }
         }
         for (int h = 0; h < n_kv_heads; h++) {
             float* kh = s->k + h * head_dim;
-            for (int i = 0; i < rope_dim / 2; i++) {
+            for (int i = 0; i < half; i++) {
                 float freq = 1.0f / powf(c->rope_freq_base, 2.0f * i / rope_dim);
                 float theta = pos * freq;
                 float cos_t = cosf(theta);
                 float sin_t = sinf(theta);
-                float k0 = kh[2 * i];
-                float k1 = kh[2 * i + 1];
-                kh[2 * i]     = k0 * cos_t - k1 * sin_t;
-                kh[2 * i + 1] = k0 * sin_t + k1 * cos_t;
+                int a = use_neox ? i        : 2 * i;
+                int b = use_neox ? i + half  : 2 * i + 1;
+                float k0 = kh[a], k1 = kh[b];
+                kh[a] = k0 * cos_t - k1 * sin_t;
+                kh[b] = k0 * sin_t + k1 * cos_t;
             }
         }
     } else if (model->rope_freqs && model->rope_freqs_len > 0 &&
@@ -13945,6 +14498,12 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
         if (rope_pairs > model->rope_freqs_len)
             rope_pairs = model->rope_freqs_len;
 
+        /* Gemma 4 / STEP35 uses NeoX-style RoPE: pairs are (q[i], q[i+half])
+         * where half = head_dim/2. Other models use interleaved: (q[2i], q[2i+1]).
+         * The GGUF converter generates rope_freqs assuming NeoX layout. */
+        int neox = c->is_gemma4;
+        int half = head_dim / 2;
+
         for (int h = 0; h < n_heads; h++) {
             float* qh = s->q + h * head_dim;
             for (int i = 0; i < rope_pairs; i++) {
@@ -13953,25 +14512,31 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
                 float theta = pos * freq;
                 float cos_t = cosf(theta);
                 float sin_t = sinf(theta);
-                float q0 = qh[2 * i];
-                float q1 = qh[2 * i + 1];
-                qh[2 * i]     = q0 * cos_t - q1 * sin_t;
-                qh[2 * i + 1] = q0 * sin_t + q1 * cos_t;
+                int a = neox ? i        : 2 * i;
+                int b = neox ? i + half  : 2 * i + 1;
+                float q0 = qh[a];
+                float q1 = qh[b];
+                qh[a] = q0 * cos_t - q1 * sin_t;
+                qh[b] = q0 * sin_t + q1 * cos_t;
             }
             /* Pairs beyond rope_pairs are left unrotated (pass-through) */
         }
-        for (int h = 0; h < n_kv_heads; h++) {
-            float* kh = s->k + h * head_dim;
-            for (int i = 0; i < rope_pairs; i++) {
-                float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)rope_n_dims);
-                float freq = base_freq / model->rope_freqs[i];
-                float theta = pos * freq;
-                float cos_t = cosf(theta);
-                float sin_t = sinf(theta);
-                float k0 = kh[2 * i];
-                float k1 = kh[2 * i + 1];
-                kh[2 * i]     = k0 * cos_t - k1 * sin_t;
-                kh[2 * i + 1] = k0 * sin_t + k1 * cos_t;
+        if (!kv_shared_skip) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = s->k + h * head_dim;
+                for (int i = 0; i < rope_pairs; i++) {
+                    float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)rope_n_dims);
+                    float freq = base_freq / model->rope_freqs[i];
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    int a = neox ? i        : 2 * i;
+                    int b = neox ? i + half  : 2 * i + 1;
+                    float k0 = kh[a];
+                    float k1 = kh[b];
+                    kh[a] = k0 * cos_t - k1 * sin_t;
+                    kh[b] = k0 * sin_t + k1 * cos_t;
+                }
             }
         }
     } else {
@@ -13981,7 +14546,122 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             model->layer_is_sliding && model->layer_is_sliding[l]) {
             rope_base = c->rope_local_base_freq;
         }
-        tq_rope(s->q, s->k, pos, head_dim, n_heads, n_kv_heads, rope_base);
+
+        /* Phi-3 LongRoPE branch.
+         *
+         * When the model ships per-frequency-pair rescaling tables
+         * (rope_factors_short, rope_factors_long) we use them to
+         * extend the RoPE rotation past the original training context.
+         * The rescaling formula:
+         *
+         *   factor[i] = (pos < orig_ctx_len) ? short[i] : long[i]
+         *   freq[i]   = 1 / (rope_base^(2i/head_dim) * factor[i])
+         *   theta     = pos * freq[i]
+         *
+         * `rope_attn_factor` is applied separately as a Q magnitude
+         * scaling AFTER rotation — it compensates for variance growth
+         * past the original context length.
+         *
+         * The factor tables are head_dim/2 long (one entry per RoPE
+         * frequency pair). We assume head_dim/2 == 48 for Phi-3.5-mini;
+         * if a future variant ships a different size we'd want to
+         * track the actual length. */
+        if (c->rope_factors_short || c->rope_factors_long) {
+            /* Phi-3 LongRoPE.
+             *
+             * Phi-3 uses NeoX-style RoPE (non-interleaved pair layout):
+             * pairs are `(q[i], q[i + half])`, not `(q[2i], q[2i+1])`.
+             * Other llama-family GGUFs (SmolLM2, Llama-3) use the same
+             * NeoX rotation in the original model, but the GGUF
+             * converter pre-permutes their separate Q/K weights so the
+             * existing interleaved rotation (`tq_rope`) produces a
+             * mathematically equivalent result. Phi-3's *fused*
+             * `attn_qkv.weight` is NOT permuted at conversion time, so
+             * we apply the rotation in its native NeoX form.
+             *
+             * Per-frequency rescaling (LongRoPE):
+             *   factor[i] = (pos < orig_ctx_len) ? short[i] : long[i]
+             *   freq[i]   = 1 / (rope_base^(2i/head_dim) * factor[i])
+             *
+             * `rope_attn_factor` is a Q magnitude scaling that
+             * compensates for variance growth past the original
+             * context length. Only kicks in past orig_ctx_len. */
+            const float* factors =
+                (pos >= c->rope_orig_ctx_len && c->rope_factors_long)
+                    ? c->rope_factors_long
+                    : (c->rope_factors_short ? c->rope_factors_short
+                                              : c->rope_factors_long);
+            int half = head_dim / 2;
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float freq = base_freq / factors[i];
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float q0 = qh[i];
+                    float q1 = qh[i + half];
+                    qh[i]        = q0 * cos_t - q1 * sin_t;
+                    qh[i + half] = q0 * sin_t + q1 * cos_t;
+                }
+            }
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = s->k + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float base_freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float freq = base_freq / factors[i];
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float k0 = kh[i];
+                    float k1 = kh[i + half];
+                    kh[i]        = k0 * cos_t - k1 * sin_t;
+                    kh[i + half] = k0 * sin_t + k1 * cos_t;
+                }
+            }
+            if (pos >= c->rope_orig_ctx_len && c->rope_attn_factor > 0.0f) {
+                float scale = c->rope_attn_factor;
+                int n_q = n_heads * head_dim;
+                for (int i = 0; i < n_q; i++) s->q[i] *= scale;
+            }
+        } else if (c->use_neox_rope) {
+            /* NeoX-style RoPE: pairs are (q[i], q[i+half]).
+             *
+             * Used for Qwen3 (n_heads*head_dim != hidden_dim) where the
+             * GGUF converter's GQA K-weight permutation creates cross-head
+             * interleaving. NeoX rotation avoids the permutation dependency.
+             * No per-frequency rescaling (unlike Phi-3 LongRoPE above). */
+            int half = head_dim / 2;
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = s->q + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float q0 = qh[i];
+                    float q1 = qh[i + half];
+                    qh[i]        = q0 * cos_t - q1 * sin_t;
+                    qh[i + half] = q0 * sin_t + q1 * cos_t;
+                }
+            }
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = s->k + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float freq = 1.0f / powf(rope_base, 2.0f * i / (float)head_dim);
+                    float theta = pos * freq;
+                    float cos_t = cosf(theta);
+                    float sin_t = sinf(theta);
+                    float k0 = kh[i];
+                    float k1 = kh[i + half];
+                    kh[i]        = k0 * cos_t - k1 * sin_t;
+                    kh[i + half] = k0 * sin_t + k1 * cos_t;
+                }
+            }
+        } else {
+            tq_rope(s->q, s->k, pos, head_dim, n_heads, n_kv_heads, rope_base);
+        }
     }
 
     /* Store K,V in cache.
@@ -13994,8 +14674,13 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     if (use_quant_kv && c->is_gemma4 && c->use_qk_norm) {
         use_quant_kv = 0; /* fall through to FP32 key storage */
     }
-    float* key_cache_layer = s->key_cache + l * kv_layer_stride;
-    if (!use_quant_kv) {
+    /* For KV-shared layers, read K/V from the reference layer's cache */
+    int kv_cache_l = (kv_shared_skip && kv_shared_ref_layer >= 0) ? kv_shared_ref_layer : l;
+    float* key_cache_layer = s->key_cache + kv_cache_l * kv_layer_stride;
+    if (kv_shared_skip) {
+        /* KV-shared layer: don't write to cache — source layer already wrote.
+         * Attention reads from the reference layer's cache via kv_cache_l. */
+    } else if (!use_quant_kv) {
         /* Use cache_kv_dim for position stride (cache allocated with sliding dims).
          * Full layers write fewer floats (kv_dim < cache_kv_dim) but at correct stride. */
         memcpy(key_cache_layer + (size_t)pos * cache_kv_dim, s->k, kv_dim * sizeof(float));
@@ -14074,11 +14759,13 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             f32_to_fp16_vec(s->v, hr_dst, kv_dim);
         }
     } else if (s->use_fp16_values) {
-        uint16_t* val_fp16_layer = s->value_cache_fp16 + l * kv_layer_stride;
-        f32_to_fp16_vec(s->v, val_fp16_layer + (size_t)pos * cache_kv_dim, kv_dim);
+        uint16_t* val_fp16_layer = s->value_cache_fp16 + kv_cache_l * kv_layer_stride;
+        if (!kv_shared_skip)
+            f32_to_fp16_vec(s->v, val_fp16_layer + (size_t)pos * cache_kv_dim, kv_dim);
     } else {
-        float* val_cache_layer = s->value_cache + l * kv_layer_stride;
-        memcpy(val_cache_layer + (size_t)pos * cache_kv_dim, s->v, kv_dim * sizeof(float));
+        float* val_cache_layer = s->value_cache + kv_cache_l * kv_layer_stride;
+        if (!kv_shared_skip)
+            memcpy(val_cache_layer + (size_t)pos * cache_kv_dim, s->v, kv_dim * sizeof(float));
     }
 
     /* Quantize the new key into the quantized cache for integer attention.
@@ -14091,15 +14778,17 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
     /* Quantized KV cache: stride was allocated with sliding dims (c->n_kv_heads, c->head_dim).
      * For hybrid attention full layers with different head_dim, skip quant cache
      * (quant_head_stride doesn't match). Fall back to FP32 cache for those layers. */
+    /* Hybrid attention KV cache: allocated with max(sliding, full) dimensions.
+     * quant_head_stride uses max_head_dim, quant_pos_stride uses max_kv_heads.
+     * Both sliding and full layers can use the quantized cache. (issue #61) */
     int cache_n_kv_heads = c->n_kv_heads;
-    if (head_dim != c->head_dim) {
-        /* Full layer: head_dim mismatch with quant cache allocation.
-         * Disable both quantized and integer attention → use FP32 path. */
+    if (c->full_n_kv_heads > cache_n_kv_heads) cache_n_kv_heads = c->full_n_kv_heads;
+    if (head_dim != c->head_dim && c->full_head_dim == 0) {
+        /* Non-hybrid head_dim mismatch — disable quantized path */
         use_quant_kv = 0;
         use_int_attn = 0;
-        /* Ensure K is stored in FP32 cache (may have been skipped above) */
         memcpy(key_cache_layer + (size_t)pos * cache_kv_dim, s->k, kv_dim * sizeof(float));
-    } else if (use_int_attn && head_dim != c->head_dim) {
+    } else if (use_int_attn && head_dim != c->head_dim && c->full_head_dim == 0) {
         use_int_attn = 0;
         memcpy(key_cache_layer + (size_t)pos * cache_kv_dim, s->k, kv_dim * sizeof(float));
     }
@@ -14618,7 +15307,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             }
         } else if (s->use_fp16_values) {
             /* FP16 value path: convert on the fly during weighted sum */
-            const uint16_t* vfp16_layer = s->value_cache_fp16 + l * kv_layer_stride;
+            const uint16_t* vfp16_layer = s->value_cache_fp16 + kv_cache_l * kv_layer_stride;
             for (int t = 0; t < seq_len; t++) {
                 const uint16_t* vt16 = vfp16_layer + (size_t)t * cache_kv_dim + kv_h * head_dim;
                 float a = atth[t];
@@ -14643,7 +15332,7 @@ static void self_attn_forward(tq_model_t* model, tq_state_t* s, int l, int pos) 
             }
         } else {
             /* FP32 value path (original) */
-            const float* val_cache_layer_fp32 = s->value_cache + l * kv_layer_stride;
+            const float* val_cache_layer_fp32 = s->value_cache + kv_cache_l * kv_layer_stride;
             for (int t = 0; t < seq_len; t++) {
                 const float* vt = val_cache_layer_fp32 + (size_t)t * cache_kv_dim + kv_h * head_dim;
                 float a = atth[t];
@@ -14754,14 +15443,15 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             memcpy(&s->x[i], &bits, 4);
         }
 #endif
-    } else if (model->output_gguf && !model->token_embedding) {
-        /* GGUF embedding: dequant single row on demand (no FP32 table in memory) */
-        int block_elems = tq_ggml_type_blck(model->output_gguf_type);
-        int block_bytes = (int)tq_ggml_type_size(model->output_gguf_type);
+    } else if (model->embed_gguf && !model->token_embedding) {
+        /* GGUF embedding: dequant single row on demand (no FP32 table in memory).
+         * Use embed_gguf (token_embd) which may differ from output_gguf (lm_head). */
+        int block_elems = tq_ggml_type_blck(model->embed_gguf_type);
+        int block_bytes = (int)tq_ggml_type_size(model->embed_gguf_type);
         int n_blocks = dim / block_elems;
         size_t row_bytes = (size_t)n_blocks * block_bytes;
-        const uint8_t* row_ptr = (const uint8_t*)model->output_gguf + (size_t)token * row_bytes;
-        tq_dequant_row_gguf(model->output_gguf_type, row_ptr, s->x, dim);
+        const uint8_t* row_ptr = (const uint8_t*)model->embed_gguf + (size_t)token * row_bytes;
+        tq_dequant_row_gguf(model->embed_gguf_type, row_ptr, s->x, dim);
     } else {
         memcpy(s->x, model->token_embedding + (size_t)token * dim,
                dim * sizeof(float));
@@ -14797,10 +15487,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             s->ple_buf = (float*)calloc((size_t)total_ple, sizeof(float));
         }
 
-        /* Step A: Dequant per_layer_token_embd[token] → temp_embd[8960]
+        /* Step A: Dequant per_layer_token_embd[token] → temp_embd
          * The embedding tensor is [total_ple, vocab_size] in GGUF row-major,
          * so one token's data is at row offset = token * row_bytes. */
-        float temp_embd[8960];  /* stack buffer, total_ple <= 8960 */
+        float temp_embd[16384];  /* stack buffer, E2B=8960, E4B=10752 */
+        if (total_ple > 16384) return s->logits;  /* safety guard */
         {
             size_t type_size = tq_ggml_type_size(model->ple_embedding_type);
             int blck = tq_ggml_type_blck(model->ple_embedding_type);
@@ -14816,11 +15507,11 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             temp_embd[i] *= ple_scale;
         }
 
-        /* Step B: per_layer_model_proj @ embed_raw → temp_proj[8960]
+        /* Step B: per_layer_model_proj @ embed_raw → temp_proj
          * ple_proj is [total_ple, hidden_dim] FP32 (rows=8960, cols=1536).
          * We need: for each output row d in [0, total_ple): dot(ple_proj[d,:], s->x[:])
          * Note: s->x already has the scaled embedding from above. */
-        float temp_proj[8960];
+        float temp_proj[16384];
         tq_matmul(temp_proj, s->x, model->ple_proj, total_ple, dim);
 
         /* Scale by 1/sqrt(hidden_dim) */
@@ -14845,7 +15536,12 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     /* Step 2: Transformer layers */
     int is_gemma3 = (c->model_type == 1);
 
-    for (int l = 0; l < c->n_layers; l++) {
+    /* Debug: limit number of layers for diagnosing per-layer issues */
+    int max_layers = c->n_layers;
+    { const char* ml = getenv("TQ_MAX_LAYERS");
+      if (ml) { int v = atoi(ml); if (v > 0 && v < max_layers) max_layers = v; } }
+
+    for (int l = 0; l < max_layers; l++) {
         tq_layer_weights_t* layer = &model->layers[l];
 
         /* Save input residual for layer_output_scale (Gemma 4).
@@ -14860,9 +15556,19 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         /* Pre-attention/DeltaNet RMSNorm */
         tq_rmsnorm(s->xb, s->x, layer->attn_norm, dim, c->rms_norm_eps);
 
+        if (pos == 0 && l == 0 && getenv("TQ_DEBUG")) {
+            fprintf(stderr, "[DEBUG] layer0 attn_norm_out[0:4] = %.4f %.4f %.4f %.4f\n",
+                    s->xb[0], s->xb[1], s->xb[2], s->xb[3]);
+        }
+
         if (layer->delta_a_log) {
             /* DeltaNet layer */
             deltanet_forward(model, s, l);
+        } else if (layer->gguf_w_qkv) {
+            /* Phi-3 fused QKV — `gguf_wq/wk/wv` are NULL because Q, K
+             * and V are concatenated into `gguf_w_qkv`. self_attn_forward
+             * handles the fused dispatch internally. */
+            self_attn_forward(model, s, l, pos);
         } else if ((layer->wq || layer->wq_q8 || layer->wq_q4 || layer->gguf_wq || layer->wq_q2) &&
                    (layer->wk || layer->wk_q8 || layer->wk_q4 || layer->gguf_wk || layer->wk_q2) &&
                    (layer->wv || layer->wv_q8 || layer->wv_q4 || layer->gguf_wv || layer->wv_q2 ||
@@ -14922,10 +15628,12 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
         /* Dense FFN path — SwiGLU (Qwen3.5, Gemma4/STEP35) or GeGLU (Gemma3).
          * For Gemma 4 STEP35: layers are either MoE or dense, NOT both.
          * For Gemma 3: runs both MoE and dense FFN (shared expert) per layer. */
-        /* Dense FFN: run for non-MoE layers, or for Gemma 3 MoE layers with dense FFN */
+        /* Dense FFN: run for non-MoE layers, or for Gemma 3 MoE layers with dense FFN.
+         * Phi-3 uses gguf_w_up_gate (fused gate||up) instead of separate
+         * gguf_w_gate / gguf_w_up — also accept that as a valid FFN. */
         if ((!did_moe || (is_gemma3 && !c->is_gemma4 && did_moe)) &&
-            (layer->w_gate || layer->w_gate_q8 || layer->w_gate_q4 || layer->w_gate_q2 || layer->gguf_w_gate) &&
-            (layer->w_up || layer->w_up_q8 || layer->w_up_q4 || layer->w_up_q2 || layer->gguf_w_up) &&
+            (layer->w_gate || layer->w_gate_q8 || layer->w_gate_q4 || layer->w_gate_q2 || layer->gguf_w_gate || layer->gguf_w_up_gate) &&
+            (layer->w_up || layer->w_up_q8 || layer->w_up_q4 || layer->w_up_q2 || layer->gguf_w_up || layer->gguf_w_up_gate) &&
             (layer->w_down || layer->w_down_q8 || layer->w_down_q4 || layer->w_down_q2 || layer->gguf_w_down)) {
 
             /* Pre-FFN norm: Gemma 4 dual-FFN uses pre_ffw_norm_2 for the dense FFN.
@@ -14973,6 +15681,30 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                                    s->xb_q8, s->xb_q8s, inter, dim);
                 tq_matmul_q4_preq(s->hb2, layer->w_up_q4, layer->w_up_q4s,
                                    s->xb_q8, s->xb_q8s, inter, dim);
+            } else if (layer->gguf_w_up_gate) {
+                /* Phi-3 fused gate||up: one matmul produces a 2*inter
+                 * float buffer that we then split into gate (s->hb)
+                 * and up (s->hb2).
+                 *
+                 * Layout is `[gate | up]` along the output axis,
+                 * matching HuggingFace's
+                 *   gate, up = gate_up_proj(x).chunk(2, dim=-1)
+                 * The GGUF converter stores the fused tensor as-is, so
+                 * the first `inter` floats are gate and the next
+                 * `inter` are up. Verified end-to-end against
+                 * Phi-3.5-mini-instruct-Q4_K_M:
+                 *   "The capital of France is" → "Paris. The Eiffel
+                 *   Tower, located in the city center, stands as a
+                 *   symbolic landmark..."
+                 *
+                 * s->hb is sized to 2*inter when has_fused_up_gate,
+                 * so the matmul writes both halves into s->hb. Then
+                 * we copy the second half into s->hb2 — no shifting
+                 * of the first half needed. */
+                tq_matmul_gguf(s->hb, s->xb,
+                               layer->gguf_w_up_gate, layer->gguf_w_up_gate_type,
+                               2 * inter, dim);
+                memcpy(s->hb2, s->hb + inter, (size_t)inter * sizeof(float));
             } else if (layer->gguf_w_gate) {
                 tq_metal_batch_begin_if_available();
                 tq_matmul_gguf(s->hb, s->xb, layer->gguf_w_gate, layer->gguf_w_gate_type, inter, dim);
@@ -15077,11 +15809,15 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
             tq_add(s->x, s->x, ple_proj_out, dim);
         }
 
-        /* Gemma 4: layer_output_scale scales the layer's CONTRIBUTIONS (attn + ffn).
-         * Essential for controlling gradient flow — model was trained with these scales. */
-        if (layer->layer_output_scale != 0.0f) {
+        /* Gemma 4: layer_output_scale — simple elementwise multiply.
+         * llama.cpp gemma4-iswa.cpp line 228: cur = ggml_mul(cur, out_scale)
+         * This multiplies the ENTIRE layer output (including residual).
+         * Despite out_scale being small (e.g., 0.0178 for layer 0), this is
+         * correct — the model was trained with this scaling, and each layer
+         * learns to compensate. The alternative "residual-separation" formula
+         * was WRONG (it prevents proper gradient flow as trained). */
+        if (layer->layer_output_scale != 0.0f && !getenv("TQ_NO_LOS")) {
             float los = layer->layer_output_scale;
-            /* Debug: print pre-scale values */
             if (pos == 0 && getenv("TQ_DEBUG") && l < 3) {
                 float maxv = 0, minv = 0;
                 for (int i = 0; i < dim; i++) {
@@ -15091,7 +15827,7 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
                 fprintf(stderr, "[DEBUG] layer%d pre_scale min=%.3f max=%.3f (los=%.4f)\n", l, minv, maxv, los);
             }
             for (int i = 0; i < dim; i++) {
-                s->x[i] = layer_residual_buf[i] + los * (s->x[i] - layer_residual_buf[i]);
+                s->x[i] *= los;
             }
         }
 
@@ -15139,12 +15875,22 @@ float* tq_forward(tq_model_t* model, tq_state_t* s, int token, int pos) {
     TQ_PROF_STOP(_tp, matmul_ns);
 
     if (pos <= 1 && getenv("TQ_DEBUG")) {
-        /* Print top-5 logits for debugging */
+        /* Print logits for debugging — include key token IDs */
         fprintf(stderr, "[DEBUG] pos=%d logits[0:8] = ", pos);
         for (int i = 0; i < 8; i++) fprintf(stderr, "%.2f ", s->logits[i]);
-        float max_l = s->logits[0]; int max_i = 0;
-        for (int i = 1; i < c->vocab_size; i++) { if (s->logits[i] > max_l) { max_l = s->logits[i]; max_i = i; } }
-        fprintf(stderr, "... max=%.2f @%d\n", max_l, max_i);
+        /* Token 100 = <|channel> (Gemma 4 thinking start) */
+        if (c->vocab_size > 100)
+            fprintf(stderr, " tok100=%.2f", s->logits[100]);
+        /* Top-5 */
+        int top5[5] = {0,0,0,0,0}; float top5v[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+        for (int i = 0; i < c->vocab_size; i++) {
+            int minj = 0;
+            for (int j = 1; j < 5; j++) if (top5v[j] < top5v[minj]) minj = j;
+            if (s->logits[i] > top5v[minj]) { top5[minj] = i; top5v[minj] = s->logits[i]; }
+        }
+        fprintf(stderr, " ... top5: ");
+        for (int j = 0; j < 5; j++) fprintf(stderr, "%d(%.1f) ", top5[j], top5v[j]);
+        fprintf(stderr, "\n");
     }
 
     /* Final logit soft-capping: logits = cap * tanh(logits / cap) */
@@ -15403,12 +16149,56 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     int prompt_tokens[4096];
     int n_prompt = 0;
 
+    /* Debug: inject exact token IDs (bypass tokenizer) for comparison.
+     * TQ_INJECT_TOKENS="2,105,9731,107,..." */
+    {
+        const char* inject = getenv("TQ_INJECT_TOKENS");
+        if (inject) {
+            char buf[4096];
+            strncpy(buf, inject, sizeof(buf)-1); buf[sizeof(buf)-1] = 0;
+            char* tok = strtok(buf, ",");
+            while (tok && n_prompt < 4096) {
+                prompt_tokens[n_prompt++] = atoi(tok);
+                tok = strtok(NULL, ",");
+            }
+            fprintf(stderr, "[DEBUG] injected %d tokens\n", n_prompt);
+            goto tq_gen_skip_tokenize;
+        }
+    }
+
     if (tokenizer && prompt) {
-        /* Gemma models: prepend BOS=2 (required by both Gemma 3 and 4 architectures).
-         * Qwen3.5: no BOS. */
+        /* Decide whether to prepend BOS:
+         *   - Gemma:           always (model_type == 1)
+         *   - Phi-3 / Llama:   yes if `<s>` is in the vocab (id 1).
+         *     Phi-3 in particular degrades into garbage without it.
+         *   - Qwen3.5 / GPT-2 BPE: no native BOS, skip.
+         * tq_encode itself handles the lookup chain for known names. */
         int add_bos = 0;
         if (model->config.model_type == 1) {
-            add_bos = 1; /* All Gemma models need BOS */
+            add_bos = 1;
+        } else {
+            int s_id = -1;
+            for (int i = 0; i < tokenizer->vocab_size && i < 8; i++) {
+                if (tokenizer->vocab[i] && strcmp(tokenizer->vocab[i], "<s>") == 0) {
+                    s_id = i; break;
+                }
+            }
+            if (s_id >= 0) add_bos = 1;
+            /* Llama 3: <|begin_of_text|> is at high token ID (128000+), not in first 8 */
+            if (!add_bos) {
+                for (int i = 128000; i < tokenizer->vocab_size && i < 128010; i++) {
+                    if (tokenizer->vocab[i] && strcmp(tokenizer->vocab[i], "<|begin_of_text|>") == 0) {
+                        add_bos = 1; break;
+                    }
+                }
+            }
+        }
+        /* Skip BOS when the prompt already starts with a special token
+         * (e.g., <|im_start|> for ChatML, <|user|> for Phi-3). Adding
+         * BOS before a chat template confuses Qwen3 and other models
+         * that expect the template to be the first token. */
+        if (add_bos && prompt && prompt[0] == '<' && prompt[1] == '|') {
+            add_bos = 0;
         }
         n_prompt = tq_encode(tokenizer, prompt, prompt_tokens, 4096, add_bos);
     } else {
@@ -15417,6 +16207,7 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         n_prompt = 1;
     }
 
+tq_gen_skip_tokenize:
     if (n_prompt <= 0) {
         prompt_tokens[0] = (model->config.model_type == 1) ? 2 : 1;
         n_prompt = 1;
@@ -15470,6 +16261,15 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         }
     }
 
+    /* Suppress <think> token to disable thinking/reasoning mode.
+     * Qwen3.5 models default to thinking mode which adds many tokens
+     * of internal reasoning before the actual answer. By suppressing
+     * the <think> special token, the model goes directly to answering. */
+    int think_token_id = tokenizer ? str_lookup(tokenizer, "<think>") : -1;
+    if (think_token_id >= 0 && think_token_id < vocab_size) {
+        state->logits[think_token_id] = -1e30f;
+    }
+
     /* Sample first generated token. The seed is configurable via
      * config->rng_seed (default 42); 0 falls back to 42 so existing
      * callers that never set rng_seed get bit-identical behaviour. */
@@ -15486,6 +16286,7 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
     int generated = 0;
     int output_pos = 0;
     int prev_token = prompt_tokens[n_prompt - 1];
+    int seen_nonwhitespace = 0; /* track whether we've emitted non-whitespace yet */
 
     /* EOS token IDs — check common values across model families.
      * Qwen3.5: eos = 248044 (<|endoftext|>), 248046 (<|im_end|>)
@@ -15581,6 +16382,19 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
                     strstr(piece, "<1st>") || strstr(piece, "<2nd>") || strstr(piece, "<3rd>")) {
                     piece = "";
                 }
+                /* Skip leading whitespace-only tokens (Qwen3.5 thinking mode
+                 * produces <think>...</think> which gets filtered, but the
+                 * surrounding newlines remain as plain text tokens).
+                 * Only skip before any non-whitespace content has been emitted. */
+                if (!seen_nonwhitespace && piece[0] != '\0') {
+                    const char* p = piece;
+                    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+                    if (*p == '\0') {
+                        piece = ""; /* all whitespace — skip */
+                    } else {
+                        seen_nonwhitespace = 1;
+                    }
+                }
             }
             if (should_stop) break;
 
@@ -15602,7 +16416,11 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
         prev_token = next_token;
         tq_forward(model, state, next_token, pos);
         pos++;
-        generated++;
+        /* Only count tokens that produced visible output toward the limit.
+         * Leading whitespace from thinking mode should not consume the budget. */
+        if (seen_nonwhitespace) {
+            generated++;
+        }
 
         /* Apply repetition penalty before sampling */
         if (rep_penalty > 1.0f) {
@@ -15618,6 +16436,11 @@ int tq_generate(tq_model_t* model, tq_tokenizer_t* tokenizer,
                         state->logits[tok] *= rep_penalty;
                 }
             }
+        }
+
+        /* Suppress <think> token to prevent entering thinking mode */
+        if (think_token_id >= 0 && think_token_id < vocab_size) {
+            state->logits[think_token_id] = -1e30f;
         }
 
         /* Sample next token */
@@ -15684,6 +16507,8 @@ int tq_generate_continue(tq_model_t* model,
     int n_new = 0;
     if (tokenizer && prompt) {
         int add_bos = (model->config.model_type == 1) ? 1 : 0;
+        /* Skip BOS for chat-template prompts (same logic as tq_generate) */
+        if (add_bos && prompt[0] == '<' && prompt[1] == '|') add_bos = 0;
         n_new = tq_encode(tokenizer, prompt, new_tokens, max_prompt, add_bos);
     }
     if (n_new <= 0) {
@@ -15691,17 +16516,23 @@ int tq_generate_continue(tq_model_t* model,
         n_new = 1;
     }
 
-    /* Sliding window: drop oldest prompt tokens if the new prompt would
-     * leave no room for max_tokens of generation. Keeps the most recent
-     * tokens. Forces full reprefill since the prefix shifted. */
+    /* Overflow check: reject prompts that won't fit. The previous
+     * behavior was to silently drop oldest tokens via a sliding window,
+     * but that desynced any cached_text the higher-level wrapper held
+     * (cached_text claimed the full prompt, while cached_tokens only
+     * had the truncated tail — next turn's text-prefix match would
+     * map text bytes to the wrong KV positions). Returning -2 lets the
+     * caller decide (reset chat, show error). */
     int reserve = config->max_tokens > 0 ? config->max_tokens : 256;
     int budget  = max_prompt - reserve - 32;
     if (budget < 64) budget = 64;
     if (n_new > budget) {
-        int drop = n_new - budget;
-        memmove(new_tokens, new_tokens + drop, (size_t)budget * sizeof(int));
-        n_new = budget;
-        *n_cached_io = 0;
+        free(new_tokens);
+        if (getenv("TQ_CHAT_DEBUG")) {
+            fprintf(stderr, "[chat] OVERFLOW n_new=%d budget=%d max=%d\n",
+                    n_new, budget, max_prompt);
+        }
+        return -2;
     }
 
     /* Find longest common prefix with the cached tokens.
@@ -15848,6 +16679,455 @@ int tq_generate_continue(tq_model_t* model,
     return generated;
 }
 
+/* ============================================================================
+ * tq_generate_chat_text — text-prefix matching for chat reuse
+ *
+ * Solves the BPE re-tokenization issue: when the model generates response
+ * tokens via sample_topp, those token IDs may not match what tq_encode()
+ * produces from the same response text in the next turn's prompt. The
+ * token-level LCP in tq_generate_continue truncates at that boundary.
+ *
+ * This function tracks the *text* of the last prompt+response. On the next
+ * call, if the new prompt starts with cached_text byte-for-byte, the entire
+ * cached state is valid — tokenize ONLY the new SUFFIX text and prefill
+ * those tokens at positions [n_cached..]. No LCP, no truncation.
+ *
+ * Pass cached_text_io == NULL to disable text-prefix tracking.
+ * ============================================================================ */
+
+/* ChatML / template-marker filter ----------------------------------------
+ *
+ * The model can generate template tokens like `<|im_start|>`, `<|im_end|>`,
+ * `<end_of_turn>`, etc. as REGULAR text bytes (not special tokens). When
+ * that happens the BPE tokenizer fragments them across multiple tokens,
+ * and a per-token strstr check (like the existing `should_stop` logic)
+ * never matches. The user sees the marker leak into their stream.
+ *
+ * This filter holds the most recent CHAT_LOOKAHEAD bytes of generated
+ * text in `pending` and only flushes bytes that are guaranteed to NOT
+ * be the start of a marker. When a full marker is matched:
+ *   - `<|im_start|>` at the very beginning of the response → header
+ *     skip mode (drop until next '\n'). The model is regurgitating the
+ *     `<|im_start|>assistant\n` prefix that the prompt template already
+ *     contains; we silently strip it.
+ *   - any END marker → emit the prefix, drop the marker and everything
+ *     after, set `stop_requested` so the generation loop can break.
+ *
+ * Cost: each token is delayed by ~CHAT_LOOKAHEAD bytes worth of stream.
+ * For typical English (3-4 chars/token), that's ~8-10 tokens of latency
+ * before the first token shows up. After that, streaming is steady-state
+ * with the same latency window.
+ * ----------------------------------------------------------------------- */
+#define CHAT_PENDING_CAP 128
+#define CHAT_LOOKAHEAD   32
+
+typedef struct {
+    char*  buf;
+    size_t len;
+    size_t cap;
+    int    tainted;          /* 1 if accumulation ever failed → buf incomplete */
+    /* Lookahead filter state */
+    char   pending[CHAT_PENDING_CAP];
+    int    pending_len;
+    int    in_header;        /* skipping <|im_start|>...\n */
+    int    stop_requested;   /* end marker hit → caller should break */
+    void (*user_cb)(const char*, void*);
+    void*  user_data;
+} chat_accum_t;
+
+/* Emit n bytes from `p` to BOTH the user callback and accum.buf.
+ * Used after the marker filter has decided the bytes are safe. */
+static void chat_accum_emit(chat_accum_t* ctx, const char* p, int n) {
+    if (n <= 0) return;
+    /* User callback gets a NUL-terminated copy. */
+    char tmp[CHAT_PENDING_CAP + 1];
+    if (n > CHAT_PENDING_CAP) n = CHAT_PENDING_CAP;
+    memcpy(tmp, p, (size_t)n);
+    tmp[n] = '\0';
+    if (ctx->user_cb) ctx->user_cb(tmp, ctx->user_data);
+    if (ctx->tainted) return;
+    if (ctx->len + (size_t)n + 1 > ctx->cap) {
+        size_t new_cap = (ctx->cap + (size_t)n + 64) * 2;
+        char* nb = (char*)realloc(ctx->buf, new_cap);
+        if (!nb) { ctx->tainted = 1; return; }
+        ctx->buf = nb; ctx->cap = new_cap;
+    }
+    memcpy(ctx->buf + ctx->len, tmp, (size_t)n);
+    ctx->len += (size_t)n;
+    ctx->buf[ctx->len] = '\0';
+}
+
+/* Drop n bytes from the front of pending. */
+static void chat_accum_drop(chat_accum_t* ctx, int n) {
+    if (n <= 0) return;
+    if (n > ctx->pending_len) n = ctx->pending_len;
+    memmove(ctx->pending, ctx->pending + n,
+            (size_t)(ctx->pending_len - n));
+    ctx->pending_len -= n;
+}
+
+/* Find first occurrence of marker `m` in haystack[0..hlen). -1 if none. */
+static int chat_find_marker(const char* h, int hlen, const char* m) {
+    int mlen = (int)strlen(m);
+    if (hlen < mlen) return -1;
+    for (int p = 0; p + mlen <= hlen; p++) {
+        if (h[p] == m[0] && memcmp(h + p, m, (size_t)mlen) == 0) return p;
+    }
+    return -1;
+}
+
+/* Markers that signal "stop generating now". <|im_start|> is included
+ * because if the model emits it MID-response (after generating real
+ * content), it's hallucinating a new chat turn and we should stop. */
+static const char* const CHAT_END_MARKERS[] = {
+    "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|endoftext|>",
+    "<|im_start|>", "<|start_header_id|>", "<|eom_id|>",
+    "</s>", "<|end|>",
+    NULL,
+};
+
+static void chat_accum_callback(const char* tok, void* u) {
+    chat_accum_t* ctx = (chat_accum_t*)u;
+    if (!tok || ctx->stop_requested) return;
+    int tlen = (int)strlen(tok);
+    if (tlen == 0) return;
+
+    /* Make room. If pending would overflow, flush the safe prefix
+     * (everything but the last LOOKAHEAD bytes) first. */
+    if (ctx->pending_len + tlen > CHAT_PENDING_CAP) {
+        int emit = ctx->pending_len - CHAT_LOOKAHEAD;
+        if (emit > 0) {
+            if (!ctx->in_header) chat_accum_emit(ctx, ctx->pending, emit);
+            chat_accum_drop(ctx, emit);
+        }
+    }
+    /* Pathological: token bigger than the whole pending buffer.
+     * Emit pending + token raw and bail (no marker scan). */
+    if (tlen > CHAT_PENDING_CAP) {
+        if (!ctx->in_header) {
+            chat_accum_emit(ctx, ctx->pending, ctx->pending_len);
+            chat_accum_emit(ctx, tok, tlen);
+        }
+        ctx->pending_len = 0;
+        return;
+    }
+    memcpy(ctx->pending + ctx->pending_len, tok, (size_t)tlen);
+    ctx->pending_len += tlen;
+
+    /* State machine: drain pending as far as possible. */
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        if (ctx->in_header) {
+            int nl = -1;
+            for (int i = 0; i < ctx->pending_len; i++) {
+                if (ctx->pending[i] == '\n') { nl = i; break; }
+            }
+            if (nl >= 0) {
+                chat_accum_drop(ctx, nl + 1);
+                ctx->in_header = 0;
+                progress = 1;
+            } else {
+                /* No newline yet — drop everything (it's all in header) */
+                ctx->pending_len = 0;
+                return;
+            }
+        }
+        /* Scan for the EARLIEST end marker in pending. */
+        int em_pos = -1;
+        const char* em_str = NULL;
+        for (int i = 0; CHAT_END_MARKERS[i]; i++) {
+            int p = chat_find_marker(ctx->pending, ctx->pending_len,
+                                       CHAT_END_MARKERS[i]);
+            if (p >= 0 && (em_pos < 0 || p < em_pos)) {
+                em_pos = p; em_str = CHAT_END_MARKERS[i];
+            }
+        }
+        if (em_pos >= 0) {
+            /* Special case: <|im_start|> at the very start of the
+             * response → strip the header (don't stop). The model is
+             * echoing the chat-template prefix. */
+            if (em_pos == 0 && ctx->len == 0 && em_str &&
+                strcmp(em_str, "<|im_start|>") == 0) {
+                chat_accum_drop(ctx, 12); /* len("<|im_start|>") */
+                ctx->in_header = 1;
+                progress = 1;
+                continue;
+            }
+            /* Otherwise: emit clean prefix, discard rest, request stop. */
+            if (em_pos > 0) {
+                chat_accum_emit(ctx, ctx->pending, em_pos);
+            }
+            ctx->pending_len = 0;
+            ctx->stop_requested = 1;
+            return;
+        }
+    }
+
+    /* Safe portion: keep the trailing LOOKAHEAD bytes (any in-flight
+     * marker is at most this long), flush the rest. */
+    if (!ctx->in_header && ctx->pending_len > CHAT_LOOKAHEAD) {
+        int emit = ctx->pending_len - CHAT_LOOKAHEAD;
+        chat_accum_emit(ctx, ctx->pending, emit);
+        chat_accum_drop(ctx, emit);
+    }
+}
+
+/* Generation finished — flush any leftover pending bytes. Called once
+ * before reading accum.buf for the cached_text update. */
+static void chat_accum_finish(chat_accum_t* ctx) {
+    if (ctx->in_header) {
+        /* Stuck mid-header (no '\n' arrived) → drop the rest. */
+        ctx->pending_len = 0;
+        return;
+    }
+    if (ctx->pending_len > 0) {
+        chat_accum_emit(ctx, ctx->pending, ctx->pending_len);
+        ctx->pending_len = 0;
+    }
+}
+
+int tq_generate_chat_text(tq_model_t* model,
+                           tq_tokenizer_t* tokenizer,
+                           tq_state_t* state,
+                           const char* prompt,
+                           tq_gen_config_t* config,
+                           char** cached_text_io,
+                           int** cached_tokens_io,
+                           int*  n_cached_io,
+                           int*  cached_capacity_io,
+                           char* output, int output_size) {
+    if (!model || !state || !config || !cached_tokens_io || !n_cached_io || !cached_capacity_io || !prompt) {
+        return -1;
+    }
+
+    int matched_text_len = 0;
+    int prefix_pos = 0;
+
+    if (cached_text_io && *cached_text_io && *n_cached_io > 0) {
+        size_t cached_len = strlen(*cached_text_io);
+        if (cached_len > 0 && strncmp(*cached_text_io, prompt, cached_len) == 0) {
+            matched_text_len = (int)cached_len;
+            prefix_pos = *n_cached_io;
+        }
+    }
+
+    chat_accum_t accum;
+    memset(&accum, 0, sizeof(accum));
+    accum.user_cb = config->on_token;
+    accum.user_data = config->user_data;
+    void (*orig_cb)(const char*, void*) = config->on_token;
+    void*  orig_ud = config->user_data;
+    config->on_token = chat_accum_callback;
+    config->user_data = &accum;
+
+    int generated = 0;
+
+    if (matched_text_len > 0) {
+        const char* suffix = prompt + matched_text_len;
+        int max_prompt = model->config.max_seq_len > 0
+                           ? model->config.max_seq_len : 4096;
+        int* suffix_toks = (int*)malloc((size_t)max_prompt * sizeof(int));
+        if (!suffix_toks) {
+            config->on_token = orig_cb; config->user_data = orig_ud;
+            return -1;
+        }
+        int n_suffix = 0;
+        if (*suffix != '\0') {
+            n_suffix = tq_encode(tokenizer, suffix, suffix_toks, max_prompt, 0);
+            if (n_suffix < 0) n_suffix = 0;
+        }
+
+        /* Context overflow: return -2 instead of falling back to a
+         * dangerous full reprefill. The state still has stale KV at
+         * positions [n_new..prefix_pos) that would corrupt later tokens.
+         * Caller should reset the chat and retry. */
+        int reserve = config->max_tokens > 0 ? config->max_tokens : 256;
+        if (prefix_pos + n_suffix + reserve + 32 > max_prompt) {
+            free(suffix_toks);
+            config->on_token = orig_cb; config->user_data = orig_ud;
+            if (accum.buf) free(accum.buf);
+            if (getenv("TQ_CHAT_DEBUG")) {
+                fprintf(stderr,
+                    "[chat-text] OVERFLOW prefix_pos=%d n_suffix=%d reserve=%d max=%d\n",
+                    prefix_pos, n_suffix, reserve, max_prompt);
+            }
+            return -2;
+        }
+
+        int needed = prefix_pos + n_suffix + reserve + 16;
+        if (*cached_capacity_io < needed) {
+            int new_cap = needed < 4096 ? 4096 : needed;
+            int* nb = (int*)realloc(*cached_tokens_io, (size_t)new_cap * sizeof(int));
+            if (!nb) { free(suffix_toks); config->on_token = orig_cb; config->user_data = orig_ud; return -1; }
+            *cached_tokens_io = nb;
+            *cached_capacity_io = new_cap;
+        }
+
+        int* cached = *cached_tokens_io;
+        for (int i = 0; i < n_suffix; i++) {
+            cached[prefix_pos + i] = suffix_toks[i];
+            tq_forward(model, state, suffix_toks[i], prefix_pos + i);
+        }
+        *n_cached_io = prefix_pos + n_suffix;
+        free(suffix_toks);
+
+        if (getenv("TQ_CHAT_DEBUG")) {
+            fprintf(stderr, "[chat-text] FAST text_match=%d new_suffix_tokens=%d\n",
+                    matched_text_len, n_suffix);
+        }
+
+        /* Generation loop — mirrors tq_generate_continue including
+         * rep_penalty (which the fast path was silently dropping). */
+        int vocab_size = model->config.vocab_size;
+        int n_cached = *n_cached_io;
+        int pos = n_cached;
+        int prev_token = n_cached > 0 ? cached[n_cached - 1] : 1;
+
+        float rep_penalty = config->rep_penalty;
+        int rep_window = config->rep_window;
+        if (rep_window > 64) rep_window = 64;
+        int recent_tokens[64];
+        int recent_count = 0;
+        for (int i = (n_cached > rep_window ? n_cached - rep_window : 0); i < n_cached; i++) {
+            recent_tokens[recent_count % 64] = cached[i];
+            recent_count++;
+        }
+        if (rep_penalty > 1.0f) {
+            int window = recent_count < rep_window ? recent_count : rep_window;
+            for (int r = 0; r < window; r++) {
+                int idx = (recent_count - 1 - r) % 64;
+                if (idx < 0) idx += 64;
+                int tok = recent_tokens[idx];
+                if (tok >= 0 && tok < vocab_size && state->logits) {
+                    if (state->logits[tok] > 0) state->logits[tok] /= rep_penalty;
+                    else                         state->logits[tok] *= rep_penalty;
+                }
+            }
+        }
+
+        uint64_t rng_state = config->rng_seed
+            ? (uint64_t)config->rng_seed : (uint64_t)time(NULL);
+        int next_token = tq_sample_topp(state->logits, vocab_size,
+                                         config->temperature, config->top_p,
+                                         &rng_state);
+
+        int output_pos = 0;
+        int eos_tokens[] = { 1, 2, 106, 128001, 128006, 128007, 128008, 128009, 248044, 248046 };
+        int n_eos = sizeof(eos_tokens) / sizeof(eos_tokens[0]);
+
+        while (generated < config->max_tokens) {
+            int is_eos = 0;
+            for (int e = 0; e < n_eos; e++) {
+                if (next_token == eos_tokens[e]) { is_eos = 1; break; }
+            }
+            if (is_eos) break;
+            if (pos >= model->config.max_seq_len) break;
+
+            const char* piece = tokenizer ? tq_decode(tokenizer, prev_token, next_token) : "";
+            int should_stop = 0;
+            if (piece) {
+                if (strstr(piece, "<|im_end|>") || strstr(piece, "<|eot_id|>") ||
+                    strstr(piece, "<|start_header_id|>")) {
+                    should_stop = 1; piece = "";
+                }
+            }
+            if (should_stop) break;
+
+            int piece_len = (int)strlen(piece ? piece : "");
+            if (config->on_token && piece) config->on_token(piece, config->user_data);
+            /* The chat_accum filter may have detected an end marker
+             * spanning multiple tokens — break before forwarding more. */
+            if (accum.stop_requested) break;
+            if (output && piece && output_pos + piece_len < output_size - 1) {
+                memcpy(output + output_pos, piece, piece_len);
+                output_pos += piece_len;
+            }
+
+            if (n_cached < *cached_capacity_io) {
+                cached[n_cached++] = next_token;
+                *n_cached_io = n_cached;
+            }
+
+            prev_token = next_token;
+            tq_forward(model, state, next_token, pos);
+            pos++;
+            generated++;
+
+            if (rep_penalty > 1.0f) {
+                int window = recent_count < rep_window ? recent_count : rep_window;
+                for (int r = 0; r < window; r++) {
+                    int idx = (recent_count - 1 - r) % 64;
+                    if (idx < 0) idx += 64;
+                    int tok = recent_tokens[idx];
+                    if (tok >= 0 && tok < vocab_size) {
+                        if (state->logits[tok] > 0) state->logits[tok] /= rep_penalty;
+                        else                         state->logits[tok] *= rep_penalty;
+                    }
+                }
+            }
+
+            next_token = tq_sample_topp(state->logits, vocab_size,
+                                         config->temperature, config->top_p,
+                                         &rng_state);
+            recent_tokens[recent_count % 64] = next_token;
+            recent_count++;
+        }
+
+        if (output && output_size > 0) {
+            output[output_pos < output_size ? output_pos : output_size - 1] = '\0';
+        }
+    } else {
+        if (getenv("TQ_CHAT_DEBUG")) {
+            fprintf(stderr, "[chat-text] SLOW no text-prefix match, full tokenize\n");
+        }
+        generated = tq_generate_continue(
+            model, tokenizer, state, prompt, config,
+            cached_tokens_io, n_cached_io, cached_capacity_io,
+            output, output_size);
+    }
+
+    /* Drain the marker filter's lookahead buffer before reading
+     * accum.buf for the cached_text update. Without this, the last
+     * ~32 bytes of clean output would be silently lost. */
+    chat_accum_finish(&accum);
+
+    config->on_token = orig_cb;
+    config->user_data = orig_ud;
+
+    /* Update cached_text only if we know the KV state corresponds
+     * EXACTLY to (prompt + accum.buf):
+     *   - generated >= 0: generation didn't error out
+     *   - !accum.tainted: every generated token was captured
+     * On any failure, clear cached_text so the next call falls through
+     * to the slow path with a clean slate instead of trusting bytes
+     * that don't match the KV cache. */
+    if (cached_text_io) {
+        if (generated < 0 || accum.tainted) {
+            if (*cached_text_io) { free(*cached_text_io); *cached_text_io = NULL; }
+        } else {
+            size_t plen = strlen(prompt);
+            size_t glen = accum.len;
+            size_t new_len = plen + glen;
+            char* nt = (char*)malloc(new_len + 1);
+            if (nt) {
+                memcpy(nt, prompt, plen);
+                if (glen > 0 && accum.buf) memcpy(nt + plen, accum.buf, glen);
+                nt[new_len] = '\0';
+                if (*cached_text_io) free(*cached_text_io);
+                *cached_text_io = nt;
+            } else {
+                /* malloc failed → can't refresh cached_text. Clearing it
+                 * is safer than leaving the previous (now stale) value. */
+                if (*cached_text_io) { free(*cached_text_io); *cached_text_io = NULL; }
+            }
+        }
+    }
+    if (accum.buf) free(accum.buf);
+
+    return generated;
+}
+
 // ============================================================================
 
 // ============================================================================
@@ -15941,6 +17221,14 @@ quant_ctx* quant_new(quant_model* model, const quant_config* config) {
             gc.kv_type = TQ_TYPE_UNIFORM_3B;
             gc.value_quant_bits = 4;
             gc.delta_kv = 1;
+        } else if (config->kv_compress == 0) {
+            /* Explicitly disable KV compression. Without this, the
+             * default kv_type (TQ_TYPE_UNIFORM_4B from tq_default_gen_config)
+             * stays active even when the user requested no compression.
+             * This breaks Qwen3 (GQA + head_dim != hidden_dim/n_heads)
+             * where the quantized key cache path has stride mismatches. */
+            gc.kv_type = TQ_TYPE_COUNT;  /* sentinel = no compression */
+            gc.value_quant_bits = 0;
         }
     }
 
@@ -16022,19 +17310,89 @@ int quant_generate(quant_ctx* ctx, const char* prompt,
     ctx->config.on_token = on_token;
     ctx->config.user_data = user_data;
 
-    /* Reset state for new generation */
-    tq_free_state(ctx->state);
-    ctx->state = tq_create_state_ex(&ctx->model->config,
-                                     ctx->config.kv_type,
-                                     ctx->config.value_quant_bits);
-    if (!ctx->state) return -1;
+    /* If KV cache was loaded via load_context, preserve it.
+     * The loaded state has valid KV at positions [0, n_ctx_tokens).
+     * New prompt tokens will be prefilled at positions [n_ctx_tokens, ...).
+     * This enables "read once, query forever": load a document's KV cache
+     * and generate answers without re-prefilling the document.
+     *
+     * If n_ctx_tokens == 0 (no loaded context), reset as before. */
+    int continue_from_loaded = (ctx->n_ctx_tokens > 0 && ctx->state != NULL);
 
-    if (ctx->model->config.is_moe && ctx->model->moe_config) {
+    if (!continue_from_loaded) {
+        /* Fresh state for new generation */
+        tq_free_state(ctx->state);
+        ctx->state = tq_create_state_ex(&ctx->model->config,
+                                         ctx->config.kv_type,
+                                         ctx->config.value_quant_bits);
+        if (!ctx->state) return -1;
+    }
+
+    if (!continue_from_loaded && ctx->model->config.is_moe && ctx->model->moe_config) {
         ctx->state->moe_state = tq_moe_create_state(
             (const tq_moe_config_t*)ctx->model->moe_config,
             ctx->model->config.hidden_dim);
     }
 
+    if (continue_from_loaded) {
+        /* Continue from loaded KV cache: prefill new prompt tokens
+         * at positions [n_ctx_tokens, ...], then generate. */
+        int start_pos = ctx->n_ctx_tokens;
+        int prompt_tokens[4096];
+        int n_prompt = 0;
+
+        if (ctx->tokenizer && prompt) {
+            n_prompt = tq_encode(ctx->tokenizer, prompt, prompt_tokens, 4096, 0);
+        }
+        if (n_prompt <= 0) return 0;
+
+        /* Prefill new tokens starting after loaded context */
+        for (int i = 0; i < n_prompt; i++) {
+            tq_forward(ctx->model, ctx->state, prompt_tokens[i], start_pos + i);
+        }
+        int pos = start_pos + n_prompt;
+
+        /* Generate loop */
+        int vocab_size = ctx->model->config.vocab_size;
+        unsigned long long rng_state = 42ULL;
+        int next_token = tq_sample_topp(ctx->state->logits, vocab_size,
+                                         ctx->config.temperature, ctx->config.top_p,
+                                         &rng_state);
+        int generated = 0;
+        int prev_token = (n_prompt > 0) ? prompt_tokens[n_prompt - 1] : 1;
+        int eos_tokens[] = { 1, 2, 106, 128001, 128009, 248044, 248046 };
+        int n_eos = sizeof(eos_tokens) / sizeof(eos_tokens[0]);
+
+        while (generated < ctx->config.max_tokens) {
+            int is_eos = 0;
+            for (int e = 0; e < n_eos; e++)
+                if (next_token == eos_tokens[e]) { is_eos = 1; break; }
+            if (is_eos) break;
+
+            if (ctx->tokenizer) {
+                const char* piece = tq_decode(ctx->tokenizer, prev_token, next_token);
+                if (piece && ctx->config.on_token) {
+                    /* Filter template tokens */
+                    if (!strstr(piece, "<|im_end|>") && !strstr(piece, "<|end|>") &&
+                        !strstr(piece, "<|im_start|>"))
+                        ctx->config.on_token(piece, ctx->config.user_data);
+                }
+            }
+
+            prev_token = next_token;
+            tq_forward(ctx->model, ctx->state, next_token, pos);
+            pos++;
+            generated++;
+
+            next_token = tq_sample_topp(ctx->state->logits, vocab_size,
+                                         ctx->config.temperature, ctx->config.top_p,
+                                         &rng_state);
+        }
+        ctx->n_ctx_tokens = pos;
+        return generated;
+    }
+
+    /* Standard path: create fresh state via tq_generate */
     char output[65536];
     int n = tq_generate(ctx->model, ctx->tokenizer, prompt,
                         &ctx->config, output, sizeof(output));
@@ -16073,6 +17431,81 @@ char* quant_ask(quant_ctx* ctx, const char* prompt) {
     }
     if (n > 0) ctx->n_ctx_tokens += n;
     return output;
+}
+
+char* quant_ask_verified(quant_ctx* ctx, const char* context,
+                          const char* question, float* out_confidence) {
+    if (!ctx || !ctx->model || !question) return NULL;
+    if (out_confidence) *out_confidence = 0.0f;
+
+    /* Build lookup prompt: context + question */
+    char* lookup_prompt = (char*)malloc(strlen(context) + strlen(question) + 256);
+    if (!lookup_prompt) return NULL;
+    sprintf(lookup_prompt,
+        "Document:\n%s\n\nQuestion: %s\n"
+        "If this text answers the question, reply ANSWER: <answer>. "
+        "If not, reply NONE.", context, question);
+
+    /* Generate answer */
+    char* answer = quant_ask(ctx, lookup_prompt);
+    free(lookup_prompt);
+    if (!answer || answer[0] == '\0') {
+        if (answer) quant_free_string(answer);
+        return NULL;
+    }
+
+    /* Check for self-reported NONE */
+    if (strncmp(answer, "NONE", 4) == 0 ||
+        strstr(answer, "does not") || strstr(answer, "cannot")) {
+        if (out_confidence) *out_confidence = 0.05f;
+        quant_free_string(answer);
+        return NULL;
+    }
+
+    /* Strip "ANSWER:" prefix */
+    char* text = answer;
+    if (strncmp(text, "ANSWER:", 7) == 0) text += 7;
+    while (*text == ' ') text++;
+
+    /* Coherence check: does the answer address the question? */
+    char* check_prompt = (char*)malloc(strlen(question) + strlen(text) + 256);
+    if (!check_prompt) {
+        if (out_confidence) *out_confidence = 0.5f;
+        /* Can't verify, return answer with medium confidence */
+        char* result = (char*)malloc(strlen(text) + 1);
+        strcpy(result, text);
+        quant_free_string(answer);
+        return result;
+    }
+    sprintf(check_prompt,
+        "A user asked: \"%s\"\n"
+        "The system answered: \"%.200s\"\n"
+        "Is the EXACT question answered? YES or NO.", question, text);
+
+    char* verdict = quant_ask(ctx, check_prompt);
+    free(check_prompt);
+
+    float conf = 0.5f;
+    if (verdict) {
+        char v = verdict[0];
+        if (v == 'Y' || v == 'y') conf = 0.9f;
+        else if (v == 'N' || v == 'n') conf = 0.1f;
+        quant_free_string(verdict);
+    }
+
+    if (out_confidence) *out_confidence = conf;
+
+    if (conf < 0.3f) {
+        /* Coherence failed — answer doesn't address the question */
+        quant_free_string(answer);
+        return NULL;
+    }
+
+    /* Return verified answer */
+    char* result = (char*)malloc(strlen(text) + 1);
+    strcpy(result, text);
+    quant_free_string(answer);
+    return result;
 }
 
 void quant_free_string(char* str) {
@@ -16171,6 +17604,17 @@ int quant_load_context(quant_ctx* ctx, const char* path) {
 
     /* Restore position */
     ctx->n_ctx_tokens = (int)nt;
+
+    /* Reset chat state so quant_chat() treats this as a fresh session
+     * with pre-filled KV cache. Without this, quant_chat's text-prefix
+     * matching sees stale cached_text and produces misaligned output.
+     * The next quant_chat() call will re-tokenize its prompt and prefill
+     * starting from position nt (where the loaded KV ends). */
+    if (ctx->cached_text) { free(ctx->cached_text); ctx->cached_text = NULL; }
+    if (ctx->cached_tokens) { free(ctx->cached_tokens); ctx->cached_tokens = NULL; }
+    ctx->n_cached = 0;
+    ctx->cached_capacity = 0;
+
     fclose(fp);
     fprintf(stderr, "quant_load_context: restored %u tokens (%u layers) from %s\n",
             nt, nl, path);
@@ -16182,6 +17626,7 @@ void quant_free_ctx(quant_ctx* ctx) {
     tq_free_state(ctx->state);
     tq_free_tokenizer(ctx->tokenizer);
     if (ctx->cached_tokens) free(ctx->cached_tokens);
+    if (ctx->cached_text) free(ctx->cached_text);
     free(ctx);
 }
 
@@ -16217,6 +17662,7 @@ int quant_chat(quant_ctx* ctx, const char* prompt,
         ctx->n_cached = 0;
         ctx->cached_capacity = 0;
         ctx->n_ctx_tokens = 0;
+        if (ctx->cached_text) { free(ctx->cached_text); ctx->cached_text = NULL; }
         return 0;
     }
 
@@ -16231,8 +17677,11 @@ int quant_chat(quant_ctx* ctx, const char* prompt,
     ctx->config.user_data = user_data;
 
     char output[65536];
-    int n = tq_generate_continue(
+    /* Use the text-prefix path so chat replays bypass BPE re-tokenization
+     * issues. Falls back to token-LCP path if text prefix doesn't match. */
+    int n = tq_generate_chat_text(
         ctx->model, ctx->tokenizer, ctx->state, prompt, &ctx->config,
+        &ctx->cached_text,
         &ctx->cached_tokens, &ctx->n_cached, &ctx->cached_capacity,
         output, sizeof(output));
 

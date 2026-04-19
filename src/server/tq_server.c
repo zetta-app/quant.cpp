@@ -19,8 +19,8 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-/* Forward decl: defined in src/engine/tq_generate.c.
- * Not yet exposed in turboquant.h since it's a chat-mode helper. */
+/* Forward decls: defined in src/engine/tq_generate.c.
+ * Not yet exposed in turboquant.h since they're chat-mode helpers. */
 extern int tq_generate_continue(tq_model_t* model,
                                  tq_tokenizer_t* tokenizer,
                                  tq_state_t* state,
@@ -30,6 +30,18 @@ extern int tq_generate_continue(tq_model_t* model,
                                  int*  n_cached_io,
                                  int*  cached_capacity_io,
                                  char* output, int output_size);
+
+/* Text-prefix matching variant — solves BPE re-tokenization mismatch. */
+extern int tq_generate_chat_text(tq_model_t* model,
+                                  tq_tokenizer_t* tokenizer,
+                                  tq_state_t* state,
+                                  const char* prompt,
+                                  tq_gen_config_t* config,
+                                  char** cached_text_io,
+                                  int** cached_tokens_io,
+                                  int*  n_cached_io,
+                                  int*  cached_capacity_io,
+                                  char* output, int output_size);
 #if defined(_MSC_VER)
 #include <intrin.h>
 typedef volatile long atomic_int;
@@ -95,7 +107,14 @@ typedef struct {
     int*        cached_tokens;
     int         n_cached;
     int         cached_capacity;
+    char*       cached_text;          /* prompt + generated, for text-prefix matching */
     long        last_used;            /* monotonic counter for LRU */
+    /* Track the kv_type / value_quant_bits used to allocate kv_state.
+     * If a later request reuses this session id with different params,
+     * we must rebuild the state — the cached KV blocks are formatted
+     * for the original config and would be misinterpreted otherwise. */
+    tq_type     kv_type;
+    int         value_quant_bits;
 } kv_session_t;
 
 struct tq_server {
@@ -110,7 +129,8 @@ struct tq_server {
 };
 
 /* Find or allocate a session by id. Caller holds inference_mutex.
- * Returns a pointer into server->sessions. Never NULL (LRU evicts). */
+ * Returns a pointer into server->sessions, or NULL on allocation failure
+ * (caller must check and respond with HTTP 500). */
 static kv_session_t* get_or_create_session(tq_server_t* server,
                                             const char* sid,
                                             tq_type kv_type,
@@ -128,8 +148,36 @@ static kv_session_t* get_or_create_session(tq_server_t* server,
             continue;
         }
         if (strncmp(server->sessions[i].id, sid, SESSION_ID_MAX) == 0) {
-            server->sessions[i].last_used = server->session_clock;
-            return &server->sessions[i];
+            kv_session_t* hit = &server->sessions[i];
+            hit->last_used = server->session_clock;
+            /* If the client switched kv_type / value_quant_bits between
+             * turns, the cached KV blocks are formatted for the OLD
+             * config. We must rebuild — reusing the state would
+             * misinterpret quantized blocks and produce garbage. */
+            if (hit->kv_type != kv_type ||
+                hit->value_quant_bits != value_quant_bits) {
+                fprintf(stderr, "[server] session %s: kv_type/vq_bits changed, rebuilding state\n", hit->id);
+                if (hit->kv_state) tq_free_state(hit->kv_state);
+                if (hit->cached_tokens) free(hit->cached_tokens);
+                if (hit->cached_text) free(hit->cached_text);
+                hit->kv_state = tq_create_state_ex(
+                    &server->config.model->config, kv_type, value_quant_bits);
+                if (!hit->kv_state) {
+                    /* Free state failed → mark slot empty so we don't
+                     * leave a half-baked entry that future calls would
+                     * NULL-deref. */
+                    fprintf(stderr, "[server] tq_create_state_ex failed (rebuild) for session %s\n", hit->id);
+                    memset(hit, 0, sizeof(*hit));
+                    return NULL;
+                }
+                hit->cached_tokens = NULL;
+                hit->n_cached = 0;
+                hit->cached_capacity = 0;
+                hit->cached_text = NULL;
+                hit->kv_type = kv_type;
+                hit->value_quant_bits = value_quant_bits;
+            }
+            return hit;
         }
         if (server->sessions[i].last_used < lru_time) {
             lru_time = server->sessions[i].last_used;
@@ -144,11 +192,23 @@ static kv_session_t* get_or_create_session(tq_server_t* server,
     /* Free old session contents (if any) */
     if (s->kv_state) tq_free_state(s->kv_state);
     if (s->cached_tokens) free(s->cached_tokens);
+    if (s->cached_text) free(s->cached_text);
 
     memset(s, 0, sizeof(*s));
     strncpy(s->id, sid, SESSION_ID_MAX - 1);
     s->kv_state = tq_create_state_ex(
         &server->config.model->config, kv_type, value_quant_bits);
+    if (!s->kv_state) {
+        /* tq_create_state_ex returned NULL (OOM, bad config). Clear the
+         * slot id so the slot looks empty again, otherwise the next
+         * call with the same sid would find this entry and dereference
+         * a NULL kv_state. */
+        fprintf(stderr, "[server] tq_create_state_ex failed for session %s\n", sid);
+        memset(s, 0, sizeof(*s));
+        return NULL;
+    }
+    s->kv_type = kv_type;
+    s->value_quant_bits = value_quant_bits;
     s->last_used = server->session_clock;
     return s;
 }
@@ -237,15 +297,22 @@ static const char* json_extract_string(const char* p, char* buf, int buf_size) {
 /* Find a key in JSON and return pointer to value (past the colon).
  * Simple scan — works for flat or lightly nested objects. */
 static const char* json_find_key(const char* json, const char* key) {
+    /* Find a "key": pattern. Naive scan: locate every "key" occurrence
+     * and verify the next non-whitespace char is ':'. This skips false
+     * matches where "key" appears as a *value* (e.g., {"role":"user"}
+     * collides with json_find_key("user") if we don't check the colon). */
     char pattern[256];
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char* p = strstr(json, pattern);
-    if (!p) return NULL;
-    p += strlen(pattern);
-    p = json_skip_ws(p);
-    if (*p != ':') return NULL;
-    p++;
-    return json_skip_ws(p);
+    size_t plen = strlen(pattern);
+    const char* p = json;
+    while ((p = strstr(p, pattern)) != NULL) {
+        const char* after = json_skip_ws(p + plen);
+        if (*after == ':') {
+            return json_skip_ws(after + 1);
+        }
+        p += plen; /* skip past this false match and keep searching */
+    }
+    return NULL;
 }
 
 /* Extract a number (int or float) from current position */
@@ -370,31 +437,65 @@ static int parse_messages(const char* p, chat_request_t* req) {
     return 0;
 }
 
-/* Build a ChatML-formatted prompt from messages */
-static char* build_prompt(const chat_request_t* req) {
-    /* Calculate total size needed */
-    size_t total = 1; /* null terminator */
-    for (int i = 0; i < req->n_messages; i++) {
-        /* <|im_start|>role\ncontent<|im_end|>\n */
-        total += 14 + strlen(req->messages[i].role) + 1 +
-                 (req->messages[i].content ? strlen(req->messages[i].content) : 0) +
-                 12 + 1;
+/* Chat template types — detected from model config */
+typedef enum {
+    CHAT_TEMPLATE_CHATML,    /* <|im_start|>role\n...<|im_end|>\n (Llama, Qwen, default) */
+    CHAT_TEMPLATE_PHI3,      /* <|system|>\n...<|end|>\n / <|user|>\n...<|end|>\n<|assistant|>\n */
+} chat_template_t;
+
+static chat_template_t detect_chat_template(const tq_model_config_t* config) {
+    if (config && config->has_fused_qkv) {
+        return CHAT_TEMPLATE_PHI3;
     }
-    /* Add assistant prompt at end */
-    total += 14 + 9 + 1; /* <|im_start|>assistant\n */
+    return CHAT_TEMPLATE_CHATML;
+}
+
+/* Build a formatted prompt from messages — template selected by model architecture */
+static char* build_prompt(const chat_request_t* req, chat_template_t tmpl) {
+    /* Calculate total size needed (generous upper bound) */
+    size_t total = 256; /* headers + null */
+    for (int i = 0; i < req->n_messages; i++) {
+        total += 64 + strlen(req->messages[i].role) +
+                 (req->messages[i].content ? strlen(req->messages[i].content) : 0);
+    }
 
     char* prompt = (char*)malloc(total);
     if (!prompt) return NULL;
 
     char* w = prompt;
     size_t remaining = total;
-    for (int i = 0; i < req->n_messages; i++) {
-        int n = snprintf(w, remaining, "<|im_start|>%s\n%s<|im_end|>\n",
-                         req->messages[i].role,
-                         req->messages[i].content ? req->messages[i].content : "");
-        if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
+
+    if (tmpl == CHAT_TEMPLATE_PHI3) {
+        /* Phi-3 / Phi-3.5 template:
+         *   <|system|>\ncontent<|end|>\n
+         *   <|user|>\ncontent<|end|>\n
+         *   <|assistant|>\n
+         */
+        for (int i = 0; i < req->n_messages; i++) {
+            const char* content = req->messages[i].content ? req->messages[i].content : "";
+            int n;
+            if (strcmp(req->messages[i].role, "system") == 0) {
+                n = snprintf(w, remaining, "<|system|>\n%s<|end|>\n", content);
+            } else if (strcmp(req->messages[i].role, "user") == 0) {
+                n = snprintf(w, remaining, "<|user|>\n%s<|end|>\n", content);
+            } else if (strcmp(req->messages[i].role, "assistant") == 0) {
+                n = snprintf(w, remaining, "<|assistant|>\n%s<|end|>\n", content);
+            } else {
+                n = snprintf(w, remaining, "<|user|>\n%s<|end|>\n", content);
+            }
+            if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
+        }
+        snprintf(w, remaining, "<|assistant|>\n");
+    } else {
+        /* ChatML (default): <|im_start|>role\ncontent<|im_end|>\n */
+        for (int i = 0; i < req->n_messages; i++) {
+            int n = snprintf(w, remaining, "<|im_start|>%s\n%s<|im_end|>\n",
+                             req->messages[i].role,
+                             req->messages[i].content ? req->messages[i].content : "");
+            if (n > 0 && (size_t)n < remaining) { w += n; remaining -= (size_t)n; }
+        }
+        snprintf(w, remaining, "<|im_start|>assistant\n");
     }
-    snprintf(w, remaining, "<|im_start|>assistant\n");
 
     return prompt;
 }
@@ -466,13 +567,9 @@ static int parse_chat_request(const char* body, chat_request_t* req) {
         return -1;
     }
 
-    /* Build prompt */
-    req->prompt = build_prompt(req);
-    if (!req->prompt) {
-        LOG_ERROR("Failed to build prompt");
-        return -1;
-    }
-
+    /* NOTE: build_prompt is called separately after parse returns,
+     * because it needs the model config to detect the chat template.
+     * See handle_chat_completion(). */
     return 0;
 }
 
@@ -675,8 +772,20 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
         return;
     }
 
-    LOG_INFO("Chat request: model=%s, stream=%s, max_tokens=%d, messages=%d",
-             req.model, req.stream ? "true" : "false", req.max_tokens, req.n_messages);
+    /* Build prompt — needs model config for architecture-aware template */
+    chat_template_t tmpl = detect_chat_template(&server->config.model->config);
+    req.prompt = build_prompt(&req, tmpl);
+    if (!req.prompt) {
+        send_json(fd, 500, "Internal Server Error",
+            "{\"error\":{\"message\":\"Failed to build prompt\","
+            "\"type\":\"server_error\",\"code\":\"internal\"}}");
+        free_chat_request(&req);
+        return;
+    }
+
+    LOG_INFO("Chat request: model=%s, stream=%s, max_tokens=%d, messages=%d, template=%s",
+             req.model, req.stream ? "true" : "false", req.max_tokens, req.n_messages,
+             tmpl == CHAT_TEMPLATE_PHI3 ? "phi3" : "chatml");
 
     /* Resolve inference parameters */
     tq_type kv_type = server->config.kv_type;
@@ -708,8 +817,17 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
     char completion_id[64];
     generate_id(completion_id, sizeof(completion_id));
 
-    /* Serialize inference (one request at a time) */
-    pthread_mutex_lock(&server->inference_mutex);
+    /* Serialize inference (one request at a time).
+     * Use trylock so concurrent requests get an immediate 429 instead of
+     * blocking silently and potentially timing out. (issue #63) */
+    if (pthread_mutex_trylock(&server->inference_mutex) != 0) {
+        send_json(fd, 429, "Too Many Requests",
+            "{\"error\":{\"message\":\"Server is busy processing another request. "
+            "Please retry in a moment.\","
+            "\"type\":\"server_error\",\"code\":\"busy\"}}");
+        free_chat_request(&req);
+        return;
+    }
 
     if (req.stream) {
         /* --- Streaming (SSE) --- */
@@ -758,13 +876,64 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
         kv_session_t* sess = get_or_create_session(server, req.session_id,
                                                     gen_cfg.kv_type,
                                                     gen_cfg.value_quant_bits);
-        tq_generate_continue(server->config.model, server->config.tokenizer,
-                              sess->kv_state, req.prompt, &gen_cfg,
-                              &sess->cached_tokens, &sess->n_cached,
-                              &sess->cached_capacity,
-                              output, sizeof(output));
+        int gen_rc;
+        if (!sess) {
+            /* tq_create_state_ex failed inside get_or_create_session.
+             * Synthesize an error event in the SSE stream so the client
+             * doesn't see a happy "stop" with empty content. */
+            gen_rc = -1;
+            LOG_ERROR("Session allocation failed");
+        } else {
+            gen_rc = tq_generate_chat_text(server->config.model, server->config.tokenizer,
+                                   sess->kv_state, req.prompt, &gen_cfg,
+                                   &sess->cached_text,
+                                   &sess->cached_tokens, &sess->n_cached,
+                                   &sess->cached_capacity,
+                                   output, sizeof(output));
+        }
+        if (gen_rc == -2 && sess) {
+            /* Context overflow — auto-reset session and surface error.
+             * Client should retry with a shorter conversation history. */
+            LOG_ERROR("Session %s: context overflow, auto-reset", sess->id);
+            tq_free_state(sess->kv_state);
+            sess->kv_state = tq_create_state_ex(
+                &server->config.model->config, gen_cfg.kv_type, gen_cfg.value_quant_bits);
+            if (sess->cached_tokens) { free(sess->cached_tokens); sess->cached_tokens = NULL; }
+            sess->n_cached = 0; sess->cached_capacity = 0;
+            if (sess->cached_text) { free(sess->cached_text); sess->cached_text = NULL; }
+        }
 
-        /* Send final chunk with finish_reason */
+        /* Send final chunk. finish_reason: "stop" on success, "error"
+         * on -1, "length" on -2 (overflow). The previous code always
+         * sent "stop" even when generation errored, leaving clients
+         * thinking the model decided to produce zero tokens. */
+        const char* finish_reason = "stop";
+        if (gen_rc == -2) finish_reason = "length";
+        else if (gen_rc < 0) finish_reason = "error";
+
+        if (gen_rc < 0) {
+            /* Emit an error delta so OpenAI-compatible clients can see
+             * what went wrong. Most clients surface the delta content. */
+            char err_chunk[SSE_CHUNK_SIZE];
+            const char* msg = (gen_rc == -2)
+                ? "context overflow — session reset, retry with shorter history"
+                : "internal error during generation";
+            snprintf(err_chunk, sizeof(err_chunk),
+                "{"
+                    "\"id\":\"%s\","
+                    "\"object\":\"chat.completion.chunk\","
+                    "\"created\":%ld,"
+                    "\"model\":\"%s\","
+                    "\"choices\":[{"
+                        "\"index\":0,"
+                        "\"delta\":{\"content\":\"[%s]\"},"
+                        "\"finish_reason\":null"
+                    "}]"
+                "}",
+                completion_id, (long)time(NULL), model_id, msg);
+            send_sse_event(fd, err_chunk);
+        }
+
         char final_chunk[SSE_CHUNK_SIZE];
         snprintf(final_chunk, sizeof(final_chunk),
             "{"
@@ -775,14 +944,15 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
                 "\"choices\":[{"
                     "\"index\":0,"
                     "\"delta\":{},"
-                    "\"finish_reason\":\"stop\""
+                    "\"finish_reason\":\"%s\""
                 "}]"
             "}",
-            completion_id, (long)time(NULL), model_id);
+            completion_id, (long)time(NULL), model_id, finish_reason);
         send_sse_event(fd, final_chunk);
         send_sse_event(fd, "[DONE]");
 
-        LOG_INFO("Streaming complete: %d tokens", sse_ctx.token_count);
+        LOG_INFO("Streaming complete: %d tokens (rc=%d)",
+                 sse_ctx.token_count, gen_rc);
 
     } else {
         /* --- Non-streaming --- */
@@ -795,11 +965,54 @@ static void handle_chat_completions(tq_server_t* server, int fd, const char* bod
         kv_session_t* sess = get_or_create_session(server, req.session_id,
                                                     gen_cfg.kv_type,
                                                     gen_cfg.value_quant_bits);
-        tq_generate_continue(server->config.model, server->config.tokenizer,
-                              sess->kv_state, req.prompt, &gen_cfg,
-                              &sess->cached_tokens, &sess->n_cached,
-                              &sess->cached_capacity,
-                              output, sizeof(output));
+        if (!sess) {
+            LOG_ERROR("Session allocation failed");
+            free(collect.buf);
+            pthread_mutex_unlock(&server->inference_mutex);
+            free_chat_request(&req);
+            send_json(fd, 500, "Internal Server Error",
+                "{\"error\":{\"message\":\"Failed to allocate KV state for session\","
+                "\"type\":\"server_error\",\"code\":\"session_alloc_failed\"}}");
+            return;
+        }
+        int gen_rc = tq_generate_chat_text(server->config.model, server->config.tokenizer,
+                               sess->kv_state, req.prompt, &gen_cfg,
+                               &sess->cached_text,
+                               &sess->cached_tokens, &sess->n_cached,
+                               &sess->cached_capacity,
+                               output, sizeof(output));
+        if (gen_rc == -2) {
+            /* Context overflow — return HTTP 413 instead of garbage. */
+            LOG_ERROR("Session %s: context overflow, returning 413", sess->id);
+            tq_free_state(sess->kv_state);
+            sess->kv_state = tq_create_state_ex(
+                &server->config.model->config, gen_cfg.kv_type, gen_cfg.value_quant_bits);
+            if (sess->cached_tokens) { free(sess->cached_tokens); sess->cached_tokens = NULL; }
+            sess->n_cached = 0; sess->cached_capacity = 0;
+            if (sess->cached_text) { free(sess->cached_text); sess->cached_text = NULL; }
+            free(collect.buf);
+            pthread_mutex_unlock(&server->inference_mutex);
+            free_chat_request(&req);
+            send_json(fd, 413, "Payload Too Large",
+                "{\"error\":{\"message\":\"Conversation history exceeds context window. "
+                "Session has been reset; please retry with a shorter history.\","
+                "\"type\":\"context_overflow\",\"code\":\"context_full\"}}");
+            return;
+        }
+        if (gen_rc < 0) {
+            /* Other error (-1: invalid args, OOM during prefill, etc.).
+             * The previous code fell through and sent HTTP 200 with an
+             * empty content string, which is indistinguishable from a
+             * deliberate empty completion. Return 500 instead. */
+            LOG_ERROR("Session %s: generation failed (rc=%d)", sess->id, gen_rc);
+            free(collect.buf);
+            pthread_mutex_unlock(&server->inference_mutex);
+            free_chat_request(&req);
+            send_json(fd, 500, "Internal Server Error",
+                "{\"error\":{\"message\":\"Generation failed (allocation error or invalid state)\","
+                "\"type\":\"server_error\",\"code\":\"generation_failed\"}}");
+            return;
+        }
 
         const char* content = collect.buf ? collect.buf : "";
 
@@ -1260,6 +1473,7 @@ void tq_server_free(tq_server_t* server) {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (server->sessions[i].kv_state) tq_free_state(server->sessions[i].kv_state);
         if (server->sessions[i].cached_tokens) free(server->sessions[i].cached_tokens);
+        if (server->sessions[i].cached_text) free(server->sessions[i].cached_text);
     }
     if (g_server == server) g_server = NULL;
     free(server);

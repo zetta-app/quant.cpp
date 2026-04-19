@@ -18,14 +18,22 @@ import os
 import json
 
 
-# Ollama-style short aliases → canonical _MODEL_REGISTRY keys
+# Ollama-style short aliases → canonical _MODEL_REGISTRY keys.
 MODEL_ALIASES = {
-    "smollm2":      "SmolLM2-135M",
-    "smollm2:135m": "SmolLM2-135M",
-    "qwen3.5":      "Qwen3.5-0.8B",
-    "qwen3.5:0.8b": "Qwen3.5-0.8B",
-    "llama3.2":     "Llama-3.2-1B",
-    "llama3.2:1b":  "Llama-3.2-1B",
+    "qwen3":           "Qwen3-4B",
+    "qwen3:4b":        "Qwen3-4B",
+    "qwen":            "Qwen3-4B",
+    "smollm2":         "SmolLM2-1.7B",
+    "smollm2:1.7b":    "SmolLM2-1.7B",
+    "smollm2:135m":    "SmolLM2-135M",
+    "qwen3.5":         "Qwen3.5-0.8B",
+    "qwen3.5:0.8b":    "Qwen3.5-0.8B",
+    "llama3.2":        "Llama-3.2-1B",
+    "llama3.2:1b":     "Llama-3.2-1B",
+    "phi3.5":          "Phi-3.5-mini",
+    "phi3.5:mini":     "Phi-3.5-mini",
+    "phi-3.5":         "Phi-3.5-mini",
+    "phi-3.5-mini":    "Phi-3.5-mini",
 }
 
 
@@ -145,30 +153,70 @@ def cmd_run(args):
     m = Model(model_path, max_tokens=args.max_tokens, temperature=args.temperature,
               n_threads=args.threads)
 
-    if args.prompt:
-        question = " ".join(args.prompt) if isinstance(args.prompt, list) else args.prompt
+    prompt_parts = args.prompt if args.prompt else None
+    if prompt_parts:
+        question = " ".join(prompt_parts) if isinstance(prompt_parts, list) else prompt_parts
         for tok in m.generate(question):
             print(tok, end="", flush=True)
         print()
     else:
+        from quantcpp import ChatContextOverflow
         print("quantcpp \u2014 type your message, Ctrl+C to exit", file=sys.stderr)
         # Multi-turn chat: accumulate history as ChatML so the model sees
         # prior turns. m.chat() reuses the KV cache via prefix-match, so
         # repeating the history is cheap (O(new tokens), not O(n^2)).
-        history = ""
+        # turns is a list of (user_msg, assistant_msg) pairs so we can
+        # trim from the front when we hit context overflow.
+        turns = []
+        def _build_history(extra_user=None):
+            parts = []
+            for u, a in turns:
+                parts.append(f"<|im_start|>user\n{u}<|im_end|>\n<|im_start|>assistant\n{a}<|im_end|>\n")
+            if extra_user is not None:
+                parts.append(f"<|im_start|>user\n{extra_user}<|im_end|>\n<|im_start|>assistant\n")
+            return "".join(parts)
+
         try:
             while True:
                 question = input("\nYou: ")
                 if not question.strip():
                     continue
-                history += f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
                 print("AI: ", end="", flush=True)
                 reply_buf = []
-                for tok in m.chat(history):
-                    print(tok, end="", flush=True)
-                    reply_buf.append(tok)
+                # Retry loop: on context overflow, drop the oldest turn
+                # and try again. Without this, the C side resets the KV
+                # cache but Python's history still has the bloat, so
+                # every subsequent turn would loop back into overflow.
+                attempt = 0
+                while True:
+                    history = _build_history(extra_user=question)
+                    try:
+                        for tok in m.chat(history):
+                            print(tok, end="", flush=True)
+                            reply_buf.append(tok)
+                        break
+                    except ChatContextOverflow:
+                        if not turns:
+                            print("\n[chat] message alone exceeds context window — try a shorter question.",
+                                  file=sys.stderr)
+                            reply_buf = []  # nothing was emitted
+                            break
+                        dropped = turns.pop(0)
+                        attempt += 1
+                        print(f"\n[chat] context full \u2014 dropped oldest turn ({len(dropped[0])+len(dropped[1])} chars), retrying...",
+                              file=sys.stderr)
+                        # The session was already reset by the C side;
+                        # retrying with the trimmed history will hit
+                        # the slow path on this turn and the fast path
+                        # again from the next turn onward.
+                        if attempt > 8:
+                            print("[chat] too many overflow retries, giving up on this turn.",
+                                  file=sys.stderr)
+                            reply_buf = []
+                            break
                 print()
-                history += "".join(reply_buf) + "<|im_end|>\n"
+                if reply_buf:
+                    turns.append((question, "".join(reply_buf)))
         except (KeyboardInterrupt, EOFError):
             print("\nBye!", file=sys.stderr)
 
@@ -177,7 +225,12 @@ def cmd_run(args):
 
 
 def cmd_serve(args):
-    """Start OpenAI-compatible HTTP server (requires quant-server binary)."""
+    """Start OpenAI-compatible HTTP server.
+
+    Prefers `quant-server-unified` (built on quant.h, guaranteed correct)
+    over the legacy `quant-server` (built on libturboquant, may diverge).
+    Falls back to the legacy binary if unified is not found.
+    """
     import shutil
     import subprocess
 
@@ -187,20 +240,39 @@ def cmd_serve(args):
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    binary = shutil.which("quant-server")
-    if not binary:
-        # Look in common build dirs relative to repo
-        for guess in ("./build/quant-server", "./build_metal/quant-server"):
+    # Prefer unified server (quant.h-based, fixes #77).
+    # Fall back to legacy libturboquant server if unified not found.
+    binary = None
+    for name in ("quant-server-unified", "quant-server"):
+        binary = shutil.which(name)
+        if binary:
+            break
+        for guess in (f"./build/{name}", f"./build_metal/{name}",
+                      f"./build_cpu/{name}"):
             if os.path.isfile(guess) and os.access(guess, os.X_OK):
                 binary = guess
                 break
+        if binary:
+            break
 
     if not binary:
         print("quant-server binary not found.", file=sys.stderr)
-        print("  Build with: cmake -B build -DTQ_BUILD_SERVER=ON && cmake --build build",
+        print("  Build with:", file=sys.stderr)
+        print("    cc -O2 -o quant-server-unified tools/quant_server_unified.c -lm -lpthread",
               file=sys.stderr)
-        print("  Or install via your package manager.", file=sys.stderr)
+        print("  Or via CMake:", file=sys.stderr)
+        print("    cmake -B build -DTQ_BUILD_SERVER=ON && cmake --build build",
+              file=sys.stderr)
         return 2
+
+    # Check if port is available before launching server
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if sock.connect_ex(("127.0.0.1", args.port)) == 0:
+            print(f"error: port {args.port} is already in use.", file=sys.stderr)
+            print(f"  Try a different port: quantcpp serve {args.model} --port {args.port + 1}",
+                  file=sys.stderr)
+            return 1
 
     cmd = [binary, model_path, "-p", str(args.port), "-j", str(args.threads)]
     print(f"quantcpp serve {os.path.basename(model_path)} on :{args.port}", file=sys.stderr)
@@ -289,9 +361,74 @@ def cmd_client(args):
         return 1
 
 
+def cmd_recommend(args):
+    """Suggest the best model based on priority."""
+    import quantcpp
+
+    # Model specs: (name, params, vocab, q4_gb, q8_gb, speed_note, quality_note)
+    models = [
+        ("Phi-3.5-mini", "3.8B", 32064, 2.4, 4.1, "~6.5 tok/s (Q8)", "MMLU 65.5, GSM8K 76.9"),
+        ("SmolLM2-1.7B", "1.7B", 49152, 1.1, 1.8, "~23 tok/s (Q8)", "Good for simple QA"),
+        ("Llama-3.2-1B", "1.0B", 128256, 0.8, 1.4, "~2.3 tok/s (Q8)", "MMLU 49.3"),
+        ("Qwen3.5-0.8B", "0.8B", 248320, 0.5, 0.9, "~1 tok/s (Q8)", "DeltaNet hybrid"),
+    ]
+
+    priority = args.priority
+    print(f"\n  quantcpp recommend (priority: {priority})")
+    print(f"  {'='*60}\n")
+
+    if priority == "speed":
+        pick = models[1]  # SmolLM2
+        reason = "Smallest model + small vocab (49K) = fastest generation"
+    elif priority == "quality":
+        pick = models[0]  # Phi-3.5
+        reason = "Best benchmarks at usable speed (32K vocab)"
+    else:  # balanced
+        pick = models[0]  # Phi-3.5
+        reason = "32K vocab gives best speed/quality ratio in 3-4B class"
+
+    print(f"  Recommended: {pick[0]}")
+    print(f"  Params:      {pick[1]}")
+    print(f"  Vocab:       {pick[2]:,} tokens")
+    print(f"  Q4 size:     {pick[3]:.1f} GB")
+    print(f"  Q8 size:     {pick[4]:.1f} GB")
+    print(f"  Speed:       {pick[5]}")
+    print(f"  Quality:     {pick[6]}")
+    print(f"  Reason:      {reason}")
+    print()
+
+    # Check if cached
+    registry, cache_dir = quantcpp._MODEL_REGISTRY, quantcpp._CACHE_DIR
+    if pick[0] in registry:
+        _, filename, _ = registry[pick[0]]
+        cached = (cache_dir / filename).exists()
+        if cached:
+            print(f"  Status: cached ✓")
+        else:
+            print(f"  Install: quantcpp pull {pick[0].lower().replace(' ', '-')}")
+    print()
+
+    print("  All models (sorted by speed):")
+    print(f"  {'Model':<16} {'Params':>6} {'Vocab':>8} {'Speed':>18} {'Quality'}")
+    print(f"  {'-'*16} {'-'*6} {'-'*8} {'-'*18} {'-'*20}")
+    for m in models:
+        marker = " ←" if m[0] == pick[0] else ""
+        print(f"  {m[0]:<16} {m[1]:>6} {m[2]:>8,} {m[5]:>18} {m[6]}{marker}")
+    print()
+    return 0
+
+
 def cmd_chat_default(args):
-    """Backwards-compatible default: auto-download Llama-3.2-1B and chat."""
-    args.model = args.model or "Llama-3.2-1B"
+    """Backwards-compatible default: auto-download Phi-3.5-mini and chat.
+
+    Default progression:
+      Llama-3.2-1B → SmolLM2-1.7B (2026-04-12, vocab fix)
+                   → Phi-3.5-mini (2026-04-12, after Phi-3 arch support
+                     landed). Phi-3.5-mini has the smallest vocab in
+                     the registry (32K) AND 3.8B params, giving the
+                     best speed/quality combo we ship.
+    """
+    args.model = args.model or "Qwen3-4B"
     args.threads = getattr(args, "threads", 4)
     args.max_tokens = getattr(args, "max_tokens", 256)
     args.temperature = getattr(args, "temperature", 0.7)
@@ -301,6 +438,8 @@ def cmd_chat_default(args):
 
 def main():
     import argparse
+
+    from quantcpp import __version__
 
     parser = argparse.ArgumentParser(
         prog="quantcpp",
@@ -315,21 +454,24 @@ commands:
   client PROMPT         Send a request to a running serve (default: SSE streaming)
 
 examples:
-  quantcpp pull llama3.2:1b
+  quantcpp pull phi-3.5-mini         # recommended default (32K vocab → fast)
   quantcpp list
-  quantcpp run llama3.2:1b
-  quantcpp run llama3.2:1b "What is gravity?"
-  quantcpp serve llama3.2:1b --port 8080
+  quantcpp run phi-3.5-mini
+  quantcpp run phi-3.5-mini "What is gravity?"
+  quantcpp serve phi-3.5-mini --port 8080
   quantcpp client "What is gravity?"                  # streams from :8080
   quantcpp client "Hi" --url http://localhost:8081
   quantcpp client "Hi" --no-stream                    # single JSON response
 
 backwards-compat (no subcommand):
-  quantcpp                          # default chat with Llama-3.2-1B
+  quantcpp                          # default chat with Phi-3.5-mini
   quantcpp "What is gravity?"       # one-shot
-  quantcpp --model SmolLM2-135M     # different model
+  quantcpp --model smollm2          # lightweight alternative
+  quantcpp --model llama3.2:1b      # smallest download
 """,
     )
+
+    parser.add_argument("--version", action="version", version=f"quantcpp {__version__}")
 
     sub = parser.add_subparsers(dest="command")
 
@@ -368,6 +510,12 @@ backwards-compat (no subcommand):
     p_client.add_argument("--no-stream", action="store_true",
                           help="Disable SSE streaming (single JSON response)")
 
+    # recommend
+    p_rec = sub.add_parser("recommend",
+        help="Suggest the best model for your hardware")
+    p_rec.add_argument("--priority", choices=["speed", "quality", "balanced"],
+                       default="balanced", help="Optimization priority")
+
     # Backwards-compat: top-level args for direct chat
     parser.add_argument("prompt", nargs="*", default=None,
                         help="(default mode) question to ask")
@@ -377,7 +525,32 @@ backwards-compat (no subcommand):
     parser.add_argument("--temperature", "-t", type=float, default=0.7)
     parser.add_argument("--threads", "-j", type=int, default=4)
 
-    args = parser.parse_args()
+    # Backwards-compat (issue #54): if the first positional arg is not a
+    # known subcommand, treat all positionals as a prompt. We must detect
+    # this BEFORE argparse sees the argv, because the subparser will reject
+    # unknown choices with an error.
+    known_commands = {"pull", "list", "run", "serve", "client", "recommend"}
+    argv = sys.argv[1:]
+
+    first_pos = None
+    for a in argv:
+        if a.startswith("-"):
+            continue
+        first_pos = a
+        break
+
+    if first_pos and first_pos not in known_commands:
+        # Parse with a minimal parser that has no subcommands
+        compat = argparse.ArgumentParser(prog="quantcpp", add_help=False)
+        compat.add_argument("prompt", nargs="*", default=None)
+        compat.add_argument("--model", "-m", default=None)
+        compat.add_argument("--max-tokens", "-n", type=int, default=256)
+        compat.add_argument("--temperature", "-t", type=float, default=0.7)
+        compat.add_argument("--threads", "-j", type=int, default=4)
+        args = compat.parse_args(argv)
+        return cmd_chat_default(args)
+
+    args = parser.parse_args(argv)
 
     if args.command == "pull":
         return cmd_pull(args)
@@ -389,6 +562,8 @@ backwards-compat (no subcommand):
         return cmd_serve(args)
     if args.command == "client":
         return cmd_client(args)
+    if args.command == "recommend":
+        return cmd_recommend(args)
 
     # No subcommand → backwards-compat default chat
     return cmd_chat_default(args)

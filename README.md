@@ -8,15 +8,16 @@
 <p align="center">
   Chunking was a workaround for small context windows. We just made it unnecessary.<br>
   6.4× KV compression brings full-document understanding to consumer hardware.<br>
-  <code>pip install quantcpp</code> — 16K lines of C, zero dependencies.
+  <code>pip install quantcpp</code> — 17.6K lines of C, zero dependencies.
 </p>
 
 <table align="center">
 <tr>
+<td align="center"><b>10/10 on 12K tokens</b><br>RLV crosses the cliff</td>
 <td align="center"><b>7/7 vs 0/7</b><br>Beyond RAG measured</td>
 <td align="center"><b>6.4x compression</b><br>+3% PPL</td>
 <td align="center"><b>128K context</b><br>on 16GB Mac</td>
-<td align="center"><b>16K LOC</b><br>zero deps</td>
+<td align="center"><b>17.6K LOC</b><br>zero deps</td>
 </tr>
 </table>
 
@@ -41,28 +42,30 @@
 ```bash
 pip install quantcpp
 
-quantcpp pull llama3.2:1b               # download from HuggingFace
-quantcpp run llama3.2:1b                # interactive chat
-quantcpp serve llama3.2:1b -p 8080      # OpenAI-compatible HTTP server (SSE streaming)
+quantcpp pull qwen3                     # download Qwen3-4B Q4_K_M (~2.5 GB)
+quantcpp run qwen3                      # interactive chat
+quantcpp serve qwen3 -p 8080            # OpenAI-compatible HTTP server (SSE streaming)
 quantcpp client "Hi"                    # streaming client → server on :8080
 quantcpp list                           # show cached models
 ```
 
-Short aliases: `smollm2:135m`, `qwen3.5:0.8b`, `llama3.2:1b`. Auto-pulls on first `run`/`serve`. The `serve` subcommand exposes `POST /v1/chat/completions` (OpenAI-compatible) on port 8080 — clients pass `"stream": true` for SSE streaming, or omit it for a single JSON response. Built-in `quantcpp client` supports both modes (default: streaming, `--no-stream` for single response).
+Recommended default: **Qwen3-4B** (4B params, MMLU 73, 4.5 tok/s on M3). Best speed AND quality — the Q4 NEON fused dot path makes it 2.4x faster than Phi-3.5-mini despite a larger vocab. Other aliases: `phi3.5`, `smollm2`, `llama3.2:1b`. Auto-pulls on first `run` / `serve`.
+
+The `serve` subcommand exposes `POST /v1/chat/completions` (OpenAI-compatible) on port 8080 — clients pass `"stream": true` for SSE streaming, or omit it for a single JSON response. Built-in `quantcpp client` supports both modes (default: streaming, `--no-stream` for single response).
 
 **One-shot question:**
 ```bash
-quantcpp run llama3.2:1b "What is gravity?"
+quantcpp run qwen3 "What is gravity?"
 ```
 
 **Python API (3 lines):**
 ```python
 from quantcpp import Model
-m = Model.from_pretrained("Llama-3.2-1B")
+m = Model.from_pretrained("Qwen3-4B")
 print(m.ask("What is gravity?"))
 ```
 
-Downloads on first use, cached at `~/.cache/quantcpp/`. No API key, no GPU. [Try in browser →](https://quantumaikr.github.io/quant.cpp/) · [**Interactive Guide →**](https://quantumaikr.github.io/quant.cpp/guide/)
+Downloads on first use, cached at `~/.cache/quantcpp/`. No API key, no GPU. See [`docs/supported_models.md`](docs/supported_models.md) for the architecture support matrix and model selection guide. [Try in browser →](https://quantumaikr.github.io/quant.cpp/) · [**Interactive Guide →**](https://quantumaikr.github.io/quant.cpp/guide/)
 
 ---
 
@@ -157,6 +160,12 @@ The bug was using the same tool for both. The fix is using each for what it's go
 > **Honest disclaimer:** v1 is a synthetic 5-section document with 7 questions on a single 3B model. We're not claiming this is LongBench. We *are* claiming it's enough to start a conversation about the failure mode chunk-RAG has been hiding.
 
 > **v2 update — the Working Memory Cliff (2026-04-11):** We followed up the v1 result with 204 NIAH trials across 1B and 3B at context lengths 256–2048, plus a 6-trial FP32-weights control. Both models hit a sharp cliff at **less than 1% of their nominal 128K context window** (1B Q8 at 512–1024, 3B Q4 at 1024–1280 *as a step function*). The 6.4× KV compression is bit-for-bit identical to FP32 baseline in 18 of 20 cells, so the cliff is a model property — not a KV property and not a weight-quantization artifact. The honest reframing: Beyond RAG works for documents that fit in the model's *effective* working memory, which is 2–3 orders of magnitude smaller than the nominal context window. Full tech report: [`docs/paper/working-memory-cliff.md`](docs/paper/working-memory-cliff.md). HF blog post draft: [`docs/paper/hf-blog-draft.md`](docs/paper/hf-blog-draft.md).
+
+> **v3 update — Crossing the Cliff with RLV (2026-04-14):** If the cliff is real, the fix is to stop asking one LLM call to hold a full document in working memory. **RLV (Read-Locate-Verify)** is a 5-stage pipeline — gist → locate → lookup → verify → research — where each stage stays below the ~1K-token cliff while the *document* can be arbitrarily long. On 12K-token wikitext (≈10× the cliff for Llama 3.2 3B Q4), **RLV scores 10/10** vs. 8/10 for verify-only and 1/10 for long-context-only. Key trick: BM25 + Reciprocal Rank Fusion does the locating; the LLM is only a tiebreaker. Runs on the same 16GB Mac as the 3B model — no RAG index, no embeddings. [`bench/rlv/`](bench/rlv/) · [`docs/phase3_rlv_challenge.md`](docs/phase3_rlv_challenge.md)
+
+> **v3.1 throughput update (2026-04-15):** A focused perf round (Q4_K/Q5_K int8 fused dot, ARMv8.2 `vdotq_s32`, weight-row prefetch, 2-row ILP, P-core thread default) lifted CPU generation throughput by **+58% to +141%** across our model lineup on M1 Pro. Phi-3.5-mini Q8_0 jumped 5.4 → 13.0 tok/s (now at 71% of llama.cpp's pure-CPU speed). We're still 3-6× behind llama.cpp's mature Metal kernels — that's the next gap to close. Full numbers + reproduce instructions: [`bench/results/2026-04-15_throughput_vs_llamacpp.md`](bench/results/2026-04-15_throughput_vs_llamacpp.md).
+
+> **v3.2 batched prefill (2026-04-16):** Prompt prefill was the widest gap vs llama.cpp (40-50× slower). A new `tq_forward_batch` path uses batched matrix-matrix matmul via Apple AMX (`cblas_sgemm`-inspired, 1.2 TFLOPS). **Now enabled by default on all supported architectures** (Llama family, both FP32 KV and default `turbo_kv_4b` KV compression modes). On Llama-3.2-1B Q8 with a ~250-token prompt: **42.7s → 5.9s end-to-end** (**7.2× total**, with default KV compression). Output bit-identical to per-token baseline. Commits `ed4b087`, `672fea2`, `f4934e9`, plus quant K cache write support.
 
 ---
 
@@ -398,6 +407,31 @@ On a 16GB Mac with Llama 3.2 3B: llama.cpp maxes out at ~50K tokens (FP16 KV). q
 ```
 
 Both are per-block methods. The quality gap comes from block size (128 vs 32), min-max range encoding, independent K/V treatment, and delta compression — not from a fundamental design flaw in llama.cpp. At ~1.6x compression, llama.cpp Q8+Q5 is excellent. quant.cpp targets the **4-7x range** where the difference matters.
+
+### vs llama.cpp: Inference speed (honest numbers)
+
+Generation throughput, 30 tokens, 4 threads, CPU-only, Apple M1 Pro:
+
+| Model | quant.cpp | llama.cpp | Ratio |
+|:--|:-:|:-:|:-:|
+| Llama 3.2 3B Q8_0 | **10.2 tok/s** | 13.5 tok/s | **75%** ✅ |
+| Phi-3.5-mini Q8_0 | 5.0 tok/s | 9.8 tok/s | 51% |
+| Phi-3.5-mini Q4_K_M | 2.7 tok/s | 17.5 tok/s | 15% |
+| Gemma 4 E2B Q8_0 | 16.3 tok/s | 175.8 tok/s | 9% |
+| Gemma 4 E4B Q8_0 | 4.8 tok/s | 34.8 tok/s | 14% |
+| Gemma 4 E4B Q4_0 | 4.8 tok/s | 50.5 tok/s | 10% |
+
+**Where we're competitive**: Q8_0 on mid-size (3B-class) models — our NEON int8×int8 fused dot path approaches llama.cpp's hand-tuned assembly (75% on Llama 3.2 3B).
+
+**Where we lag (2-10×)**:
+- **Q4_K_M** (mixed Q2_K/Q3_K/Q4_K) — llama.cpp has years of assembly tuning on K-quant types. We have NEON for Q4_K and Q2_K but not Q3_K.
+- **Large vocab models** (Gemma 4, 262K vocab) — the lm_head matmul alone is 2560×262144. llama.cpp's Q8_0 matmul benefits disproportionately from CPU-specific tiling we haven't implemented.
+- **Tiny models** (<1B) — llama.cpp's scheduling and batch overhead is optimized for cases where per-matmul work is small.
+
+**Known correctness issues**:
+- **Qwen3.5-4B** (`architecture = qwen35`, DeltaNet hybrid) — forward pass runs without errors but produces whitespace-only output. llama.cpp produces `<think>...` reasoning. Root cause unidentified.
+
+**Why we still exist**: llama.cpp is ~500K LOC (C++/CUDA/Metal/Vulkan). quant.cpp is ~17.6K LOC of C with zero dependencies. If you want the fastest inference, use llama.cpp. If you want something you can read end-to-end, embed in a single `.c` file, or use as a research platform for new KV compression methods — we're the alternative.
 
 ### vs other TurboQuant implementations
 

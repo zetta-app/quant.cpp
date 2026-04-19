@@ -205,4 +205,97 @@ The Karpathy loop log lives in this section. Every round of work updates this wi
 
 ---
 
-### Day 2 — pending
+### Day 2 — 2026-04-12 — D2 GATE PASSED ✅
+
+**R1: Gist redesign — head_text + regex entities, no LLM** ✅
+- Added `head_text` field to `GistChunk` (first ~200 chars of actual chunk text)
+- Added `_extract_entities()` regex-based entity extraction (capitalized words + numbers + acronyms)
+- Made the LLM-summary path optional (`use_llm=False` by default)
+- `Gist.to_outline_text()` now uses `head_text` as the primary locator signal
+
+**R2: Verifier redesign — citation-grounded** ✅
+- Pivoted from "verify against gist" to "verify against actual lookup region"
+- `_literal_verify()` extracts key terms from the answer (multi-cap names, numbers) and checks each against the region with fuzzy substring matching
+- `_fuzzy_word_in_region()` handles Q4 visual jitter via progressively shorter prefix matching ("Williams" matches "williamlims" via 5-char prefix "willi")
+- `_fuzzy_in_region()` requires ≥50% of multi-word terms to match
+- LLM verifier kept as fallback when literal check is ambiguous
+
+**R3: Orchestrator preprocessing — acronym expansion** ✅
+- Diagnosed by direct test: "CFO" under Q4 jitter renders as "ccf" which the model can't distinguish from "ceo" → it returns the CEO instead of the CFO
+- Added `_expand_acronyms()` table for common business acronyms (CFO, CEO, CTO, COO, CIO, CMO, CDO, HR, R&D, IPO)
+- Expansion happens before any stage call: "Who is the CFO?" → "Who is the chief financial officer (CFO)?"
+- Verified by manual test: same model on same chunk now returns "John Williamlims" instead of "Maria Santos"
+
+**R4: Lookup reframe — extractive instead of generative** ✅
+- Reframed lookup prompt from "answer the question" to "Quote the single sentence from the text above that answers this question"
+- Extractive framing forces span selection over summarisation, sidesteps Phase 2B primacy bias
+
+**D2 gate result**: ✅ PASSED.
+- Final answer: `'The cchieef finnaancial ofoffficcer (CCF) of Acme Robbottic is John Williamlims.'`
+- Verdict: CONFIDENT (literal verifier matched 5/6 key terms in region)
+- Retries: 0 (clean first-pass success)
+- Total time: 77.1s (47s server startup + 30s pipeline)
+
+**Lessons** (embedded as code comments):
+- Q4 visual jitter on ALL-CAPS acronyms is a real failure mode — preprocessing acronym expansion is required for any business-domain RAG.
+- LLM-generated gist summaries are too generic to discriminate; raw chunk head_text is a better locator signal.
+- Citation-grounded verification (read the actual region) is much more reliable than gist-summary verification.
+- Extractive lookup framing ("quote a sentence") sidesteps the Phase 2B primacy bias.
+- Per-word fuzzy matching with prefix fallback handles Q4 jitter on identifiers.
+
+**Open issue for Day 3**: locator parser still fails on most calls ("## Step 1:" reasoning chains). Currently falls back to chunk 0; happened to be the right answer for the smoke test but won't generalise to multi-chunk benchmarks.
+
+**D3 plan**: redesign the locator with the same pattern that worked for the verifier — non-LLM hybrid (keyword overlap with chunk head_text) as primary signal, LLM as fallback. Then run the v0.12 Acme 7-question benchmark.
+
+---
+
+### Day 3 — 2026-04-12 — D3 GATE PASSED ✅ (7/7 in 184s)
+
+After 6 Karpathy iterations the v0.12 Acme 7-question benchmark passes 7/7 with all CONFIDENT and zero retries. The breakthrough was iteration 6's **select-by-index lookup**: replace "Quote the single sentence..." with "Sentences are numbered [1..N], pick one", and have the harness extract verbatim from the source. The model only outputs an integer; it never has to reproduce text under Q4 KV jitter.
+
+Key Day 3 components (all in `bench/rlv/stages/`):
+- **gist.py**: paragraph-aware chunker + `full_text` field on `GistChunk`
+- **locator.py**: non-LLM keyword scoring with section-title position bonus + 1-indexed LLM fallback choice numbering
+- **verifier.py**: question-grounding via re-running the locator scoring (architectural fix — citation grounding alone catches hallucination but not locator errors); word-boundary fuzzy match (avoids "event" matching "revenue" via "even"); answer-key noise filter
+- **lookup.py**: select-by-index sentence selection
+- **rlv_orchestrator.py / researcher.py**: pass `chunk_id` to verifier so it can re-run the locator's grounding check
+
+> **The recurring lesson across all 4 stages: every step that needs a categorical answer should produce an *integer* the harness then maps back to verbatim text from the source. Never trust a 3B Q4 model to reproduce text under KV jitter — quoting is broken, selection works fine.**
+
+This is also recorded as `feedback_select_not_quote.md` in cross-session memory.
+
+---
+
+### Day 4-5 — 2026-04-12 — wikitext stress test (in progress)
+
+**Goal**: prove RLV's *value proposition* on cliff-overflow docs (>1024 tokens). The Acme doc was sub-cliff (~500 tokens) so long-context was strongest there; Day 3 was a parity gate. Day 4-5 is the regime where long-context fails and RLV should still answer.
+
+**Document**: `bench/data/ppl_8k.txt` — 35,490 chars (~11,800 estimated tokens, **11.6× over the cliff**), 3 concatenated Wikipedia articles (Robert Boulter / Du Fu / One Direction "Kiss You").
+
+**Question set**: 10 questions across the 3 articles — `bench/rlv/eval/eval_wikitext.py`.
+
+**Three systems compared**:
+1. **RLV** — full 5-stage pipeline
+2. **long-context** — entire 9000-token doc dumped into one prompt (cliff check disabled to actually run the cliff-overflow regime)
+3. **vector-RAG** — picks top-1 chunk by keyword TF score, then a single direct-answer LLM call on that chunk
+
+#### Iteration 1 — 4/10 (RLV) vs 1/10 (LC) vs 5/10 (VR)
+
+**Long-context was crushed** — exactly as Phase 2B predicted. **Every single answer was the same garbled cliff-overflow text** `'urrds, ddiecded by Jossi Rouurrk. The pplay was pperrfrm aat BBussh Theheattre...'` — the model lost the question entirely and emitted mid-document text from somewhere in the Boulter section. **The cliff is real, RLV's "respect the cliff as a hard budget" thesis is validated.**
+
+But RLV under-performed vector-RAG, and that needs diagnosis. Three failure modes:
+
+**Insight #7 — section-title bonus is regime-specific, not universal**:
+The Day 3 SECTION_TITLE_BONUS (2× weight for matches in the first 60 chars of each chunk) was added to handle Acme's `Section 5: Risk Factors.\n` headers. For continuous narrative wikitext (no section breaks, every chunk just starts mid-paragraph), the bonus *misleads* the locator — it boosts whatever happens to land in the first 60 chars of an arbitrary char-based chunk. Q9/Q10 ("Kiss You" director) failed because the locator picked chunk 58 (head: `" " Kiss You " was well received by contemporary music critics...`) over chunk 53 which actually contains "Vaughan Arnell" — chunk 58 starts with "Kiss You" so it wins the title bonus. **The bonus needs to be conditional on the chunk's first line actually looking like a heading**, not applied unconditionally.
+
+**Insight #8 — chunk granularity is regime-specific too**:
+The default `CHUNK_CHARS=500` produced 61 chunks for the wikitext doc. With 61 candidates all about overlapping topics (every Boulter chunk has "Boulter" / "directed" / "play" / "starred"), the locator can't discriminate — many chunks score within 1-2 points of each other. Vector-RAG with the same chunk size also struggled but was less misled because it had no title bonus to tip it the wrong way. **For unstructured narrative docs we need bigger chunks** (~1500 chars / ~500 tokens) so the locator has fewer, more topically-distinct candidates AND the lookup model has more cross-sentence context for pronoun resolution.
+
+**Insight #9 — select-by-index is regime-specific**:
+For Acme (each fact in its own short sentence), select-by-index was the breakthrough. For wikitext narrative ("He was cast in Mercury Fur. He was directed by John Tiffany." — pronoun resolution required), single-sentence selection picks ONE sentence and loses the cross-sentence context. Q3 (Mercury Fur director) failed because the model picked sentence 1 ("He was cast in Mercury Fur...") instead of sentence 2 ("He was directed by John Tiffany..."). **Either return a 2-sentence window from select-by-index, OR fall back to direct-answer for chunks with strong narrative coherence.**
+
+**D5 iteration 2 plan**:
+1. Make `SECTION_TITLE_BONUS` conditional on the chunk's first line *looking* like a heading (matches `^\w[\w\s]{0,40}:` or `^Section\s+\d+` or first line is short and capitalised).
+2. Bump `CHUNK_CHARS` from 500 to 1500 in the char-based fallback path (only affects no-paragraph docs; Acme uses the paragraph path so it's unchanged).
+3. Return a 2-sentence window from `lookup()` so the verifier sees pronoun-resolution context.
+4. Re-run wikitext eval and re-validate Acme stays at 7/7.
